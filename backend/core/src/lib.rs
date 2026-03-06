@@ -96,6 +96,10 @@ pub struct BackendConfig {
     pub session_ttl_ms: u64,
     pub rate_limit_per_sec: u32,
     pub burst_limit: u32,
+    pub event_dir: String,
+    pub segment_max_bytes: u64,
+    pub snapshot_interval_events: u64,
+    pub snapshot_retain_count: usize,
     pub log_level: String,
 }
 
@@ -116,6 +120,10 @@ impl Default for BackendConfig {
             session_ttl_ms: 3_600_000,
             rate_limit_per_sec: 100,
             burst_limit: 200,
+            event_dir: ".maxc/events".to_string(),
+            segment_max_bytes: 1_048_576,
+            snapshot_interval_events: 100,
+            snapshot_retain_count: 3,
             log_level: "info".to_string(),
         }
     }
@@ -197,6 +205,36 @@ impl BackendConfig {
                     value: value.clone(),
                 })?;
         }
+        if let Some(value) = get("MAXC_EVENT_DIR") {
+            cfg.event_dir = value;
+        }
+        if let Some(value) = get("MAXC_SEGMENT_MAX_BYTES") {
+            cfg.segment_max_bytes =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_SEGMENT_MAX_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_SNAPSHOT_INTERVAL_EVENTS") {
+            cfg.snapshot_interval_events =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_SNAPSHOT_INTERVAL_EVENTS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_SNAPSHOT_RETAIN_COUNT") {
+            cfg.snapshot_retain_count =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_SNAPSHOT_RETAIN_COUNT",
+                        value: value.clone(),
+                    })?;
+        }
 
         if let Some(value) = get("MAXC_LOG_LEVEL") {
             cfg.log_level = value;
@@ -253,6 +291,30 @@ impl BackendConfig {
             return Err(ConfigError::InvalidValue {
                 key: "MAXC_BURST_LIMIT",
                 value: self.burst_limit.to_string(),
+            });
+        }
+        if self.event_dir.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_EVENT_DIR",
+                value: self.event_dir.clone(),
+            });
+        }
+        if self.segment_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_SEGMENT_MAX_BYTES",
+                value: self.segment_max_bytes.to_string(),
+            });
+        }
+        if self.snapshot_interval_events == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_SNAPSHOT_INTERVAL_EVENTS",
+                value: self.snapshot_interval_events.to_string(),
+            });
+        }
+        if self.snapshot_retain_count == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_SNAPSHOT_RETAIN_COUNT",
+                value: self.snapshot_retain_count.to_string(),
             });
         }
 
@@ -323,6 +385,10 @@ mod tests {
         assert_eq!(cfg.session_ttl_ms, 3_600_000);
         assert_eq!(cfg.rate_limit_per_sec, 100);
         assert_eq!(cfg.burst_limit, 200);
+        assert_eq!(cfg.event_dir, ".maxc/events");
+        assert_eq!(cfg.segment_max_bytes, 1_048_576);
+        assert_eq!(cfg.snapshot_interval_events, 100);
+        assert_eq!(cfg.snapshot_retain_count, 3);
         assert_eq!(cfg.log_level, "debug");
     }
 
@@ -354,6 +420,10 @@ mod tests {
             "MAXC_SESSION_TTL_MS" => Some("5000".to_string()),
             "MAXC_RATE_LIMIT_PER_SEC" => Some("6".to_string()),
             "MAXC_BURST_LIMIT" => Some("7".to_string()),
+            "MAXC_EVENT_DIR" => Some("data/events".to_string()),
+            "MAXC_SEGMENT_MAX_BYTES" => Some("8192".to_string()),
+            "MAXC_SNAPSHOT_INTERVAL_EVENTS" => Some("10".to_string()),
+            "MAXC_SNAPSHOT_RETAIN_COUNT" => Some("2".to_string()),
             "MAXC_LOG_LEVEL" => Some("warn".to_string()),
             _ => None,
         })
@@ -367,6 +437,10 @@ mod tests {
         assert_eq!(cfg.session_ttl_ms, 5000);
         assert_eq!(cfg.rate_limit_per_sec, 6);
         assert_eq!(cfg.burst_limit, 7);
+        assert_eq!(cfg.event_dir, "data/events");
+        assert_eq!(cfg.segment_max_bytes, 8192);
+        assert_eq!(cfg.snapshot_interval_events, 10);
+        assert_eq!(cfg.snapshot_retain_count, 2);
         assert_eq!(cfg.log_level, "warn");
     }
 
@@ -436,6 +510,45 @@ mod tests {
                 value: "bad".to_string(),
             }
         );
+
+        let bad_segment = BackendConfig::from_env_map(|key| match key {
+            "MAXC_SEGMENT_MAX_BYTES" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_segment,
+            ConfigError::InvalidValue {
+                key: "MAXC_SEGMENT_MAX_BYTES",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_snapshot_interval = BackendConfig::from_env_map(|key| match key {
+            "MAXC_SNAPSHOT_INTERVAL_EVENTS" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_snapshot_interval,
+            ConfigError::InvalidValue {
+                key: "MAXC_SNAPSHOT_INTERVAL_EVENTS",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_snapshot_retain = BackendConfig::from_env_map(|key| match key {
+            "MAXC_SNAPSHOT_RETAIN_COUNT" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_snapshot_retain,
+            ConfigError::InvalidValue {
+                key: "MAXC_SNAPSHOT_RETAIN_COUNT",
+                value: "bad".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -496,6 +609,54 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::InvalidValue {
                 key: "MAXC_BURST_LIMIT",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            event_dir: "".to_string(),
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_EVENT_DIR",
+                value: "".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            segment_max_bytes: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_SEGMENT_MAX_BYTES",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            snapshot_interval_events: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_SNAPSHOT_INTERVAL_EVENTS",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            snapshot_retain_count: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_SNAPSHOT_RETAIN_COUNT",
                 value: "0".to_string(),
             })
         );

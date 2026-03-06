@@ -1,6 +1,10 @@
 use crate::{RpcErrorCode, RpcId, RpcRequest, RpcSuccess};
-use maxc_core::BackendConfig;
+use maxc_core::{BackendConfig, CommandId};
 use maxc_security::SessionToken;
+use maxc_storage::{
+    EventRecord, EventStore, EventStoreConfig, EventType, ProjectionState, SessionProjection,
+    StoreError,
+};
 use rand::RngCore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -21,14 +25,31 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    fn from_projection(value: &SessionProjection) -> Self {
+        Self {
+            token: value.token.clone(),
+            issued_at_ms: value.issued_at_ms,
+            expires_at_ms: value.expires_at_ms,
+            last_seen_ms: value.last_seen_ms,
+            revoked: value.revoked,
+        }
+    }
+
     fn is_active(&self, now_ms: u64) -> bool {
         !self.revoked && self.expires_at_ms > now_ms
     }
 }
 
+#[derive(Debug, Error)]
+pub enum RpcServerInitError {
+    #[error("event store initialization failed: {0}")]
+    Store(#[from] StoreError),
+}
+
 #[derive(Debug)]
 struct ServerState {
-    sessions: Mutex<HashMap<String, SessionRecord>>,
+    projection: Mutex<ProjectionState>,
+    store: Mutex<EventStore>,
     global_limiter: Mutex<RateLimiter>,
     connection_limiters: Mutex<HashMap<String, RateLimiter>>,
     inflight_by_connection: StdMutex<HashMap<String, usize>>,
@@ -49,6 +70,8 @@ enum ServerError {
     Unauthorized,
     #[error("not found")]
     NotFound,
+    #[error("conflict")]
+    Conflict,
     #[error("timeout")]
     Timeout,
     #[error("rate limited")]
@@ -135,18 +158,27 @@ impl Drop for InflightGuard {
 }
 
 impl RpcServer {
-    pub fn new(config: BackendConfig) -> Self {
+    pub fn new(config: BackendConfig) -> Result<Self, RpcServerInitError> {
+        let store_cfg = EventStoreConfig {
+            event_dir: std::path::PathBuf::from(config.event_dir.clone()),
+            segment_max_bytes: config.segment_max_bytes,
+            snapshot_interval_events: config.snapshot_interval_events,
+            snapshot_retain_count: config.snapshot_retain_count,
+        };
+        let mut store = EventStore::new(store_cfg)?;
+        let projection = store.recover()?;
         let global_limiter = RateLimiter::new(config.rate_limit_per_sec, config.burst_limit);
-        Self {
+        Ok(Self {
             config,
             state: Arc::new(ServerState {
-                sessions: Mutex::new(HashMap::new()),
+                projection: Mutex::new(projection),
+                store: Mutex::new(store),
                 global_limiter: Mutex::new(global_limiter),
                 connection_limiters: Mutex::new(HashMap::new()),
                 inflight_by_connection: StdMutex::new(HashMap::new()),
                 correlation: AtomicU64::new(1),
             }),
-        }
+        })
     }
 
     pub async fn handle_json_line(&self, connection_id: &str, line: &str) -> String {
@@ -245,7 +277,7 @@ impl RpcServer {
 
     async fn dispatch(&self, request: RpcRequest) -> Result<Value, ServerError> {
         match request.method.as_str() {
-            "session.create" => self.session_create().await,
+            "session.create" => self.session_create(request.params).await,
             "session.refresh" => self.session_refresh(request.params).await,
             "session.revoke" => self.session_revoke(request.params).await,
             "system.health" => Ok(json!({ "ok": true })),
@@ -253,55 +285,131 @@ impl RpcServer {
         }
     }
 
-    async fn session_create(&self) -> Result<Value, ServerError> {
+    async fn session_create(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
         let now = now_unix_ms();
         let ttl = self.config.session_ttl_ms;
         let token = random_token()?;
-
-        let record = SessionRecord {
-            token: token.clone(),
-            issued_at_ms: now,
-            expires_at_ms: now + ttl,
-            last_seen_ms: now,
-            revoked: false,
-        };
-        self.state
-            .sessions
-            .lock()
-            .await
-            .insert(token.clone(), record.clone());
-        Ok(json!({
+        let result = json!({
             "token": token,
-            "issued_at_ms": record.issued_at_ms,
-            "expires_at_ms": record.expires_at_ms
-        }))
+            "issued_at_ms": now,
+            "expires_at_ms": now + ttl
+        });
+        let payload = json!({
+            "token": token,
+            "issued_at_ms": now,
+            "expires_at_ms": now + ttl,
+            "last_seen_ms": now,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::SessionCreated,
+            token.clone(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
     }
 
     async fn session_refresh(&self, params: Option<Value>) -> Result<Value, ServerError> {
-        let token = extract_token(params).ok_or(ServerError::Unauthorized)?;
+        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
         let now = now_unix_ms();
         let ttl = self.config.session_ttl_ms;
-        let mut sessions = self.state.sessions.lock().await;
-        let record = sessions.get_mut(&token).ok_or(ServerError::Unauthorized)?;
-        if !record.is_active(now) {
+        let session = self
+            .find_session(&token)
+            .await
+            .ok_or(ServerError::Unauthorized)?;
+        if !session.is_active(now) {
             return Err(ServerError::Unauthorized);
         }
-        record.expires_at_ms = now + ttl;
-        record.last_seen_ms = now;
-        Ok(json!({
-            "token": record.token,
-            "expires_at_ms": record.expires_at_ms
-        }))
+
+        let result = json!({
+            "token": token,
+            "expires_at_ms": now + ttl
+        });
+        let payload = json!({
+            "token": token,
+            "expires_at_ms": now + ttl,
+            "last_seen_ms": now,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::SessionRefreshed,
+            session.token,
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
     }
 
     async fn session_revoke(&self, params: Option<Value>) -> Result<Value, ServerError> {
-        let token = extract_token(params).ok_or(ServerError::Unauthorized)?;
-        let mut sessions = self.state.sessions.lock().await;
-        let record = sessions.get_mut(&token).ok_or(ServerError::Unauthorized)?;
-        record.revoked = true;
-        Ok(json!({
+        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        self.find_session(&token)
+            .await
+            .ok_or(ServerError::Unauthorized)?;
+
+        let result = json!({
             "revoked": true
-        }))
+        });
+        let payload = json!({
+            "token": token,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::SessionRevoked,
+            token,
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn persist_and_apply(&self, event: EventRecord) -> Result<Value, ServerError> {
+        let mut projection = self.state.projection.lock().await;
+        if let Some(existing) = projection.command_results.get(&event.command_id) {
+            return Ok(existing.clone());
+        }
+        let mut store = self.state.store.lock().await;
+        let cursor = store.append(&event).map_err(map_store_error)?;
+        projection.apply(&event, cursor).map_err(map_store_error)?;
+        store
+            .maybe_snapshot_and_compact(&projection)
+            .map_err(map_store_error)?;
+        projection
+            .command_results
+            .get(&event.command_id)
+            .cloned()
+            .ok_or(ServerError::Internal)
+    }
+
+    async fn lookup_command_result(&self, command_id: &str) -> Option<Value> {
+        let projection = self.state.projection.lock().await;
+        projection.command_results.get(command_id).cloned()
+    }
+
+    async fn find_session(&self, token: &str) -> Option<SessionRecord> {
+        let projection = self.state.projection.lock().await;
+        projection
+            .sessions
+            .get(token)
+            .map(SessionRecord::from_projection)
     }
 
     fn next_correlation_id(&self) -> String {
@@ -310,7 +418,8 @@ impl RpcServer {
     }
 
     pub async fn session_count(&self) -> usize {
-        self.state.sessions.lock().await.len()
+        let projection = self.state.projection.lock().await;
+        projection.sessions.len()
     }
 
     #[cfg(windows)]
@@ -360,11 +469,19 @@ impl RpcServer {
     }
 }
 
+fn map_store_error(err: StoreError) -> ServerError {
+    match err {
+        StoreError::ChecksumMismatch { .. } => ServerError::Conflict,
+        _ => ServerError::Internal,
+    }
+}
+
 fn map_error_code(err: &ServerError) -> RpcErrorCode {
     match err {
         ServerError::InvalidRequest => RpcErrorCode::InvalidRequest,
         ServerError::Unauthorized => RpcErrorCode::Unauthorized,
         ServerError::NotFound => RpcErrorCode::NotFound,
+        ServerError::Conflict => RpcErrorCode::Conflict,
         ServerError::Timeout => RpcErrorCode::Timeout,
         ServerError::RateLimited => RpcErrorCode::RateLimited,
         ServerError::Internal => RpcErrorCode::Internal,
@@ -380,7 +497,7 @@ fn extract_id_from_raw_json(raw: &str) -> Value {
     }
 }
 
-fn extract_token(params: Option<Value>) -> Option<String> {
+fn extract_token(params: Option<&Value>) -> Option<String> {
     let params = params?;
     let object = params.as_object()?;
     if let Some(token) = object.get("token").and_then(Value::as_str) {
@@ -398,6 +515,18 @@ fn extract_token(params: Option<Value>) -> Option<String> {
                 .ok()
                 .map(|t| t.as_str().to_string())
         })
+}
+
+fn extract_command_id(params: Option<&Value>) -> Result<String, ServerError> {
+    let params = params.ok_or(ServerError::InvalidRequest)?;
+    let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
+    let command_id = object
+        .get("command_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?;
+    let command_id =
+        CommandId::new(command_id.to_string()).map_err(|_| ServerError::InvalidRequest)?;
+    Ok(command_id.as_str().to_string())
 }
 
 fn now_unix_ms() -> u64 {
@@ -420,18 +549,43 @@ fn random_token() -> Result<String, ServerError> {
     Ok(token)
 }
 
+fn random_event_id() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::from("evt-");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RpcRequest;
+    use serde_json::json;
+
+    fn test_config(label: &str) -> BackendConfig {
+        BackendConfig {
+            event_dir: std::env::temp_dir()
+                .join(format!("maxc-server-{label}-{}", now_unix_ms()))
+                .to_string_lossy()
+                .to_string(),
+            snapshot_interval_events: 2,
+            snapshot_retain_count: 2,
+            segment_max_bytes: 1024 * 64,
+            ..BackendConfig::default()
+        }
+    }
 
     #[tokio::test]
-    async fn session_create_and_refresh() {
-        let server = RpcServer::new(BackendConfig::default());
+    async fn session_create_and_refresh_with_command_id() {
+        let cfg = test_config("create-refresh");
+        let server = RpcServer::new(cfg).expect("server");
         let create_request = RpcRequest {
             id: Some(RpcId::Number(1)),
             method: "session.create".to_string(),
-            params: None,
+            params: Some(json!({ "command_id": "cmd-1" })),
         };
 
         let create_response = server
@@ -449,6 +603,7 @@ mod tests {
             id: Some(RpcId::Number(2)),
             method: "session.refresh".to_string(),
             params: Some(json!({
+                "command_id": "cmd-2",
                 "auth": {
                     "token": token.clone()
                 }
@@ -463,73 +618,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_accepts_token_at_root_param() {
-        let server = RpcServer::new(BackendConfig::default());
-        let create_request = RpcRequest {
-            id: Some(RpcId::Number(1)),
-            method: "session.create".to_string(),
-            params: None,
-        };
-        let create_response = server
-            .handle_request("conn-a", create_request)
-            .await
-            .expect("create");
-        let token = create_response["result"]["token"]
-            .as_str()
-            .expect("token")
-            .to_string();
-
-        let refresh_request = RpcRequest {
-            id: Some(RpcId::Number(2)),
-            method: "session.refresh".to_string(),
-            params: Some(json!({ "token": token.clone() })),
-        };
-        let refresh_response = server
-            .handle_request("conn-a", refresh_request)
-            .await
-            .expect("refresh");
-        assert_eq!(refresh_response["result"]["token"], token);
+    async fn create_without_command_id_is_invalid_request() {
+        let cfg = test_config("missing-cmd");
+        let server = RpcServer::new(cfg).expect("server");
+        let output = server
+            .handle_json_line(
+                "conn-a",
+                r#"{"id":1,"method":"session.create","params":{}}"#,
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(parsed["error"]["code"], "INVALID_REQUEST");
     }
 
     #[tokio::test]
-    async fn session_revoke_makes_refresh_fail() {
-        let server = RpcServer::new(BackendConfig::default());
-        let create_req = RpcRequest {
-            id: Some(RpcId::Number(1)),
-            method: "session.create".to_string(),
-            params: None,
-        };
-        let create_response = server
-            .handle_request("conn-a", create_req)
-            .await
-            .expect("create");
-        let token = create_response["result"]["token"]
-            .as_str()
-            .expect("token")
-            .to_string();
+    async fn idempotent_command_returns_same_result() {
+        let cfg = test_config("idem");
+        let server = RpcServer::new(cfg).expect("server");
+        let request = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": { "command_id": "cmd-1" }
+        })
+        .to_string();
 
-        let revoke = RpcRequest {
-            id: Some(RpcId::Number(2)),
-            method: "session.revoke".to_string(),
-            params: Some(json!({ "token": token })),
-        };
-        server
-            .handle_request("conn-a", revoke)
-            .await
-            .expect("revoke");
+        let first: Value =
+            serde_json::from_str(&server.handle_json_line("c", &request).await).expect("json");
+        let second: Value =
+            serde_json::from_str(&server.handle_json_line("c", &request).await).expect("json");
+        assert_eq!(first["result"], second["result"]);
+        assert_eq!(server.session_count().await, 1);
+    }
 
-        let refresh = RpcRequest {
-            id: Some(RpcId::Number(3)),
-            method: "session.refresh".to_string(),
-            params: Some(json!({ "auth": { "token": create_response["result"]["token"] } })),
-        };
-        let output = server.handle_request("conn-a", refresh).await;
-        assert!(output.is_err());
+    #[tokio::test]
+    async fn recover_state_from_event_store() {
+        let cfg = test_config("recovery");
+        let event_dir = cfg.event_dir.clone();
+        let server = RpcServer::new(cfg.clone()).expect("server");
+        let create = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": { "command_id": "cmd-1" }
+        })
+        .to_string();
+        let _ = server.handle_json_line("c", &create).await;
+
+        let restarted = RpcServer::new(BackendConfig { event_dir, ..cfg }).expect("restart");
+        assert_eq!(restarted.session_count().await, 1);
     }
 
     #[tokio::test]
     async fn unknown_method_maps_to_not_found() {
-        let server = RpcServer::new(BackendConfig::default());
+        let cfg = test_config("not-found");
+        let server = RpcServer::new(cfg).expect("server");
         let input = json!({
             "id": "x1",
             "method": "unknown.method"
@@ -545,9 +686,9 @@ mod tests {
     async fn invalid_payload_maps_to_invalid_request() {
         let cfg = BackendConfig {
             max_payload_bytes: 5,
-            ..BackendConfig::default()
+            ..test_config("invalid-payload")
         };
-        let server = RpcServer::new(cfg);
+        let server = RpcServer::new(cfg).expect("server");
         let output = server
             .handle_json_line("conn-z", r#"{"id":1,"method":"system.health"}"#)
             .await;
@@ -560,9 +701,9 @@ mod tests {
         let cfg = BackendConfig {
             rate_limit_per_sec: 1,
             burst_limit: 1,
-            ..BackendConfig::default()
+            ..test_config("rate")
         };
-        let server = RpcServer::new(cfg);
+        let server = RpcServer::new(cfg).expect("server");
         let req = json!({"id": 1, "method": "system.health"}).to_string();
         let _ = server.handle_json_line("c", &req).await;
         let second = server.handle_json_line("c", &req).await;

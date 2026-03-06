@@ -78,7 +78,7 @@ impl RpcErrorObject {
 
 pub mod server;
 
-pub use server::{RpcServer, SessionRecord};
+pub use server::{RpcServer, RpcServerInitError, SessionRecord};
 
 #[cfg(test)]
 mod tests {

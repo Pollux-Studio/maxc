@@ -12,3 +12,4 @@ tokio.workspace = true
 rand.workspace = true
 maxc-core = { path = "../core" }
 maxc-security = { path = "../security" }
+maxc-storage = { path = "../storage" }

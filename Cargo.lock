@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "maxc-core",
  "maxc-security",
+ "maxc-storage",
  "rand",
  "serde",
  "serde_json",
@@ -72,6 +73,8 @@ name = "maxc-storage"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

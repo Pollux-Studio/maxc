@@ -82,15 +82,15 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - Add durable backend state and deterministic recovery.
 
 ### Tasks
-- [ ] Implement append-only event store with segment files and checksums.
-- [ ] Define event schema with version field for forward compatibility.
-- [ ] Implement event index for efficient reads and replay positions.
-- [ ] Build projection engine that reconstructs in-memory state from events.
-- [ ] Add snapshotting and startup recovery (load snapshot + replay tail).
-- [ ] Implement command idempotency keyed by `CommandId`.
-- [ ] Add compaction policy for old segments and snapshot rotation.
-- [ ] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
-- [ ] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-3: add event store and deterministic replay`).
+- [x] Implement append-only event store with segment files and checksums.
+- [x] Define event schema with version field for forward compatibility.
+- [x] Implement event index for efficient reads and replay positions.
+- [x] Build projection engine that reconstructs in-memory state from events.
+- [x] Add snapshotting and startup recovery (load snapshot + replay tail).
+- [x] Implement command idempotency keyed by `CommandId`.
+- [x] Add compaction policy for old segments and snapshot rotation.
+- [x] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
+- [x] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-3: add event store and deterministic replay`).
 
 ### Deliverables
 - Durable event log and projection engine
