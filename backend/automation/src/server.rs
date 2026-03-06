@@ -6,9 +6,13 @@ use maxc_storage::{
     EventRecord, EventStore, EventStoreConfig, EventType, ProjectionState, SessionProjection,
     StoreError,
 };
+use maxc_telemetry::{
+    LatencyMetric, LogLevel, LogRecord, MetricsSnapshot as TelemetryMetricsSnapshot, SpanRecord,
+    TelemetryCollector, TelemetrySnapshot as CollectorTelemetrySnapshot,
+};
 use rand::RngCore;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -77,8 +81,47 @@ struct ServerState {
     breaker: StdMutex<CircuitBreaker>,
     faults: StdMutex<HashMap<FaultHook, FaultAction>>,
     shutting_down: AtomicBool,
+    started_at_ms: u64,
+    telemetry: StdMutex<TelemetryCollector>,
+    metrics: StdMutex<ServerMetrics>,
     inflight_by_connection: StdMutex<HashMap<String, usize>>,
     correlation: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct ServerMetrics {
+    counters: BTreeMap<String, u64>,
+    gauges: BTreeMap<String, u64>,
+    latencies: BTreeMap<String, LatencyMetric>,
+}
+
+impl ServerMetrics {
+    fn incr_counter(&mut self, name: &str, value: u64) {
+        *self.counters.entry(name.to_string()).or_default() += value;
+    }
+
+    fn set_gauge(&mut self, name: &str, value: u64) {
+        self.gauges.insert(name.to_string(), value);
+    }
+
+    fn record_latency(&mut self, name: &str, value_ms: f64) {
+        self.latencies
+            .entry(name.to_string())
+            .or_default()
+            .record(value_ms);
+    }
+
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            counters: self.counters.clone(),
+            gauges: self.gauges.clone(),
+            latencies: self
+                .latencies
+                .iter()
+                .map(|(key, value)| (key.clone(), value.snapshot()))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +244,9 @@ pub struct RpcServer {
     config: BackendConfig,
     state: Arc<ServerState>,
 }
+
+pub type MetricsSnapshot = TelemetryMetricsSnapshot;
+pub type TelemetrySnapshot = CollectorTelemetrySnapshot;
 
 #[derive(Debug, Error)]
 enum ServerError {
@@ -331,6 +377,9 @@ impl RpcServer {
                 breaker: StdMutex::new(CircuitBreaker::default()),
                 faults: StdMutex::new(faults),
                 shutting_down: AtomicBool::new(false),
+                started_at_ms: now_unix_ms(),
+                telemetry: StdMutex::new(TelemetryCollector::new(256)),
+                metrics: StdMutex::new(ServerMetrics::default()),
                 inflight_by_connection: StdMutex::new(HashMap::new()),
                 correlation: AtomicU64::new(1),
             }),
@@ -347,10 +396,39 @@ impl RpcServer {
 
     pub async fn handle_json_line(&self, connection_id: &str, line: &str) -> String {
         let corr = self.next_correlation_id();
+        let started = Instant::now();
+        let method = extract_method_from_raw_json(line);
+        self.log_event(
+            LogLevel::Info,
+            "rpc",
+            "request.start",
+            &corr,
+            Some(connection_id.to_string()),
+            method.clone(),
+            None,
+            None,
+            "started",
+            BTreeMap::new(),
+        );
         let result = self
             .handle_json_line_inner(connection_id, line)
             .await
             .unwrap_or_else(|err| {
+                self.record_request_metrics(method.as_deref(), started.elapsed(), false);
+                let mut fields = BTreeMap::new();
+                fields.insert("error_code".to_string(), json!(map_error_code(&err)));
+                self.log_event(
+                    LogLevel::Error,
+                    "rpc",
+                    "request.error",
+                    &corr,
+                    Some(connection_id.to_string()),
+                    method.clone(),
+                    None,
+                    Some(started.elapsed().as_millis() as u64),
+                    "error",
+                    fields,
+                );
                 let id = extract_id_from_raw_json(line);
                 json!({
                     "id": id,
@@ -363,6 +441,22 @@ impl RpcServer {
                     }
                 })
             });
+
+        if result.get("result").is_some() {
+            self.record_request_metrics(method.as_deref(), started.elapsed(), true);
+            self.log_event(
+                LogLevel::Info,
+                "rpc",
+                "request.finish",
+                &corr,
+                Some(connection_id.to_string()),
+                method,
+                None,
+                Some(started.elapsed().as_millis() as u64),
+                "ok",
+                BTreeMap::new(),
+            );
+        }
 
         serde_json::to_string(&result).unwrap_or_else(|_| {
             json!({
@@ -406,6 +500,8 @@ impl RpcServer {
         request: RpcRequest,
     ) -> Result<Value, ServerError> {
         self.check_breaker()?;
+        let span_started = now_unix_ms();
+        let method_name = request.method.clone();
         let id = request.id.clone().unwrap_or(RpcId::Null);
         let _guard = InflightGuard::acquire(
             Arc::clone(&self.state),
@@ -430,6 +526,16 @@ impl RpcServer {
             return Err(err);
         }
         self.record_success();
+        let mut attrs = BTreeMap::new();
+        attrs.insert("connection_id".to_string(), json!(connection_id));
+        attrs.insert("method".to_string(), json!(method_name));
+        self.record_span(
+            "rpc.request",
+            &self.next_correlation_id(),
+            span_started,
+            now_unix_ms().saturating_sub(span_started),
+            attrs,
+        );
 
         serde_json::to_value(RpcSuccess {
             id,
@@ -473,7 +579,11 @@ impl RpcServer {
             "session.create" => self.session_create(request.params).await,
             "session.refresh" => self.session_refresh(request.params).await,
             "session.revoke" => self.session_revoke(request.params).await,
-            "system.health" => Ok(json!({ "ok": true })),
+            "system.health" => self.system_health().await,
+            "system.readiness" => self.system_readiness(request.params).await,
+            "system.diagnostics" => self.system_diagnostics(request.params).await,
+            "system.metrics" => self.system_metrics(request.params).await,
+            "system.logs" => self.system_logs(request.params).await,
             method if method.starts_with("terminal.") => {
                 self.terminal_dispatch(method, request.params).await
             }
@@ -482,6 +592,82 @@ impl RpcServer {
             }
             _ => Err(ServerError::NotFound),
         }
+    }
+
+    async fn system_health(&self) -> Result<Value, ServerError> {
+        Ok(json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "shutting_down": self.is_shutting_down(),
+            "breaker_open": self.breaker_is_open(),
+            "active_requests": self.active_request_count(),
+            "uptime_ms": now_unix_ms().saturating_sub(self.state.started_at_ms)
+        }))
+    }
+
+    async fn system_readiness(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        self.require_active_session(params.as_ref()).await?;
+        Ok(json!({
+            "ready": !self.is_shutting_down() && !self.breaker_is_open(),
+            "accepting_requests": !self.is_shutting_down(),
+            "breaker_open": self.breaker_is_open(),
+            "queue_saturated": self.active_request_count() >= self.config.overload_reject_threshold,
+            "store_available": true
+        }))
+    }
+
+    async fn system_diagnostics(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        self.require_active_session(params.as_ref()).await?;
+        let projection = self.state.projection.lock().await;
+        let terminal_runtime = self.state.terminal_runtime.lock().await;
+        let browser_runtime = self.state.browser_runtime.lock().await;
+        let terminal_subscriptions = self
+            .state
+            .terminal_subscriptions
+            .lock()
+            .expect("subscription lock poisoned");
+        let browser_subscriptions = self
+            .state
+            .browser_subscriptions
+            .lock()
+            .expect("subscription lock poisoned");
+        let metrics = self.metrics_snapshot();
+        Ok(json!({
+            "sessions": projection.sessions.len(),
+            "browser_sessions": projection.browser_sessions.len(),
+            "browser_tabs": projection.browser_tabs.len(),
+            "terminal_runtime_count": terminal_runtime.len(),
+            "browser_runtime_count": browser_runtime.len(),
+            "terminal_subscription_count": terminal_subscriptions.values().map(|v| v.len()).sum::<usize>(),
+            "browser_subscription_count": browser_subscriptions.values().map(|v| v.len()).sum::<usize>(),
+            "active_requests": self.active_request_count(),
+            "shutting_down": self.is_shutting_down(),
+            "breaker_open": self.breaker_is_open(),
+            "metrics": metrics
+        }))
+    }
+
+    async fn system_metrics(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        self.require_active_session(params.as_ref()).await?;
+        let mut metrics = self.metrics_snapshot();
+        metrics.gauges.insert(
+            "rpc.active_requests".to_string(),
+            self.active_request_count() as u64,
+        );
+        metrics.gauges.insert(
+            "runtime.terminal.sessions".to_string(),
+            self.state.terminal_runtime.lock().await.len() as u64,
+        );
+        metrics.gauges.insert(
+            "runtime.browser.sessions".to_string(),
+            self.state.browser_runtime.lock().await.len() as u64,
+        );
+        serde_json::to_value(metrics).map_err(|_| ServerError::Internal)
+    }
+
+    async fn system_logs(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        self.require_active_session(params.as_ref()).await?;
+        serde_json::to_value(self.telemetry_snapshot()).map_err(|_| ServerError::Internal)
     }
 
     async fn session_create(&self, params: Option<Value>) -> Result<Value, ServerError> {
@@ -1825,12 +2011,152 @@ impl RpcServer {
         projection.sessions.len()
     }
 
+    pub fn telemetry_snapshot(&self) -> TelemetrySnapshot {
+        self.state
+            .telemetry
+            .lock()
+            .expect("telemetry lock poisoned")
+            .snapshot()
+    }
+
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.state
+            .metrics
+            .lock()
+            .expect("metrics lock poisoned")
+            .snapshot()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_event(
+        &self,
+        level: LogLevel,
+        component: &str,
+        event: &str,
+        correlation_id: &str,
+        connection_id: Option<String>,
+        method: Option<String>,
+        command_id: Option<String>,
+        duration_ms: Option<u64>,
+        status: &str,
+        fields: BTreeMap<String, Value>,
+    ) {
+        self.state
+            .telemetry
+            .lock()
+            .expect("telemetry lock poisoned")
+            .push_log(LogRecord {
+                timestamp_ms: now_unix_ms(),
+                level,
+                component: component.to_string(),
+                event: event.to_string(),
+                correlation_id: correlation_id.to_string(),
+                command_id,
+                connection_id,
+                workspace_id: None,
+                surface_id: None,
+                method,
+                duration_ms,
+                status: status.to_string(),
+                fields,
+            });
+    }
+
+    fn record_span(
+        &self,
+        name: &str,
+        correlation_id: &str,
+        started_at_ms: u64,
+        duration_ms: u64,
+        attributes: BTreeMap<String, Value>,
+    ) {
+        self.state
+            .telemetry
+            .lock()
+            .expect("telemetry lock poisoned")
+            .push_span(SpanRecord {
+                name: name.to_string(),
+                correlation_id: correlation_id.to_string(),
+                started_at_ms,
+                duration_ms,
+                attributes,
+            });
+    }
+
+    fn record_request_metrics(&self, method: Option<&str>, duration: Duration, ok: bool) {
+        let mut metrics = self.state.metrics.lock().expect("metrics lock poisoned");
+        metrics.incr_counter("rpc.requests.total", 1);
+        if ok {
+            metrics.incr_counter("rpc.requests.ok", 1);
+        } else {
+            metrics.incr_counter("rpc.requests.error", 1);
+        }
+        metrics.record_latency("rpc.request.latency_ms", duration.as_secs_f64() * 1000.0);
+        if let Some(method) = method {
+            metrics.incr_counter(&format!("rpc.method.{method}.count"), 1);
+            metrics.record_latency(
+                &format!("rpc.method.{method}.latency_ms"),
+                duration.as_secs_f64() * 1000.0,
+            );
+        }
+        metrics.set_gauge("rpc.active_requests", self.active_request_count() as u64);
+    }
+
+    async fn require_active_session(
+        &self,
+        params: Option<&Value>,
+    ) -> Result<SessionRecord, ServerError> {
+        let token = extract_token(params).ok_or(ServerError::Unauthorized)?;
+        let now = now_unix_ms();
+        let session = self
+            .find_session(&token)
+            .await
+            .ok_or(ServerError::Unauthorized)?;
+        if !session.is_active(now) {
+            return Err(ServerError::Unauthorized);
+        }
+        Ok(session)
+    }
+
     pub fn begin_shutdown(&self) {
         self.state.shutting_down.store(true, Ordering::SeqCst);
+        self.log_event(
+            LogLevel::Warn,
+            "lifecycle",
+            "shutdown.begin",
+            "lifecycle",
+            None,
+            None,
+            None,
+            None,
+            "started",
+            BTreeMap::new(),
+        );
     }
 
     pub fn is_shutting_down(&self) -> bool {
         self.state.shutting_down.load(Ordering::SeqCst)
+    }
+
+    fn active_request_count(&self) -> usize {
+        self.state
+            .inflight_by_connection
+            .lock()
+            .expect("inflight lock poisoned")
+            .values()
+            .copied()
+            .sum::<usize>()
+    }
+
+    fn breaker_is_open(&self) -> bool {
+        let now = now_unix_ms();
+        self.state
+            .breaker
+            .lock()
+            .expect("breaker lock poisoned")
+            .open_until_ms
+            .map(|until| until > now)
+            .unwrap_or(false)
     }
 
     pub async fn shutdown_and_drain(&self) {
@@ -1898,6 +2224,23 @@ impl RpcServer {
         breaker.half_open_probe_running = false;
         if breaker.consecutive_failures >= self.config.breaker_failure_threshold {
             breaker.open_until_ms = Some(now + self.config.breaker_cooldown_ms);
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "open_until_ms".to_string(),
+                json!(now + self.config.breaker_cooldown_ms),
+            );
+            self.log_event(
+                LogLevel::Warn,
+                "reliability",
+                "breaker.open",
+                "breaker",
+                None,
+                None,
+                None,
+                None,
+                "open",
+                fields,
+            );
         }
     }
 
@@ -2007,6 +2350,16 @@ fn extract_id_from_raw_json(raw: &str) -> Value {
     } else {
         Value::Null
     }
+}
+
+fn extract_method_from_raw_json(raw: &str) -> Option<String> {
+    let parsed: Result<Value, _> = serde_json::from_str(raw);
+    parsed.ok().and_then(|value| {
+        value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
 }
 
 fn extract_token(params: Option<&Value>) -> Option<String> {
@@ -2730,6 +3083,92 @@ mod tests {
         let parsed: Value = serde_json::from_str(&output).expect("json");
         assert_eq!(parsed["result"]["ok"], true);
         assert!(start.elapsed() >= Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_metrics_and_logs_require_auth_and_emit_data() {
+        let cfg = test_config("system-observability");
+        let server = RpcServer::new(cfg).expect("server");
+
+        let denied = server
+            .handle_json_line(
+                "conn-a",
+                &json!({"id":1,"method":"system.readiness"}).to_string(),
+            )
+            .await;
+        let denied: Value = serde_json::from_str(&denied).expect("json");
+        assert_eq!(denied["error"]["code"], "UNAUTHORIZED");
+
+        let create = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 2,
+                    "method": "session.create",
+                    "params": {"command_id":"cmd-system-auth"}
+                })
+                .to_string(),
+            )
+            .await;
+        let create: Value = serde_json::from_str(&create).expect("json");
+        let token = create["result"]["token"].as_str().expect("token");
+
+        let readiness = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 3,
+                    "method": "system.readiness",
+                    "params": {"command_id":"cmd-ready","auth":{"token": token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let readiness: Value = serde_json::from_str(&readiness).expect("json");
+        assert!(readiness["result"]["ready"].is_boolean());
+
+        let metrics = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 4,
+                    "method": "system.metrics",
+                    "params": {"command_id":"cmd-metrics","auth":{"token": token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let metrics: Value = serde_json::from_str(&metrics).expect("json");
+        assert!(metrics["result"]["counters"].is_object());
+
+        let logs = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 5,
+                    "method": "system.logs",
+                    "params": {"command_id":"cmd-logs","auth":{"token": token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let logs: Value = serde_json::from_str(&logs).expect("json");
+        assert!(logs["result"]["logs"].is_array());
+
+        let diagnostics = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 6,
+                    "method": "system.diagnostics",
+                    "params": {"command_id":"cmd-diag","auth":{"token": token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let diagnostics: Value = serde_json::from_str(&diagnostics).expect("json");
+        assert!(diagnostics["result"]["metrics"].is_object());
+        assert!(!server.telemetry_snapshot().logs.is_empty());
     }
 
     #[tokio::test]

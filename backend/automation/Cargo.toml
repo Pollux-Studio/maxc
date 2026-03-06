@@ -14,3 +14,4 @@ maxc-core = { path = "../core" }
 maxc-security = { path = "../security" }
 maxc-storage = { path = "../storage" }
 maxc-browser = { path = "../browser" }
+maxc-telemetry = { path = "../telemetry" }

@@ -26,6 +26,9 @@ jobs:
       - name: backend tests
         run: cargo test --workspace --all-features
 
+      - name: backend cli smoke tests
+        run: cargo test -p maxc-cli
+
       - name: backend perf guardrails
         run: cargo run -p maxc-automation --bin perf-harness -- --profile ci --json
 

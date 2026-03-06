@@ -537,7 +537,9 @@ mod tests {
             Some(30.0)
         );
         assert_eq!(default_profile("restart_recovery").fixture_events, 1000);
-        assert!(temp_event_dir("x").to_string_lossy().contains("maxc-perf-x-"));
+        assert!(temp_event_dir("x")
+            .to_string_lossy()
+            .contains("maxc-perf-x-"));
     }
 
     #[test]
@@ -566,7 +568,10 @@ mod tests {
                 warmup: 1,
                 fixture_events: 0,
             },
-            &ThresholdConfig { p95_ms: Some(50.0), max_ms: None },
+            &ThresholdConfig {
+                p95_ms: Some(50.0),
+                max_ms: None,
+            },
         )
         .await
         .expect("profile");
@@ -583,7 +588,10 @@ mod tests {
                 warmup: 0,
                 fixture_events: 0,
             },
-            &ThresholdConfig { p95_ms: Some(100.0), max_ms: None },
+            &ThresholdConfig {
+                p95_ms: Some(100.0),
+                max_ms: None,
+            },
         )
         .await
         .expect("terminal profile");
@@ -596,7 +604,10 @@ mod tests {
                 warmup: 0,
                 fixture_events: 10,
             },
-            &ThresholdConfig { p95_ms: None, max_ms: Some(300.0) },
+            &ThresholdConfig {
+                p95_ms: None,
+                max_ms: Some(300.0),
+            },
         )
         .await
         .expect("recovery profile");

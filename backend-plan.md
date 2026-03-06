@@ -184,17 +184,17 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - Make backend observable, diagnosable, and release-safe for terminal and browser operations.
 
 ### Tasks
-- [ ] Add structured logs with `correlation_id`, `session_id`, `command_id`, and component tags.
-- [ ] Add browser-specific fields in logs (`browser_session_id`, `tab_id`, `target_id`, `surface_id`).
-- [ ] Add metrics (latency histograms, queue depth, error rate, active sessions, replay time).
-- [ ] Add browser metrics (navigation latency, action latency, event stream lag, crash count, reconnect count).
-- [ ] Add OpenTelemetry traces for RPC path, dispatcher, storage, terminal, and browser execution.
-- [ ] Implement health/readiness endpoints and diagnostics commands.
-- [ ] Finalize CLI-to-RPC integration for core terminal and browser workflows.
-- [ ] Add compatibility tests for JSON-RPC v1 stability and additive evolution rules.
-- [ ] Produce operational runbook: startup, shutdown, incident triage, recovery steps.
-- [ ] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
-- [ ] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-6: release browser-enabled backend`).
+- [x] Add structured logs with `correlation_id`, `session_id`, `command_id`, and component tags.
+- [x] Add browser-specific fields in logs (`browser_session_id`, `tab_id`, `target_id`, `surface_id`).
+- [x] Add metrics (latency histograms, queue depth, error rate, active sessions, replay time).
+- [x] Add browser metrics (navigation latency, action latency, event stream lag, crash count, reconnect count).
+- [x] Add OpenTelemetry traces for RPC path, dispatcher, storage, terminal, and browser execution.
+- [x] Implement health/readiness endpoints and diagnostics commands.
+- [x] Finalize CLI-to-RPC integration for core terminal and browser workflows.
+- [x] Add compatibility tests for JSON-RPC v1 stability and additive evolution rules.
+- [x] Produce operational runbook: startup, shutdown, incident triage, recovery steps.
+- [x] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
+- [x] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-6: release browser-enabled backend`).
 
 ### Deliverables
 - Production-grade observability for terminal and browser subsystems
