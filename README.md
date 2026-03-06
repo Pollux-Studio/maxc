@@ -178,7 +178,7 @@ maxc uses a modular architecture designed for performance and extensibility.
           │                           │
 
       Terminal Engine            Browser Engine
-         ConPTY                     WebView
+         ConPTY               Chromium + Playwright
 
           │                           │
           ▼                           ▼
@@ -213,7 +213,8 @@ terminal/
   terminal_renderer
 
 browser/
-  webview_runtime
+  chromium_runtime
+  playwright_driver
   dom_controller
   automation_api
 
@@ -259,6 +260,8 @@ Supported shells include:
 ## 🌐 Browser Engine
 
 Browser surfaces allow developers and AI agents to interact with web applications directly inside the workspace.
+
+Runtime direction: Chromium controlled through a Playwright-based backend driver.
 
 Capabilities include:
 
@@ -354,7 +357,8 @@ maxc is built with modern systems technologies.
 * Tokio async runtime
 * ConPTY terminal backend
 * VTE terminal parser
-* WebView browser runtime
+* Chromium browser runtime
+* Playwright automation driver
 * Winit GPU based UI
 * Clap CLI framework
 * Serde JSON RPC
@@ -363,9 +367,9 @@ maxc is built with modern systems technologies.
 
 ### Phase 1
 
-Core terminal workspace
+Core workspace foundations
 
-* terminal engine
+* terminal + browser surface models
 * pane splitting
 * surface tabs
 
