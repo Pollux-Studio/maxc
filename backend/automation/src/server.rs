@@ -9,7 +9,7 @@ use maxc_storage::{
 use rand::RngCore;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -74,6 +74,9 @@ struct ServerState {
     terminal_subscriptions: StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
     browser_subscriptions: StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
     scheduler: StdMutex<SchedulerState>,
+    breaker: StdMutex<CircuitBreaker>,
+    faults: StdMutex<HashMap<FaultHook, FaultAction>>,
+    shutting_down: AtomicBool,
     inflight_by_connection: StdMutex<HashMap<String, usize>>,
     correlation: AtomicU64,
 }
@@ -114,9 +117,9 @@ struct SubscriptionState {
 }
 
 impl SubscriptionState {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
-            queue: VecDeque::new(),
+            queue: VecDeque::with_capacity(limit),
             dropped_events: 0,
         }
     }
@@ -138,6 +141,29 @@ impl SubscriptionState {
 struct SchedulerState {
     interactive_inflight: usize,
     background_inflight: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CircuitBreaker {
+    consecutive_failures: u32,
+    open_until_ms: Option<u64>,
+    half_open_probe_running: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FaultHook {
+    StoreAppend,
+    Snapshot,
+    MethodDispatch,
+    Response,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum FaultAction {
+    ReturnInternal,
+    DelayMs(u64),
+    DropResponse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +299,13 @@ impl Drop for InflightGuard {
 
 impl RpcServer {
     pub fn new(config: BackendConfig) -> Result<Self, RpcServerInitError> {
+        Self::new_with_faults_internal(config, HashMap::new())
+    }
+
+    fn new_with_faults_internal(
+        config: BackendConfig,
+        faults: HashMap<FaultHook, FaultAction>,
+    ) -> Result<Self, RpcServerInitError> {
         let store_cfg = EventStoreConfig {
             event_dir: std::path::PathBuf::from(config.event_dir.clone()),
             segment_max_bytes: config.segment_max_bytes,
@@ -295,10 +328,21 @@ impl RpcServer {
                 terminal_subscriptions: StdMutex::new(HashMap::new()),
                 browser_subscriptions: StdMutex::new(HashMap::new()),
                 scheduler: StdMutex::new(SchedulerState::default()),
+                breaker: StdMutex::new(CircuitBreaker::default()),
+                faults: StdMutex::new(faults),
+                shutting_down: AtomicBool::new(false),
                 inflight_by_connection: StdMutex::new(HashMap::new()),
                 correlation: AtomicU64::new(1),
             }),
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_faults(
+        config: BackendConfig,
+        faults: HashMap<FaultHook, FaultAction>,
+    ) -> Result<Self, RpcServerInitError> {
+        Self::new_with_faults_internal(config, faults)
     }
 
     pub async fn handle_json_line(&self, connection_id: &str, line: &str) -> String {
@@ -340,6 +384,9 @@ impl RpcServer {
         connection_id: &str,
         line: &str,
     ) -> Result<Value, ServerError> {
+        if self.is_shutting_down() {
+            return Err(ServerError::RateLimited);
+        }
         if line.len() > self.config.max_payload_bytes {
             return Err(ServerError::InvalidRequest);
         }
@@ -358,6 +405,7 @@ impl RpcServer {
         connection_id: &str,
         request: RpcRequest,
     ) -> Result<Value, ServerError> {
+        self.check_breaker()?;
         let id = request.id.clone().unwrap_or(RpcId::Null);
         let _guard = InflightGuard::acquire(
             Arc::clone(&self.state),
@@ -366,9 +414,22 @@ impl RpcServer {
         )?;
 
         let timeout_duration = Duration::from_millis(self.config.request_timeout_ms);
-        let response = timeout(timeout_duration, self.dispatch(request))
-            .await
-            .map_err(|_| ServerError::Timeout)??;
+        let response = match timeout(timeout_duration, self.dispatch(request)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                self.record_failure(&err);
+                return Err(err);
+            }
+            Err(_) => {
+                self.record_failure(&ServerError::Timeout);
+                return Err(ServerError::Timeout);
+            }
+        };
+        if let Err(err) = self.apply_fault(FaultHook::Response).await {
+            self.record_failure(&err);
+            return Err(err);
+        }
+        self.record_success();
 
         serde_json::to_value(RpcSuccess {
             id,
@@ -378,6 +439,17 @@ impl RpcServer {
     }
 
     async fn check_limits(&self, connection_id: &str) -> Result<(), ServerError> {
+        let total_inflight = {
+            let inflight = self
+                .state
+                .inflight_by_connection
+                .lock()
+                .expect("inflight lock poisoned");
+            inflight.values().copied().sum::<usize>()
+        };
+        if total_inflight >= self.config.overload_reject_threshold {
+            return Err(ServerError::RateLimited);
+        }
         {
             let mut global = self.state.global_limiter.lock().await;
             if !global.allow() {
@@ -396,6 +468,7 @@ impl RpcServer {
     }
 
     async fn dispatch(&self, request: RpcRequest) -> Result<Value, ServerError> {
+        self.apply_fault(FaultHook::MethodDispatch).await?;
         match request.method.as_str() {
             "session.create" => self.session_create(request.params).await,
             "session.refresh" => self.session_refresh(request.params).await,
@@ -1644,7 +1717,10 @@ impl RpcServer {
                 .take(10)
                 .collect::<String>()
         );
-        entry.insert(subscriber_id.clone(), SubscriptionState::new());
+        entry.insert(
+            subscriber_id.clone(),
+            SubscriptionState::new(self.config.queue_limit.max(1)),
+        );
         Ok(subscriber_id)
     }
 
@@ -1711,9 +1787,11 @@ impl RpcServer {
         if let Some(existing) = projection.command_results.get(&event.command_id) {
             return Ok(existing.clone());
         }
+        self.apply_fault(FaultHook::StoreAppend).await?;
         let mut store = self.state.store.lock().await;
         let cursor = store.append(&event).map_err(map_store_error)?;
         projection.apply(&event, cursor).map_err(map_store_error)?;
+        self.apply_fault(FaultHook::Snapshot).await?;
         store
             .maybe_snapshot_and_compact(&projection)
             .map_err(map_store_error)?;
@@ -1747,13 +1825,113 @@ impl RpcServer {
         projection.sessions.len()
     }
 
+    pub fn begin_shutdown(&self) {
+        self.state.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.state.shutting_down.load(Ordering::SeqCst)
+    }
+
+    pub async fn shutdown_and_drain(&self) {
+        self.begin_shutdown();
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.shutdown_drain_timeout_ms);
+        loop {
+            let inflight = {
+                let map = self
+                    .state
+                    .inflight_by_connection
+                    .lock()
+                    .expect("inflight lock poisoned");
+                map.values().copied().sum::<usize>()
+            };
+            if inflight == 0 || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.state.terminal_runtime.lock().await.clear();
+        self.state.browser_runtime.lock().await.clear();
+        self.state
+            .terminal_subscriptions
+            .lock()
+            .expect("subscription lock poisoned")
+            .clear();
+        self.state
+            .browser_subscriptions
+            .lock()
+            .expect("subscription lock poisoned")
+            .clear();
+    }
+
+    fn check_breaker(&self) -> Result<(), ServerError> {
+        let now = now_unix_ms();
+        let mut breaker = self.state.breaker.lock().expect("breaker lock poisoned");
+        if let Some(open_until_ms) = breaker.open_until_ms {
+            if open_until_ms > now {
+                return Err(ServerError::RateLimited);
+            }
+            if breaker.half_open_probe_running {
+                return Err(ServerError::RateLimited);
+            }
+            breaker.open_until_ms = None;
+            breaker.half_open_probe_running = true;
+        }
+        Ok(())
+    }
+
+    fn record_success(&self) {
+        let mut breaker = self.state.breaker.lock().expect("breaker lock poisoned");
+        breaker.consecutive_failures = 0;
+        breaker.open_until_ms = None;
+        breaker.half_open_probe_running = false;
+    }
+
+    fn record_failure(&self, err: &ServerError) {
+        if !matches!(err, ServerError::Internal | ServerError::Timeout) {
+            return;
+        }
+        let now = now_unix_ms();
+        let mut breaker = self.state.breaker.lock().expect("breaker lock poisoned");
+        breaker.consecutive_failures = breaker.consecutive_failures.saturating_add(1);
+        breaker.half_open_probe_running = false;
+        if breaker.consecutive_failures >= self.config.breaker_failure_threshold {
+            breaker.open_until_ms = Some(now + self.config.breaker_cooldown_ms);
+        }
+    }
+
+    async fn apply_fault(&self, hook: FaultHook) -> Result<(), ServerError> {
+        let action = {
+            let faults = self.state.faults.lock().expect("fault lock poisoned");
+            faults.get(&hook).cloned()
+        };
+        match action {
+            Some(FaultAction::ReturnInternal) => Err(ServerError::Internal),
+            Some(FaultAction::DelayMs(delay_ms)) => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                Ok(())
+            }
+            Some(FaultAction::DropResponse) => Err(ServerError::Timeout),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(windows)]
     pub async fn serve_named_pipe(&self, pipe_name: &str) -> Result<(), std::io::Error> {
+        self.serve_named_pipe_until_shutdown(pipe_name).await
+    }
+
+    #[cfg(windows)]
+    pub async fn serve_named_pipe_until_shutdown(
+        &self,
+        pipe_name: &str,
+    ) -> Result<(), std::io::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::windows::named_pipe::ServerOptions;
 
         let mut listener = ServerOptions::new().create(pipe_name)?;
-        loop {
+        while !self.is_shutting_down() {
             listener.connect().await?;
             let next_listener = ServerOptions::new().create(pipe_name)?;
             let mut stream = std::mem::replace(&mut listener, next_listener);
@@ -1783,10 +1961,19 @@ impl RpcServer {
                 }
             });
         }
+        Ok(())
     }
 
     #[cfg(not(windows))]
     pub async fn serve_named_pipe(&self, _pipe_name: &str) -> Result<(), std::io::Error> {
+        self.serve_named_pipe_until_shutdown(_pipe_name).await
+    }
+
+    #[cfg(not(windows))]
+    pub async fn serve_named_pipe_until_shutdown(
+        &self,
+        _pipe_name: &str,
+    ) -> Result<(), std::io::Error> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "named pipes are only supported on Windows",
@@ -2392,6 +2579,157 @@ mod tests {
                 serde_json::from_str(&server.handle_json_line("c", &req).await).expect("json");
             assert!(out.get("result").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_requests_and_drains_runtime() {
+        let cfg = BackendConfig {
+            shutdown_drain_timeout_ms: 50,
+            ..test_config("shutdown")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        server.begin_shutdown();
+
+        let denied = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 1,
+                    "method": "system.health"
+                })
+                .to_string(),
+            )
+            .await;
+        let denied: Value = serde_json::from_str(&denied).expect("json");
+        assert_eq!(denied["error"]["code"], "RATE_LIMITED");
+
+        server.shutdown_and_drain().await;
+        assert!(server.state.terminal_runtime.lock().await.is_empty());
+        assert!(server.state.browser_runtime.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overload_threshold_rejects_requests() {
+        let cfg = BackendConfig {
+            overload_reject_threshold: 1,
+            ..test_config("overload")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        {
+            let mut inflight = server
+                .state
+                .inflight_by_connection
+                .lock()
+                .expect("inflight lock");
+            inflight.insert("conn-a".to_string(), 1);
+        }
+        let output = server
+            .handle_json_line(
+                "conn-b",
+                &json!({
+                    "id": 1,
+                    "method": "system.health"
+                })
+                .to_string(),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(parsed["error"]["code"], "RATE_LIMITED");
+    }
+
+    #[tokio::test]
+    async fn fault_injection_opens_breaker_and_then_recovers() {
+        let cfg = BackendConfig {
+            breaker_failure_threshold: 2,
+            breaker_cooldown_ms: 5,
+            ..test_config("breaker")
+        };
+        let mut faults = HashMap::new();
+        faults.insert(FaultHook::MethodDispatch, FaultAction::ReturnInternal);
+        let server = RpcServer::new_with_faults(cfg, faults).expect("server");
+
+        let request = json!({
+            "id": 1,
+            "method": "system.health"
+        })
+        .to_string();
+        for _ in 0..2 {
+            let out = server.handle_json_line("conn-a", &request).await;
+            let parsed: Value = serde_json::from_str(&out).expect("json");
+            assert_eq!(parsed["error"]["code"], "INTERNAL");
+        }
+
+        let blocked = server.handle_json_line("conn-a", &request).await;
+        let blocked: Value = serde_json::from_str(&blocked).expect("json");
+        assert_eq!(blocked["error"]["code"], "RATE_LIMITED");
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        server.state.faults.lock().expect("fault lock").clear();
+        let recovered = server.handle_json_line("conn-a", &request).await;
+        let recovered: Value = serde_json::from_str(&recovered).expect("json");
+        assert_eq!(recovered["result"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn fault_injection_can_fail_persist_path() {
+        let cfg = test_config("persist-fault");
+        let mut faults = HashMap::new();
+        faults.insert(FaultHook::StoreAppend, FaultAction::ReturnInternal);
+        let server = RpcServer::new_with_faults(cfg, faults).expect("server");
+
+        let create = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": { "command_id": "cmd-1" }
+        })
+        .to_string();
+        let output = server.handle_json_line("conn-a", &create).await;
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(parsed["error"]["code"], "INTERNAL");
+    }
+
+    #[tokio::test]
+    async fn response_fault_can_force_timeout_path() {
+        let cfg = test_config("response-fault");
+        let mut faults = HashMap::new();
+        faults.insert(FaultHook::Response, FaultAction::DropResponse);
+        let server = RpcServer::new_with_faults(cfg, faults).expect("server");
+
+        let output = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 1,
+                    "method": "system.health"
+                })
+                .to_string(),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(parsed["error"]["code"], "TIMEOUT");
+    }
+
+    #[tokio::test]
+    async fn delay_fault_slows_dispatch_without_failing() {
+        let cfg = test_config("delay-fault");
+        let mut faults = HashMap::new();
+        faults.insert(FaultHook::MethodDispatch, FaultAction::DelayMs(5));
+        let server = RpcServer::new_with_faults(cfg, faults).expect("server");
+
+        let start = Instant::now();
+        let output = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 1,
+                    "method": "system.health"
+                })
+                .to_string(),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(parsed["result"]["ok"], true);
+        assert!(start.elapsed() >= Duration::from_millis(5));
     }
 
     #[tokio::test]

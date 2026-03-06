@@ -26,5 +26,8 @@ jobs:
       - name: backend tests
         run: cargo test --workspace --all-features
 
+      - name: backend perf guardrails
+        run: cargo run -p maxc-automation --bin perf-harness -- --profile ci --json
+
       - name: cargo llvm-cov
         run: cargo llvm-cov --workspace --all-features --fail-under-lines 85

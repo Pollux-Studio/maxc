@@ -111,6 +111,10 @@ pub struct BackendConfig {
     pub browser_download_max_bytes: usize,
     pub browser_subscription_limit: usize,
     pub browser_raw_rate_limit_per_sec: u32,
+    pub shutdown_drain_timeout_ms: u64,
+    pub overload_reject_threshold: usize,
+    pub breaker_failure_threshold: u32,
+    pub breaker_cooldown_ms: u64,
     pub log_level: String,
 }
 
@@ -146,6 +150,10 @@ impl Default for BackendConfig {
             browser_download_max_bytes: 52_428_800,
             browser_subscription_limit: 32,
             browser_raw_rate_limit_per_sec: 10,
+            shutdown_drain_timeout_ms: 3_000,
+            overload_reject_threshold: 1_024,
+            breaker_failure_threshold: 5,
+            breaker_cooldown_ms: 10_000,
             log_level: "info".to_string(),
         }
     }
@@ -336,6 +344,42 @@ impl BackendConfig {
                         value: value.clone(),
                     })?;
         }
+        if let Some(value) = get("MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS") {
+            cfg.shutdown_drain_timeout_ms =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_OVERLOAD_REJECT_THRESHOLD") {
+            cfg.overload_reject_threshold =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_OVERLOAD_REJECT_THRESHOLD",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BREAKER_FAILURE_THRESHOLD") {
+            cfg.breaker_failure_threshold =
+                value
+                    .parse::<u32>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BREAKER_FAILURE_THRESHOLD",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BREAKER_COOLDOWN_MS") {
+            cfg.breaker_cooldown_ms =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BREAKER_COOLDOWN_MS",
+                        value: value.clone(),
+                    })?;
+        }
 
         if let Some(value) = get("MAXC_LOG_LEVEL") {
             cfg.log_level = value;
@@ -478,6 +522,30 @@ impl BackendConfig {
                 value: self.browser_raw_rate_limit_per_sec.to_string(),
             });
         }
+        if self.shutdown_drain_timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS",
+                value: self.shutdown_drain_timeout_ms.to_string(),
+            });
+        }
+        if self.overload_reject_threshold == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_OVERLOAD_REJECT_THRESHOLD",
+                value: self.overload_reject_threshold.to_string(),
+            });
+        }
+        if self.breaker_failure_threshold == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BREAKER_FAILURE_THRESHOLD",
+                value: self.breaker_failure_threshold.to_string(),
+            });
+        }
+        if self.breaker_cooldown_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BREAKER_COOLDOWN_MS",
+                value: self.breaker_cooldown_ms.to_string(),
+            });
+        }
 
         let valid_levels = ["trace", "debug", "info", "warn", "error"];
         if !valid_levels.contains(&self.log_level.as_str()) {
@@ -560,6 +628,10 @@ mod tests {
         assert_eq!(cfg.browser_download_max_bytes, 52_428_800);
         assert_eq!(cfg.browser_subscription_limit, 32);
         assert_eq!(cfg.browser_raw_rate_limit_per_sec, 10);
+        assert_eq!(cfg.shutdown_drain_timeout_ms, 3_000);
+        assert_eq!(cfg.overload_reject_threshold, 1_024);
+        assert_eq!(cfg.breaker_failure_threshold, 5);
+        assert_eq!(cfg.breaker_cooldown_ms, 10_000);
         assert_eq!(cfg.log_level, "debug");
     }
 
@@ -606,6 +678,10 @@ mod tests {
             "MAXC_BROWSER_DOWNLOAD_MAX_BYTES" => Some("2048".to_string()),
             "MAXC_BROWSER_SUBSCRIPTION_LIMIT" => Some("9".to_string()),
             "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC" => Some("3".to_string()),
+            "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS" => Some("4000".to_string()),
+            "MAXC_OVERLOAD_REJECT_THRESHOLD" => Some("77".to_string()),
+            "MAXC_BREAKER_FAILURE_THRESHOLD" => Some("8".to_string()),
+            "MAXC_BREAKER_COOLDOWN_MS" => Some("9000".to_string()),
             "MAXC_LOG_LEVEL" => Some("warn".to_string()),
             _ => None,
         })
@@ -637,6 +713,10 @@ mod tests {
         assert_eq!(cfg.browser_download_max_bytes, 2048);
         assert_eq!(cfg.browser_subscription_limit, 9);
         assert_eq!(cfg.browser_raw_rate_limit_per_sec, 3);
+        assert_eq!(cfg.shutdown_drain_timeout_ms, 4000);
+        assert_eq!(cfg.overload_reject_threshold, 77);
+        assert_eq!(cfg.breaker_failure_threshold, 8);
+        assert_eq!(cfg.breaker_cooldown_ms, 9000);
         assert_eq!(cfg.log_level, "warn");
     }
 
@@ -784,6 +864,58 @@ mod tests {
                 value: "bad".to_string(),
             }
         );
+
+        let bad_shutdown_timeout = BackendConfig::from_env_map(|key| match key {
+            "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_shutdown_timeout,
+            ConfigError::InvalidValue {
+                key: "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_overload = BackendConfig::from_env_map(|key| match key {
+            "MAXC_OVERLOAD_REJECT_THRESHOLD" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_overload,
+            ConfigError::InvalidValue {
+                key: "MAXC_OVERLOAD_REJECT_THRESHOLD",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_breaker_threshold = BackendConfig::from_env_map(|key| match key {
+            "MAXC_BREAKER_FAILURE_THRESHOLD" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_breaker_threshold,
+            ConfigError::InvalidValue {
+                key: "MAXC_BREAKER_FAILURE_THRESHOLD",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_breaker_cooldown = BackendConfig::from_env_map(|key| match key {
+            "MAXC_BREAKER_COOLDOWN_MS" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_breaker_cooldown,
+            ConfigError::InvalidValue {
+                key: "MAXC_BREAKER_COOLDOWN_MS",
+                value: "bad".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -928,6 +1060,54 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::InvalidValue {
                 key: "MAXC_BROWSER_SUBSCRIPTION_LIMIT",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            shutdown_drain_timeout_ms: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            overload_reject_threshold: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_OVERLOAD_REJECT_THRESHOLD",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            breaker_failure_threshold: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_BREAKER_FAILURE_THRESHOLD",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            breaker_cooldown_ms: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_BREAKER_COOLDOWN_MS",
                 value: "0".to_string(),
             })
         );

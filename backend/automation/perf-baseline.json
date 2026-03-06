@@ -1,0 +1,20 @@
+{
+  "rpc_health": {
+    "p95_ms": 15.0
+  },
+  "session_lifecycle": {
+    "p95_ms": 20.0
+  },
+  "terminal_interactive": {
+    "p95_ms": 25.0
+  },
+  "browser_navigation": {
+    "p95_ms": 30.0
+  },
+  "browser_fanout": {
+    "p95_ms": 30.0
+  },
+  "restart_recovery": {
+    "max_ms": 300.0
+  }
+}

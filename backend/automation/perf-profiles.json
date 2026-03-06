@@ -1,0 +1,27 @@
+{
+  "rpc_health": {
+    "iterations": 120,
+    "warmup": 10
+  },
+  "session_lifecycle": {
+    "iterations": 80,
+    "warmup": 5
+  },
+  "terminal_interactive": {
+    "iterations": 80,
+    "warmup": 5
+  },
+  "browser_navigation": {
+    "iterations": 80,
+    "warmup": 5
+  },
+  "browser_fanout": {
+    "iterations": 60,
+    "warmup": 5
+  },
+  "restart_recovery": {
+    "iterations": 1,
+    "warmup": 0,
+    "fixture_events": 1000
+  }
+}

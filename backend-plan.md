@@ -158,15 +158,15 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - Optimize latency/throughput and harden backend against failure scenarios.
 
 ### Tasks
-- [ ] Define backend SLOs and benchmark profiles for terminal and browser workloads.
-- [ ] Add benchmark harness for RPC latency, stream latency, command throughput, and browser action latency.
-- [ ] Optimize hot paths (buffer reuse, lock contention reduction, batched persistence, event fan-out).
-- [ ] Add graceful shutdown with queue draining and in-flight request handling.
-- [ ] Add fault injection tests for partial writes, process crashes, browser runtime crashes, and restart loops.
-- [ ] Add protective controls: circuit breaker, queue caps, overload rejection policy.
-- [ ] Add regression guardrails in CI for key performance thresholds.
-- [ ] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
-- [ ] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-5: harden browser and terminal reliability`).
+- [x] Define backend SLOs and benchmark profiles for terminal and browser workloads.
+- [x] Add benchmark harness for RPC latency, stream latency, command throughput, and browser action latency.
+- [x] Optimize hot paths (buffer reuse, lock contention reduction, batched persistence, event fan-out).
+- [x] Add graceful shutdown with queue draining and in-flight request handling.
+- [x] Add fault injection tests for partial writes, process crashes, browser runtime crashes, and restart loops.
+- [x] Add protective controls: circuit breaker, queue caps, overload rejection policy.
+- [x] Add regression guardrails in CI for key performance thresholds.
+- [x] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
+- [x] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-5: harden browser and terminal reliability`).
 
 ### Deliverables
 - Performance baselines and optimization changes
