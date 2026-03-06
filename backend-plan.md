@@ -140,7 +140,7 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - [x] Add lifecycle cleanup hooks to prevent orphaned sessions/processes.
 - [x] Add robust error propagation for process exits, runtime failures, IO failures, and cancellation.
 - [x] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
-- [ ] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-4: implement browser and terminal execution core`).
+- [x] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-4: implement browser and terminal execution core`).
 
 ### Deliverables
 - Functional terminal and browser backend APIs
