@@ -111,6 +111,15 @@ pub struct BackendConfig {
     pub browser_download_max_bytes: usize,
     pub browser_subscription_limit: usize,
     pub browser_raw_rate_limit_per_sec: u32,
+    pub terminal_runtime: String,
+    pub terminal_max_sessions: usize,
+    pub terminal_max_sessions_per_workspace: usize,
+    pub terminal_max_history_events: usize,
+    pub terminal_max_history_bytes: usize,
+    pub terminal_max_input_bytes: usize,
+    pub terminal_max_env_bytes: usize,
+    pub terminal_allowed_cwd_roots: Vec<String>,
+    pub terminal_allowed_programs: Vec<String>,
     pub shutdown_drain_timeout_ms: u64,
     pub overload_reject_threshold: usize,
     pub breaker_failure_threshold: u32,
@@ -150,6 +159,19 @@ impl Default for BackendConfig {
             browser_download_max_bytes: 52_428_800,
             browser_subscription_limit: 32,
             browser_raw_rate_limit_per_sec: 10,
+            terminal_runtime: if cfg!(windows) {
+                "conpty".to_string()
+            } else {
+                "process-stdio".to_string()
+            },
+            terminal_max_sessions: 32,
+            terminal_max_sessions_per_workspace: 8,
+            terminal_max_history_events: 512,
+            terminal_max_history_bytes: 262_144,
+            terminal_max_input_bytes: 8_192,
+            terminal_max_env_bytes: 8_192,
+            terminal_allowed_cwd_roots: Vec::new(),
+            terminal_allowed_programs: Vec::new(),
             shutdown_drain_timeout_ms: 3_000,
             overload_reject_threshold: 1_024,
             breaker_failure_threshold: 5,
@@ -344,6 +366,77 @@ impl BackendConfig {
                         value: value.clone(),
                     })?;
         }
+        if let Some(value) = get("MAXC_TERMINAL_RUNTIME") {
+            cfg.terminal_runtime = value;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_MAX_SESSIONS") {
+            cfg.terminal_max_sessions =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_TERMINAL_MAX_SESSIONS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_MAX_SESSIONS_PER_WORKSPACE") {
+            cfg.terminal_max_sessions_per_workspace =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_TERMINAL_MAX_SESSIONS_PER_WORKSPACE",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_MAX_HISTORY_EVENTS") {
+            cfg.terminal_max_history_events =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_TERMINAL_MAX_HISTORY_EVENTS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_MAX_HISTORY_BYTES") {
+            cfg.terminal_max_history_bytes =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_TERMINAL_MAX_HISTORY_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_MAX_INPUT_BYTES") {
+            cfg.terminal_max_input_bytes =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_TERMINAL_MAX_INPUT_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_MAX_ENV_BYTES") {
+            cfg.terminal_max_env_bytes =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_TERMINAL_MAX_ENV_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_TERMINAL_ALLOWED_CWD_ROOTS") {
+            cfg.terminal_allowed_cwd_roots = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_TERMINAL_ALLOWED_PROGRAMS") {
+            cfg.terminal_allowed_programs = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
         if let Some(value) = get("MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS") {
             cfg.shutdown_drain_timeout_ms =
                 value
@@ -522,6 +615,48 @@ impl BackendConfig {
                 value: self.browser_raw_rate_limit_per_sec.to_string(),
             });
         }
+        if !["conpty", "process-stdio"].contains(&self.terminal_runtime.as_str()) {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_RUNTIME",
+                value: self.terminal_runtime.clone(),
+            });
+        }
+        if self.terminal_max_sessions == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_SESSIONS",
+                value: self.terminal_max_sessions.to_string(),
+            });
+        }
+        if self.terminal_max_sessions_per_workspace == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_SESSIONS_PER_WORKSPACE",
+                value: self.terminal_max_sessions_per_workspace.to_string(),
+            });
+        }
+        if self.terminal_max_history_events == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_HISTORY_EVENTS",
+                value: self.terminal_max_history_events.to_string(),
+            });
+        }
+        if self.terminal_max_history_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_HISTORY_BYTES",
+                value: self.terminal_max_history_bytes.to_string(),
+            });
+        }
+        if self.terminal_max_input_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_INPUT_BYTES",
+                value: self.terminal_max_input_bytes.to_string(),
+            });
+        }
+        if self.terminal_max_env_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_ENV_BYTES",
+                value: self.terminal_max_env_bytes.to_string(),
+            });
+        }
         if self.shutdown_drain_timeout_ms == 0 {
             return Err(ConfigError::InvalidValue {
                 key: "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS",
@@ -628,6 +763,22 @@ mod tests {
         assert_eq!(cfg.browser_download_max_bytes, 52_428_800);
         assert_eq!(cfg.browser_subscription_limit, 32);
         assert_eq!(cfg.browser_raw_rate_limit_per_sec, 10);
+        assert_eq!(
+            cfg.terminal_runtime,
+            if cfg!(windows) {
+                "conpty".to_string()
+            } else {
+                "process-stdio".to_string()
+            }
+        );
+        assert_eq!(cfg.terminal_max_sessions, 32);
+        assert_eq!(cfg.terminal_max_sessions_per_workspace, 8);
+        assert_eq!(cfg.terminal_max_history_events, 512);
+        assert_eq!(cfg.terminal_max_history_bytes, 262_144);
+        assert_eq!(cfg.terminal_max_input_bytes, 8_192);
+        assert_eq!(cfg.terminal_max_env_bytes, 8_192);
+        assert!(cfg.terminal_allowed_cwd_roots.is_empty());
+        assert!(cfg.terminal_allowed_programs.is_empty());
         assert_eq!(cfg.shutdown_drain_timeout_ms, 3_000);
         assert_eq!(cfg.overload_reject_threshold, 1_024);
         assert_eq!(cfg.breaker_failure_threshold, 5);
@@ -678,6 +829,15 @@ mod tests {
             "MAXC_BROWSER_DOWNLOAD_MAX_BYTES" => Some("2048".to_string()),
             "MAXC_BROWSER_SUBSCRIPTION_LIMIT" => Some("9".to_string()),
             "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC" => Some("3".to_string()),
+            "MAXC_TERMINAL_RUNTIME" => Some("process-stdio".to_string()),
+            "MAXC_TERMINAL_MAX_SESSIONS" => Some("13".to_string()),
+            "MAXC_TERMINAL_MAX_SESSIONS_PER_WORKSPACE" => Some("5".to_string()),
+            "MAXC_TERMINAL_MAX_HISTORY_EVENTS" => Some("123".to_string()),
+            "MAXC_TERMINAL_MAX_HISTORY_BYTES" => Some("4567".to_string()),
+            "MAXC_TERMINAL_MAX_INPUT_BYTES" => Some("111".to_string()),
+            "MAXC_TERMINAL_MAX_ENV_BYTES" => Some("222".to_string()),
+            "MAXC_TERMINAL_ALLOWED_CWD_ROOTS" => Some("C:\\work;D:\\repos".to_string()),
+            "MAXC_TERMINAL_ALLOWED_PROGRAMS" => Some("powershell.exe;cmd.exe".to_string()),
             "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS" => Some("4000".to_string()),
             "MAXC_OVERLOAD_REJECT_THRESHOLD" => Some("77".to_string()),
             "MAXC_BREAKER_FAILURE_THRESHOLD" => Some("8".to_string()),
@@ -713,6 +873,21 @@ mod tests {
         assert_eq!(cfg.browser_download_max_bytes, 2048);
         assert_eq!(cfg.browser_subscription_limit, 9);
         assert_eq!(cfg.browser_raw_rate_limit_per_sec, 3);
+        assert_eq!(cfg.terminal_runtime, "process-stdio");
+        assert_eq!(cfg.terminal_max_sessions, 13);
+        assert_eq!(cfg.terminal_max_sessions_per_workspace, 5);
+        assert_eq!(cfg.terminal_max_history_events, 123);
+        assert_eq!(cfg.terminal_max_history_bytes, 4567);
+        assert_eq!(cfg.terminal_max_input_bytes, 111);
+        assert_eq!(cfg.terminal_max_env_bytes, 222);
+        assert_eq!(
+            cfg.terminal_allowed_cwd_roots,
+            vec!["C:\\work".to_string(), "D:\\repos".to_string()]
+        );
+        assert_eq!(
+            cfg.terminal_allowed_programs,
+            vec!["powershell.exe".to_string(), "cmd.exe".to_string()]
+        );
         assert_eq!(cfg.shutdown_drain_timeout_ms, 4000);
         assert_eq!(cfg.overload_reject_threshold, 77);
         assert_eq!(cfg.breaker_failure_threshold, 8);
@@ -862,6 +1037,32 @@ mod tests {
             ConfigError::InvalidValue {
                 key: "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC",
                 value: "bad".to_string(),
+            }
+        );
+
+        let bad_terminal_sessions = BackendConfig::from_env_map(|key| match key {
+            "MAXC_TERMINAL_MAX_SESSIONS" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_terminal_sessions,
+            ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_SESSIONS",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_terminal_runtime = BackendConfig::from_env_map(|key| match key {
+            "MAXC_TERMINAL_RUNTIME" => Some("bogus".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_terminal_runtime,
+            ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_RUNTIME",
+                value: "bogus".to_string(),
             }
         );
 
@@ -1061,6 +1262,30 @@ mod tests {
             Err(ConfigError::InvalidValue {
                 key: "MAXC_BROWSER_SUBSCRIPTION_LIMIT",
                 value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            terminal_max_sessions: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_MAX_SESSIONS",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            terminal_runtime: "bad".to_string(),
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_TERMINAL_RUNTIME",
+                value: "bad".to_string(),
             })
         );
 

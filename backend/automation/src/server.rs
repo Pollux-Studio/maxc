@@ -13,12 +13,38 @@ use maxc_telemetry::{
 use rand::RngCore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File as StdFile;
+use std::io::{BufRead, BufReader as StdBufReader, Write};
+#[cfg(windows)]
+use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, Command};
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Pipes::CreatePipe;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, STARTUPINFOEXW,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
@@ -124,13 +150,72 @@ impl ServerMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
 struct TerminalSessionRuntime {
+    workspace_id: String,
+    surface_id: String,
     cols: u16,
     rows: u16,
     alive: bool,
     last_output: String,
+    program: String,
+    cwd: String,
+    pid: u32,
+    runtime: String,
+    status: String,
+    exit_code: Option<i32>,
+    input: Option<TerminalInputHandle>,
+    kill_tx: Option<oneshot::Sender<()>>,
+    next_sequence: u64,
+    history: VecDeque<Value>,
+    history_bytes: usize,
+    #[cfg(windows)]
+    conpty: Option<Arc<ConptyControl>>,
 }
+
+impl std::fmt::Debug for TerminalSessionRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalSessionRuntime")
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("alive", &self.alive)
+            .field("last_output", &self.last_output)
+            .field("workspace_id", &self.workspace_id)
+            .field("surface_id", &self.surface_id)
+            .field("program", &self.program)
+            .field("cwd", &self.cwd)
+            .field("pid", &self.pid)
+            .field("runtime", &self.runtime)
+            .field("status", &self.status)
+            .field("exit_code", &self.exit_code)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct TerminalLaunchSpec {
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+    env: HashMap<String, String>,
+    shell: String,
+}
+
+#[derive(Clone)]
+enum TerminalInputHandle {
+    Process(Arc<Mutex<ChildStdin>>),
+    BlockingPipe(Arc<StdMutex<StdFile>>),
+}
+
+#[cfg(windows)]
+struct ConptyControl {
+    hpc: HPCON,
+    process_handle: HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for ConptyControl {}
+#[cfg(windows)]
+unsafe impl Sync for ConptyControl {}
 
 #[derive(Debug, Clone)]
 struct BrowserSessionRuntime {
@@ -640,6 +725,9 @@ impl RpcServer {
             "browser_runtime_count": browser_runtime.len(),
             "terminal_subscription_count": terminal_subscriptions.values().map(|v| v.len()).sum::<usize>(),
             "browser_subscription_count": browser_subscriptions.values().map(|v| v.len()).sum::<usize>(),
+            "terminal_history_events": terminal_runtime.values().map(|session| session.history.len()).sum::<usize>(),
+            "terminal_history_bytes": terminal_runtime.values().map(|session| session.history_bytes).sum::<usize>(),
+            "terminal_runtime_backend": selected_terminal_runtime_name(&self.config),
             "active_requests": self.active_request_count(),
             "shutting_down": self.is_shutting_down(),
             "breaker_open": self.breaker_is_open(),
@@ -657,6 +745,26 @@ impl RpcServer {
         metrics.gauges.insert(
             "runtime.terminal.sessions".to_string(),
             self.state.terminal_runtime.lock().await.len() as u64,
+        );
+        metrics.gauges.insert(
+            "runtime.terminal.history_events".to_string(),
+            self.state
+                .terminal_runtime
+                .lock()
+                .await
+                .values()
+                .map(|session| session.history.len() as u64)
+                .sum::<u64>(),
+        );
+        metrics.gauges.insert(
+            "runtime.terminal.history_bytes".to_string(),
+            self.state
+                .terminal_runtime
+                .lock()
+                .await
+                .values()
+                .map(|session| session.history_bytes as u64)
+                .sum::<u64>(),
         );
         metrics.gauges.insert(
             "runtime.browser.sessions".to_string(),
@@ -930,6 +1038,7 @@ impl RpcServer {
             "terminal.spawn" => self.terminal_spawn(command_id, audit, params_ref).await,
             "terminal.input" => self.terminal_input(command_id, audit, params_ref).await,
             "terminal.resize" => self.terminal_resize(command_id, audit, params_ref).await,
+            "terminal.history" => self.terminal_history(audit, params_ref).await,
             "terminal.kill" => self.terminal_kill(command_id, audit).await,
             "terminal.subscribe" => self.terminal_subscribe(command_id, audit).await,
             _ => Err(ServerError::NotFound),
@@ -952,26 +1061,79 @@ impl RpcServer {
             .and_then(Value::as_u64)
             .map(|v| v as u16)
             .unwrap_or(30);
-        let shell = params
-            .get("shell")
-            .and_then(Value::as_str)
-            .unwrap_or("powershell")
-            .to_string();
+        let launch = parse_terminal_launch_spec(params)?;
+        self.enforce_terminal_spawn_limits(&audit, &launch).await?;
         let terminal_session_id = format!(
             "ts-{}",
             random_token()?.chars().take(12).collect::<String>()
         );
+        let spawn = spawn_terminal_process(&self.config, &launch, cols, rows).await?;
+        let pid = match &spawn {
+            SpawnedTerminalProcess::Process(process) => process.pid,
+            #[cfg(windows)]
+            SpawnedTerminalProcess::Conpty(process) => process.pid,
+        };
+        let program = launch.program.clone();
+        let cwd = launch.cwd.clone();
+        let runtime_name = match &spawn {
+            SpawnedTerminalProcess::Process(_) => "process-stdio",
+            #[cfg(windows)]
+            SpawnedTerminalProcess::Conpty(_) => "conpty",
+        };
+        let (kill_tx, kill_rx) = oneshot::channel();
         {
             let mut runtime = self.state.terminal_runtime.lock().await;
             runtime.insert(
                 terminal_session_id.clone(),
                 TerminalSessionRuntime {
+                    workspace_id: audit.workspace_id.clone(),
+                    surface_id: audit.surface_id.clone(),
                     cols,
                     rows,
                     alive: true,
-                    last_output: format!("{shell} started"),
+                    last_output: String::new(),
+                    program: program.clone(),
+                    cwd: cwd.clone(),
+                    pid,
+                    runtime: runtime_name.to_string(),
+                    status: "running".to_string(),
+                    exit_code: None,
+                    input: match &spawn {
+                        SpawnedTerminalProcess::Process(process) => process.input.clone(),
+                        #[cfg(windows)]
+                        SpawnedTerminalProcess::Conpty(process) => process.input.clone(),
+                    },
+                    kill_tx: Some(kill_tx),
+                    next_sequence: 1,
+                    history: VecDeque::with_capacity(self.config.terminal_max_history_events),
+                    history_bytes: 0,
+                    #[cfg(windows)]
+                    conpty: match &spawn {
+                        SpawnedTerminalProcess::Process(_) => None,
+                        SpawnedTerminalProcess::Conpty(process) => Some(process.control.clone()),
+                    },
                 },
             );
+        }
+        match spawn {
+            SpawnedTerminalProcess::Process(process) => {
+                self.spawn_terminal_background_tasks_process(
+                    terminal_session_id.clone(),
+                    process.child,
+                    process.stdout,
+                    process.stderr,
+                    kill_rx,
+                );
+            }
+            #[cfg(windows)]
+            SpawnedTerminalProcess::Conpty(process) => {
+                self.spawn_terminal_background_tasks_conpty(
+                    terminal_session_id.clone(),
+                    process.output,
+                    process.control,
+                    kill_rx,
+                );
+            }
         }
         self.publish_terminal_event(
             &terminal_session_id,
@@ -979,17 +1141,27 @@ impl RpcServer {
                 "type": "terminal.spawned",
                 "terminal_session_id": terminal_session_id,
                 "workspace_id": audit.workspace_id,
-                "surface_id": audit.surface_id
+                "surface_id": audit.surface_id,
+                "pid": pid,
+                "program": program,
+                "cwd": cwd,
+                "status": "running",
+                "runtime": runtime_name
             }),
-        );
+        )
+        .await;
         let result = json!({
             "terminal_session_id": terminal_session_id,
             "workspace_id": audit.workspace_id,
             "surface_id": audit.surface_id,
-            "shell": shell,
+            "shell": launch.shell,
+            "program": program,
             "cols": cols,
             "rows": rows,
-            "runtime": "conpty-simulated"
+            "cwd": cwd,
+            "pid": pid,
+            "status": "running",
+            "runtime": runtime_name
         });
         let event = EventRecord::new(
             random_event_id(),
@@ -1020,7 +1192,10 @@ impl RpcServer {
             .get("input")
             .and_then(Value::as_str)
             .ok_or(ServerError::InvalidRequest)?;
-        let echoed = {
+        if input.len() > self.config.terminal_max_input_bytes {
+            return Err(ServerError::RateLimited);
+        }
+        let input_handle = {
             let mut runtime = self.state.terminal_runtime.lock().await;
             let session = runtime
                 .get_mut(&terminal_session_id)
@@ -1028,22 +1203,22 @@ impl RpcServer {
             if !session.alive {
                 return Err(ServerError::Conflict);
             }
-            session.last_output = format!("echo:{input}");
-            session.last_output.clone()
+            session.input.clone().ok_or(ServerError::Conflict)?
         };
+        let bytes = write_to_terminal_input(input_handle, input).await?;
         self.publish_terminal_event(
             &terminal_session_id,
             json!({
-                "type":"terminal.output",
+                "type":"terminal.input.accepted",
                 "terminal_session_id": terminal_session_id,
-                "output": echoed
+                "bytes": bytes
             }),
-        );
+        )
+        .await;
         let result = json!({
             "terminal_session_id": terminal_session_id,
             "accepted": true,
-            "bytes": input.len(),
-            "output": echoed
+            "bytes": bytes
         });
         let event = EventRecord::new(
             random_event_id(),
@@ -1078,7 +1253,7 @@ impl RpcServer {
             .get("rows")
             .and_then(Value::as_u64)
             .ok_or(ServerError::InvalidRequest)? as u16;
-        {
+        let conpty = {
             let mut runtime = self.state.terminal_runtime.lock().await;
             let session = runtime
                 .get_mut(&terminal_session_id)
@@ -1088,20 +1263,32 @@ impl RpcServer {
             }
             session.cols = cols;
             session.rows = rows;
-        }
+            #[cfg(windows)]
+            {
+                session.conpty.clone()
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        };
+        let applied = resize_terminal_runtime(conpty, cols, rows)?;
         self.publish_terminal_event(
             &terminal_session_id,
             json!({
                 "type":"terminal.resized",
                 "terminal_session_id": terminal_session_id,
                 "cols": cols,
-                "rows": rows
+                "rows": rows,
+                "applied": applied
             }),
-        );
+        )
+        .await;
         let result = json!({
             "terminal_session_id": terminal_session_id,
             "cols": cols,
-            "rows": rows
+            "rows": rows,
+            "applied": applied
         });
         let event = EventRecord::new(
             random_event_id(),
@@ -1127,26 +1314,37 @@ impl RpcServer {
         let terminal_session_id = audit
             .terminal_session_id
             .ok_or(ServerError::InvalidRequest)?;
-        let mut removed = None;
-        {
+        let (pid, kill_tx, already_stopped) = {
             let mut runtime = self.state.terminal_runtime.lock().await;
-            if let Some(mut session) = runtime.remove(&terminal_session_id) {
-                session.alive = false;
-                removed = Some(session);
-            }
+            let session = runtime
+                .get_mut(&terminal_session_id)
+                .ok_or(ServerError::NotFound)?;
+            let pid = session.pid;
+            let already_stopped = !session.alive;
+            session.alive = false;
+            session.status = "killed".to_string();
+            session.input = None;
+            session.exit_code.get_or_insert(-1);
+            (pid, session.kill_tx.take(), already_stopped)
+        };
+        if let Some(kill_tx) = kill_tx {
+            let _ = kill_tx.send(());
+        } else if !already_stopped {
+            return Err(ServerError::Conflict);
         }
-        let _ = removed.ok_or(ServerError::NotFound)?;
-        self.cleanup_terminal_subscribers(&terminal_session_id);
         self.publish_terminal_event(
             &terminal_session_id,
             json!({
                 "type":"terminal.killed",
-                "terminal_session_id": terminal_session_id
+                "terminal_session_id": terminal_session_id,
+                "pid": pid
             }),
-        );
+        )
+        .await;
         let result = json!({
             "terminal_session_id": terminal_session_id,
-            "killed": true
+            "killed": true,
+            "pid": pid
         });
         let event = EventRecord::new(
             random_event_id(),
@@ -1188,7 +1386,8 @@ impl RpcServer {
             "terminal_session_id": terminal_session_id,
             "subscriber_id": subscriber_id,
             "events": events,
-            "dropped_events": dropped_events
+            "dropped_events": dropped_events,
+            "last_sequence": self.last_terminal_sequence(&terminal_session_id).await
         });
         let event = EventRecord::new(
             random_event_id(),
@@ -1201,6 +1400,55 @@ impl RpcServer {
             }),
         );
         self.persist_and_apply(event).await
+    }
+
+    async fn terminal_history(
+        &self,
+        audit: TerminalAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let terminal_session_id = audit
+            .terminal_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let from_sequence = params
+            .get("from_sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_events = params
+            .get("max_events")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(self.config.terminal_max_history_events)
+            .max(1);
+        let runtime = self.state.terminal_runtime.lock().await;
+        let session = runtime
+            .get(&terminal_session_id)
+            .ok_or(ServerError::NotFound)?;
+        let events = session
+            .history
+            .iter()
+            .filter(|event| event["sequence"].as_u64().unwrap_or_default() >= from_sequence)
+            .take(max_events)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = session
+            .history
+            .iter()
+            .filter(|event| event["sequence"].as_u64().unwrap_or_default() >= from_sequence)
+            .count()
+            > events.len();
+        Ok(json!({
+            "terminal_session_id": terminal_session_id,
+            "runtime": session.runtime,
+            "status": session.status,
+            "pid": session.pid,
+            "cols": session.cols,
+            "rows": session.rows,
+            "last_sequence": session.next_sequence.saturating_sub(1),
+            "events": events,
+            "has_more": has_more,
+            "exit_code": session.exit_code
+        }))
     }
 
     async fn browser_create(
@@ -1924,17 +2172,16 @@ impl RpcServer {
         Ok((events, dropped))
     }
 
-    fn publish_terminal_event(&self, terminal_session_id: &str, event: Value) {
-        let mut all = self
-            .state
-            .terminal_subscriptions
-            .lock()
-            .expect("subscription lock poisoned");
-        if let Some(subs) = all.get_mut(terminal_session_id) {
-            for sub in subs.values_mut() {
-                sub.push(event.clone(), self.config.queue_limit.max(1));
-            }
-        }
+    async fn publish_terminal_event(&self, terminal_session_id: &str, event: Value) {
+        publish_terminal_event_for_state(
+            &self.state,
+            self.config.queue_limit.max(1),
+            self.config.terminal_max_history_events.max(1),
+            self.config.terminal_max_history_bytes.max(1),
+            terminal_session_id,
+            event,
+        )
+        .await;
     }
 
     fn publish_browser_event(&self, browser_session_id: &str, event: Value) {
@@ -1950,15 +2197,6 @@ impl RpcServer {
         }
     }
 
-    fn cleanup_terminal_subscribers(&self, terminal_session_id: &str) {
-        let mut all = self
-            .state
-            .terminal_subscriptions
-            .lock()
-            .expect("subscription lock poisoned");
-        all.remove(terminal_session_id);
-    }
-
     fn cleanup_browser_subscribers(&self, browser_session_id: &str) {
         let mut all = self
             .state
@@ -1966,6 +2204,191 @@ impl RpcServer {
             .lock()
             .expect("subscription lock poisoned");
         all.remove(browser_session_id);
+    }
+
+    fn spawn_terminal_background_tasks_process(
+        &self,
+        terminal_session_id: String,
+        mut child: tokio::process::Child,
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr: Option<tokio::process::ChildStderr>,
+        mut kill_rx: oneshot::Receiver<()>,
+    ) {
+        if let Some(stdout) = stdout {
+            spawn_terminal_output_task(
+                self.state.clone(),
+                self.config.queue_limit.max(1),
+                terminal_session_id.clone(),
+                stdout,
+                "stdout",
+            );
+        }
+        if let Some(stderr) = stderr {
+            spawn_terminal_output_task(
+                self.state.clone(),
+                self.config.queue_limit.max(1),
+                terminal_session_id.clone(),
+                stderr,
+                "stderr",
+            );
+        }
+        let state = self.state.clone();
+        let queue_limit = self.config.queue_limit.max(1);
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                wait = child.wait() => wait,
+                _ = &mut kill_rx => {
+                    let _ = child.kill().await;
+                    child.wait().await
+                }
+            };
+            update_terminal_exit_state(&state, &terminal_session_id, status).await;
+            publish_terminal_event_for_state(
+                &state,
+                queue_limit,
+                queue_limit.saturating_mul(64),
+                queue_limit.saturating_mul(1024),
+                &terminal_session_id,
+                build_terminal_exit_event(&state, &terminal_session_id).await,
+            )
+            .await;
+        });
+    }
+
+    #[cfg(windows)]
+    fn spawn_terminal_background_tasks_conpty(
+        &self,
+        terminal_session_id: String,
+        output: StdFile,
+        control: Arc<ConptyControl>,
+        mut kill_rx: oneshot::Receiver<()>,
+    ) {
+        let state = self.state.clone();
+        let queue_limit = self.config.queue_limit.max(1);
+        let history_events = self.config.terminal_max_history_events.max(1);
+        let history_bytes = self.config.terminal_max_history_bytes.max(1);
+        let runtime = tokio::runtime::Handle::current();
+        let terminal_for_reader = terminal_session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut reader = StdBufReader::new(output);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+                        let state = state.clone();
+                        let terminal = terminal_for_reader.clone();
+                        runtime.block_on(async move {
+                            {
+                                let mut runtime = state.terminal_runtime.lock().await;
+                                if let Some(session) = runtime.get_mut(&terminal) {
+                                    session.last_output = trimmed.clone();
+                                }
+                            }
+                            publish_terminal_event_for_state(
+                                &state,
+                                queue_limit,
+                                history_events,
+                                history_bytes,
+                                &terminal,
+                                json!({
+                                    "type": "terminal.output",
+                                    "terminal_session_id": terminal,
+                                    "stream": "stdout",
+                                    "output": trimmed
+                                }),
+                            )
+                            .await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                exit = tokio::task::spawn_blocking({
+                    let control = control.clone();
+                    move || wait_for_conpty_process_exit(&control)
+                }) => exit.map_err(|_| std::io::Error::from(std::io::ErrorKind::Other)).and_then(|v| v),
+                _ = &mut kill_rx => {
+                    let _ = terminate_conpty_process(&control);
+                    tokio::task::spawn_blocking({
+                        let control = control.clone();
+                        move || wait_for_conpty_process_exit(&control)
+                    }).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::Other)).and_then(|v| v)
+                }
+            };
+            update_terminal_exit_state(&state, &terminal_session_id, status).await;
+            publish_terminal_event_for_state(
+                &state,
+                queue_limit,
+                history_events,
+                history_bytes,
+                &terminal_session_id,
+                build_terminal_exit_event(&state, &terminal_session_id).await,
+            )
+            .await;
+        });
+    }
+
+    async fn last_terminal_sequence(&self, terminal_session_id: &str) -> u64 {
+        self.state
+            .terminal_runtime
+            .lock()
+            .await
+            .get(terminal_session_id)
+            .map(|session| session.next_sequence.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    async fn enforce_terminal_spawn_limits(
+        &self,
+        audit: &TerminalAuditContext,
+        launch: &TerminalLaunchSpec,
+    ) -> Result<(), ServerError> {
+        if launch
+            .env
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>()
+            > self.config.terminal_max_env_bytes
+        {
+            return Err(ServerError::RateLimited);
+        }
+        if !self.config.terminal_allowed_programs.is_empty()
+            && !self
+                .config
+                .terminal_allowed_programs
+                .iter()
+                .any(|program| program.eq_ignore_ascii_case(&launch.program))
+        {
+            return Err(ServerError::RateLimited);
+        }
+        if !self.config.terminal_allowed_cwd_roots.is_empty()
+            && !self
+                .config
+                .terminal_allowed_cwd_roots
+                .iter()
+                .any(|root| launch.cwd.starts_with(root))
+        {
+            return Err(ServerError::RateLimited);
+        }
+        let runtime = self.state.terminal_runtime.lock().await;
+        if runtime.len() >= self.config.terminal_max_sessions {
+            return Err(ServerError::RateLimited);
+        }
+        let workspace_sessions = runtime
+            .values()
+            .filter(|session| session.workspace_id == audit.workspace_id && session.alive)
+            .count();
+        if workspace_sessions >= self.config.terminal_max_sessions_per_workspace {
+            return Err(ServerError::RateLimited);
+        }
+        Ok(())
     }
 
     async fn persist_and_apply(&self, event: EventRecord) -> Result<Value, ServerError> {
@@ -2176,6 +2599,16 @@ impl RpcServer {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let terminal_kills = {
+            let mut runtime = self.state.terminal_runtime.lock().await;
+            runtime
+                .values_mut()
+                .filter_map(|session| session.kill_tx.take())
+                .collect::<Vec<_>>()
+        };
+        for kill_tx in terminal_kills {
+            let _ = kill_tx.send(());
         }
         self.state.terminal_runtime.lock().await.clear();
         self.state.browser_runtime.lock().await.clear();
@@ -2394,6 +2827,660 @@ fn extract_command_id(params: Option<&Value>) -> Result<String, ServerError> {
     Ok(command_id.as_str().to_string())
 }
 
+fn parse_terminal_launch_spec(params: &Value) -> Result<TerminalLaunchSpec, ServerError> {
+    let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
+    let shell = object
+        .get("shell")
+        .and_then(Value::as_str)
+        .unwrap_or(default_terminal_shell())
+        .to_string();
+    let program = object
+        .get("program")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| default_program_for_shell(&shell));
+    let args = match object.get("args") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or(ServerError::InvalidRequest)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(ServerError::InvalidRequest),
+        None => default_args_for_shell(&shell),
+    };
+    let cwd = object
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(default_terminal_cwd);
+    let env = match object.get("env") {
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|v| (key.clone(), v.to_string()))
+                    .ok_or(ServerError::InvalidRequest)
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?,
+        Some(_) => return Err(ServerError::InvalidRequest),
+        None => HashMap::new(),
+    };
+    Ok(TerminalLaunchSpec {
+        program,
+        args,
+        cwd,
+        env,
+        shell,
+    })
+}
+
+enum SpawnedTerminalProcess {
+    Process(Box<ProcessSpawnedTerminal>),
+    #[cfg(windows)]
+    Conpty(Box<ConptySpawnedTerminal>),
+}
+
+struct ProcessSpawnedTerminal {
+    pid: u32,
+    input: Option<TerminalInputHandle>,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    child: tokio::process::Child,
+}
+
+#[cfg(windows)]
+struct ConptySpawnedTerminal {
+    pid: u32,
+    input: Option<TerminalInputHandle>,
+    output: StdFile,
+    control: Arc<ConptyControl>,
+}
+
+async fn spawn_terminal_process(
+    config: &BackendConfig,
+    launch: &TerminalLaunchSpec,
+    _cols: u16,
+    _rows: u16,
+) -> Result<SpawnedTerminalProcess, ServerError> {
+    #[cfg(windows)]
+    if config.terminal_runtime == "conpty" {
+        return spawn_terminal_process_conpty(launch, _cols, _rows);
+    }
+    let mut command = Command::new(&launch.program);
+    command.args(&launch.args);
+    command.current_dir(&launch.cwd);
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    for (key, value) in &launch.env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().map_err(|_| ServerError::Internal)?;
+    let pid = child.id().ok_or(ServerError::Internal)?;
+    let input = child
+        .stdin
+        .take()
+        .map(|stdin| TerminalInputHandle::Process(Arc::new(Mutex::new(stdin))));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok(SpawnedTerminalProcess::Process(Box::new(
+        ProcessSpawnedTerminal {
+            pid,
+            input,
+            stdout,
+            stderr,
+            child,
+        },
+    )))
+}
+
+fn default_terminal_shell() -> &'static str {
+    if cfg!(windows) {
+        "powershell"
+    } else {
+        "sh"
+    }
+}
+
+fn default_program_for_shell(shell: &str) -> String {
+    match shell {
+        "cmd" if cfg!(windows) => system32_program("cmd.exe"),
+        "powershell" if cfg!(windows) => {
+            system32_program("WindowsPowerShell\\v1.0\\powershell.exe")
+        }
+        "pwsh" => "pwsh".to_string(),
+        "bash" => "bash".to_string(),
+        _ if cfg!(windows) => system32_program("WindowsPowerShell\\v1.0\\powershell.exe"),
+        _ => "sh".to_string(),
+    }
+}
+
+fn default_args_for_shell(shell: &str) -> Vec<String> {
+    match shell {
+        "cmd" if cfg!(windows) => vec!["/Q".to_string(), "/K".to_string()],
+        "powershell" if cfg!(windows) => vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NoExit".to_string(),
+        ],
+        "pwsh" => vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NoExit".to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn default_terminal_cwd() -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn system32_program(relative: &str) -> String {
+    std::env::var("SystemRoot")
+        .map(|root| format!("{root}\\System32\\{relative}"))
+        .unwrap_or_else(|_| relative.to_string())
+}
+
+async fn write_to_terminal_input(
+    handle: TerminalInputHandle,
+    input: &str,
+) -> Result<usize, ServerError> {
+    match handle {
+        TerminalInputHandle::Process(stdin) => {
+            let mut writer = stdin.lock().await;
+            writer
+                .write_all(input.as_bytes())
+                .await
+                .map_err(|_| ServerError::Internal)?;
+            let bytes = if input.ends_with('\n') {
+                input.len()
+            } else {
+                writer
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|_| ServerError::Internal)?;
+                input.len() + 1
+            };
+            writer.flush().await.map_err(|_| ServerError::Internal)?;
+            Ok(bytes)
+        }
+        TerminalInputHandle::BlockingPipe(file) => {
+            let input = input.to_string();
+            tokio::task::spawn_blocking(move || {
+                let mut writer = file.lock().expect("pipe lock");
+                writer
+                    .write_all(input.as_bytes())
+                    .map_err(|_| ServerError::Internal)?;
+                let bytes = if input.ends_with('\n') {
+                    input.len()
+                } else {
+                    writer
+                        .write_all(b"\r\n")
+                        .map_err(|_| ServerError::Internal)?;
+                    input.len() + 2
+                };
+                writer.flush().map_err(|_| ServerError::Internal)?;
+                Ok(bytes)
+            })
+            .await
+            .map_err(|_| ServerError::Internal)?
+        }
+    }
+}
+
+async fn publish_terminal_event_for_state(
+    state: &Arc<ServerState>,
+    queue_limit: usize,
+    history_limit_events: usize,
+    history_limit_bytes: usize,
+    terminal_session_id: &str,
+    mut event: Value,
+) {
+    let (status, runtime_name, sequence, timestamp_ms) = {
+        let mut runtime = state.terminal_runtime.lock().await;
+        if let Some(session) = runtime.get_mut(terminal_session_id) {
+            let sequence = session.next_sequence;
+            session.next_sequence = session.next_sequence.saturating_add(1);
+            let timestamp_ms = now_unix_ms();
+            if let Some(object) = event.as_object_mut() {
+                object
+                    .entry("sequence".to_string())
+                    .or_insert(json!(sequence));
+                object
+                    .entry("timestamp_ms".to_string())
+                    .or_insert(json!(timestamp_ms));
+                object
+                    .entry("status".to_string())
+                    .or_insert(json!(session.status.clone()));
+                object
+                    .entry("runtime".to_string())
+                    .or_insert(json!(session.runtime.clone()));
+            }
+            let encoded_len = event.to_string().len();
+            session.history.push_back(event.clone());
+            session.history_bytes = session.history_bytes.saturating_add(encoded_len);
+            while session.history.len() > history_limit_events
+                || session.history_bytes > history_limit_bytes
+            {
+                if let Some(removed) = session.history.pop_front() {
+                    session.history_bytes = session
+                        .history_bytes
+                        .saturating_sub(removed.to_string().len());
+                } else {
+                    break;
+                }
+            }
+            (
+                session.status.clone(),
+                session.runtime.clone(),
+                sequence,
+                timestamp_ms,
+            )
+        } else {
+            (
+                "unknown".to_string(),
+                "unknown".to_string(),
+                0,
+                now_unix_ms(),
+            )
+        }
+    };
+    if let Some(object) = event.as_object_mut() {
+        object
+            .entry("sequence".to_string())
+            .or_insert(json!(sequence));
+        object
+            .entry("timestamp_ms".to_string())
+            .or_insert(json!(timestamp_ms));
+        object.entry("status".to_string()).or_insert(json!(status));
+        object
+            .entry("runtime".to_string())
+            .or_insert(json!(runtime_name));
+    }
+    let mut all = state
+        .terminal_subscriptions
+        .lock()
+        .expect("subscription lock poisoned");
+    if let Some(subs) = all.get_mut(terminal_session_id) {
+        for sub in subs.values_mut() {
+            sub.push(event.clone(), queue_limit);
+        }
+    }
+}
+
+fn spawn_terminal_output_task<R>(
+    state: Arc<ServerState>,
+    queue_limit: usize,
+    terminal_session_id: String,
+    reader: R,
+    stream: &'static str,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    {
+                        let mut runtime = state.terminal_runtime.lock().await;
+                        if let Some(session) = runtime.get_mut(&terminal_session_id) {
+                            session.last_output = line.clone();
+                        }
+                    }
+                    publish_terminal_event_for_state(
+                        &state,
+                        queue_limit,
+                        queue_limit.saturating_mul(64),
+                        queue_limit.saturating_mul(1024),
+                        &terminal_session_id,
+                        json!({
+                            "type": "terminal.output",
+                            "terminal_session_id": terminal_session_id,
+                            "stream": stream,
+                            "output": line
+                        }),
+                    )
+                    .await;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    publish_terminal_event_for_state(
+                        &state,
+                        queue_limit,
+                        queue_limit.saturating_mul(64),
+                        queue_limit.saturating_mul(1024),
+                        &terminal_session_id,
+                        json!({
+                            "type": "terminal.runtime-error",
+                            "terminal_session_id": terminal_session_id,
+                            "stream": stream
+                        }),
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn update_terminal_exit_state(
+    state: &Arc<ServerState>,
+    terminal_session_id: &str,
+    status: Result<std::process::ExitStatus, std::io::Error>,
+) {
+    let mut runtime = state.terminal_runtime.lock().await;
+    if let Some(session) = runtime.get_mut(terminal_session_id) {
+        session.alive = false;
+        session.input = None;
+        session.kill_tx = None;
+        match status {
+            Ok(exit) => {
+                session.exit_code = exit.code();
+                session.status = if exit.success() {
+                    "exited".to_string()
+                } else {
+                    "failed".to_string()
+                };
+            }
+            Err(_) => {
+                session.exit_code = Some(-1);
+                session.status = "failed".to_string();
+            }
+        }
+    }
+}
+
+async fn build_terminal_exit_event(state: &Arc<ServerState>, terminal_session_id: &str) -> Value {
+    let runtime = state.terminal_runtime.lock().await;
+    if let Some(session) = runtime.get(terminal_session_id) {
+        json!({
+            "type": "terminal.exited",
+            "terminal_session_id": terminal_session_id,
+            "pid": session.pid,
+            "status": session.status,
+            "exit_code": session.exit_code,
+            "runtime": session.runtime
+        })
+    } else {
+        json!({
+            "type": "terminal.exited",
+            "terminal_session_id": terminal_session_id
+        })
+    }
+}
+
+fn selected_terminal_runtime_name(config: &BackendConfig) -> &'static str {
+    if cfg!(windows) && config.terminal_runtime == "conpty" {
+        "conpty"
+    } else {
+        "process-stdio"
+    }
+}
+
+#[cfg(windows)]
+fn resize_terminal_runtime(
+    conpty: Option<Arc<ConptyControl>>,
+    cols: u16,
+    rows: u16,
+) -> Result<bool, ServerError> {
+    if let Some(control) = conpty {
+        unsafe {
+            let hr = ResizePseudoConsole(
+                control.hpc,
+                COORD {
+                    X: cols as i16,
+                    Y: rows as i16,
+                },
+            );
+            if hr != 0 {
+                return Err(ServerError::Internal);
+            }
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(not(windows))]
+fn resize_terminal_runtime(
+    _conpty: Option<()>,
+    _cols: u16,
+    _rows: u16,
+) -> Result<bool, ServerError> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn spawn_terminal_process_conpty(
+    launch: &TerminalLaunchSpec,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnedTerminalProcess, ServerError> {
+    unsafe {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let mut input_read: HANDLE = std::ptr::null_mut();
+        let mut input_write: HANDLE = std::ptr::null_mut();
+        let mut output_read: HANDLE = std::ptr::null_mut();
+        let mut output_write: HANDLE = std::ptr::null_mut();
+        if CreatePipe(&mut input_read, &mut input_write, &sa, 0) == 0 {
+            return Err(ServerError::Internal);
+        }
+        if CreatePipe(&mut output_read, &mut output_write, &sa, 0) == 0 {
+            let _ = CloseHandle(input_read);
+            let _ = CloseHandle(input_write);
+            return Err(ServerError::Internal);
+        }
+        let _ = SetHandleInformation(input_write, HANDLE_FLAG_INHERIT, 0);
+        let _ = SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0);
+
+        let mut hpc: HPCON = 0;
+        let hr = CreatePseudoConsole(
+            COORD {
+                X: cols as i16,
+                Y: rows as i16,
+            },
+            input_read,
+            output_write,
+            0,
+            &mut hpc,
+        );
+        let _ = CloseHandle(input_read);
+        let _ = CloseHandle(output_write);
+        if hr != 0 {
+            let _ = CloseHandle(input_write);
+            let _ = CloseHandle(output_read);
+            return Err(ServerError::Internal);
+        }
+
+        let attribute_count = 1;
+        let mut attr_list_size = 0;
+        let _ = InitializeProcThreadAttributeList(
+            std::ptr::null_mut(),
+            attribute_count,
+            0,
+            &mut attr_list_size,
+        );
+        let mut attr_list = vec![0u8; attr_list_size];
+        let lp_attribute_list = attr_list.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if InitializeProcThreadAttributeList(
+            lp_attribute_list,
+            attribute_count,
+            0,
+            &mut attr_list_size,
+        ) == 0
+        {
+            ClosePseudoConsole(hpc);
+            let _ = CloseHandle(input_write);
+            let _ = CloseHandle(output_read);
+            return Err(ServerError::Internal);
+        }
+
+        const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
+        if UpdateProcThreadAttribute(
+            lp_attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            hpc as *mut _,
+            std::mem::size_of::<HPCON>(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            DeleteProcThreadAttributeList(lp_attribute_list);
+            ClosePseudoConsole(hpc);
+            let _ = CloseHandle(input_write);
+            let _ = CloseHandle(output_read);
+            return Err(ServerError::Internal);
+        }
+
+        let mut startup: STARTUPINFOEXW = std::mem::zeroed();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = lp_attribute_list;
+        let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
+        let application_name = to_wide_null(&launch.program);
+        let mut command_line = build_windows_command_line(&launch.program, &launch.args);
+        let mut cwd = to_wide_null(&launch.cwd);
+        let mut env_block = build_windows_environment_block(&launch.env);
+        let env_ptr = if env_block.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            env_block.as_mut_ptr() as *mut core::ffi::c_void
+        };
+        let ok = CreateProcessW(
+            application_name.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            EXTENDED_STARTUPINFO_PRESENT,
+            env_ptr,
+            cwd.as_mut_ptr(),
+            &startup.StartupInfo,
+            &mut process_info,
+        );
+        DeleteProcThreadAttributeList(lp_attribute_list);
+        let _ = CloseHandle(process_info.hThread);
+        if ok == 0 {
+            ClosePseudoConsole(hpc);
+            let _ = CloseHandle(input_write);
+            let _ = CloseHandle(output_read);
+            if !process_info.hProcess.is_null() {
+                let _ = CloseHandle(process_info.hProcess);
+            }
+            return Err(ServerError::Internal);
+        }
+
+        let input_file = StdFile::from_raw_handle(input_write as _);
+        let output_file = StdFile::from_raw_handle(output_read as _);
+        Ok(SpawnedTerminalProcess::Conpty(Box::new(
+            ConptySpawnedTerminal {
+                pid: process_info.dwProcessId,
+                input: Some(TerminalInputHandle::BlockingPipe(Arc::new(StdMutex::new(
+                    input_file,
+                )))),
+                output: output_file,
+                control: Arc::new(ConptyControl {
+                    hpc,
+                    process_handle: process_info.hProcess,
+                }),
+            },
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_conpty_process_exit(
+    control: &ConptyControl,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    unsafe {
+        WaitForSingleObject(control.process_handle, u32::MAX);
+        let mut code: u32 = 0;
+        if GetExitCodeProcess(control.process_handle, &mut code) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        ClosePseudoConsole(control.hpc);
+        let _ = CloseHandle(control.process_handle);
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        Ok(std::process::ExitStatus::from_raw(code))
+    }
+}
+
+#[cfg(windows)]
+fn terminate_conpty_process(control: &ConptyControl) -> Result<(), ServerError> {
+    unsafe {
+        if TerminateProcess(control.process_handle, 1) == 0 {
+            return Err(ServerError::Internal);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn build_windows_environment_block(env_overrides: &HashMap<String, String>) -> Vec<u16> {
+    if env_overrides.is_empty() {
+        return Vec::new();
+    }
+    let mut merged = std::env::vars().collect::<HashMap<_, _>>();
+    for (key, value) in env_overrides {
+        merged.insert(key.clone(), value.clone());
+    }
+    let mut entries = merged.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut wide = Vec::new();
+    for (key, value) in entries {
+        let mut item = to_wide_null(&format!("{key}={value}"));
+        wide.extend(item.drain(..item.len().saturating_sub(1)));
+        wide.push(0);
+    }
+    wide.push(0);
+    wide
+}
+
+#[cfg(windows)]
+fn build_windows_command_line(program: &str, args: &[String]) -> Vec<u16> {
+    let mut text = quote_windows_arg(program);
+    for arg in args {
+        text.push(' ');
+        text.push_str(&quote_windows_arg(arg));
+    }
+    to_wide_null(&text)
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(value: &str) -> String {
+    if value.is_empty() || value.chars().any(|c| c.is_whitespace() || c == '"') {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn to_wide_null(value: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 fn extract_browser_audit(params: &Value, method: &str) -> Result<BrowserAuditContext, ServerError> {
     let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
     let workspace_id = object
@@ -2554,6 +3641,22 @@ mod tests {
             snapshot_retain_count: 2,
             segment_max_bytes: 1024 * 64,
             ..BackendConfig::default()
+        }
+    }
+
+    fn test_terminal_shell() -> &'static str {
+        if cfg!(windows) {
+            "cmd"
+        } else {
+            "sh"
+        }
+    }
+
+    fn test_terminal_echo_command(marker: &str) -> String {
+        if cfg!(windows) {
+            format!("echo {marker}")
+        } else {
+            format!("printf '{marker}\\n'")
         }
     }
 
@@ -2737,7 +3840,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_lifecycle_and_subscription_work() {
         let cfg = BackendConfig {
-            queue_limit: 2,
+            queue_limit: 8,
             ..test_config("terminal-lifecycle")
         };
         let server = RpcServer::new(cfg).expect("server");
@@ -2760,6 +3863,7 @@ mod tests {
                 "workspace_id":"ws-1",
                 "surface_id":"sf-t-1",
                 "auth":{"token":token},
+                "shell": test_terminal_shell(),
                 "cols": 100,
                 "rows": 40
             }
@@ -2770,7 +3874,11 @@ mod tests {
         let terminal_session_id = spawn_out["result"]["terminal_session_id"]
             .as_str()
             .expect("terminal session");
-        assert_eq!(spawn_out["result"]["runtime"], "conpty-simulated");
+        assert_eq!(
+            spawn_out["result"]["runtime"],
+            selected_terminal_runtime_name(&server.config)
+        );
+        assert!(spawn_out["result"]["pid"].as_u64().unwrap_or_default() > 0);
 
         let subscribe = json!({
             "id": 3,
@@ -2787,39 +3895,78 @@ mod tests {
         let subscribe_out: Value =
             serde_json::from_str(&server.handle_json_line("c", &subscribe).await).expect("json");
         assert_eq!(subscribe_out["result"]["subscribed"], true);
-        let subscriber_id = subscribe_out["result"]["subscriber_id"]
-            .as_str()
-            .expect("subscriber")
-            .to_string();
+        assert!(subscribe_out["result"]["subscriber_id"].as_str().is_some());
 
-        for idx in 0..4 {
-            let input = json!({
-                "id": 10 + idx,
-                "method":"terminal.input",
+        let input = json!({
+            "id": 10,
+            "method":"terminal.input",
+            "params":{
+                "command_id": "cmd-term-input-0",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "terminal_session_id": terminal_session_id,
+                "auth":{"token":token},
+                "input": test_terminal_echo_command("terminal-lifecycle-ok")
+            }
+        })
+        .to_string();
+        let out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &input).await).expect("json");
+        assert_eq!(out["result"]["accepted"], true);
+        assert!(out["result"]["bytes"].as_u64().unwrap_or_default() > 0);
+
+        let mut observed_output = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let history = json!({
+                "id": 30,
+                "method":"terminal.history",
                 "params":{
-                    "command_id": format!("cmd-term-input-{idx}"),
+                    "command_id":"cmd-term-history-check",
                     "workspace_id":"ws-1",
                     "surface_id":"sf-t-1",
                     "terminal_session_id": terminal_session_id,
-                    "auth":{"token":token},
-                    "input": format!("echo {idx}")
+                    "from_sequence": 1,
+                    "max_events": 20,
+                    "auth":{"token":token}
                 }
             })
             .to_string();
-            let out: Value =
-                serde_json::from_str(&server.handle_json_line("c", &input).await).expect("json");
-            assert_eq!(out["result"]["accepted"], true);
+            let history_out: Value =
+                serde_json::from_str(&server.handle_json_line("c", &history).await).expect("json");
+            if history_out["result"]["last_sequence"]
+                .as_u64()
+                .unwrap_or_default()
+                > 1
+                && history_out["result"]["events"]
+                    .as_array()
+                    .expect("events")
+                    .iter()
+                    .any(|event| event["type"] == "terminal.output")
+            {
+                observed_output = true;
+                break;
+            }
         }
+        assert!(observed_output);
 
-        let (events, dropped_events) = server
-            .drain_subscription(
-                &server.state.terminal_subscriptions,
-                terminal_session_id,
-                &subscriber_id,
-            )
-            .expect("drain subscription");
-        assert_eq!(events.len(), 2);
-        assert!(dropped_events >= 2);
+        let second_spawn = json!({
+            "id": 20,
+            "method":"terminal.spawn",
+            "params":{
+                "command_id":"cmd-term-spawn-2",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-2",
+                "auth":{"token":token},
+                "shell": test_terminal_shell()
+            }
+        })
+        .to_string();
+        let second_spawn_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &second_spawn).await).expect("json");
+        let second_terminal_session_id = second_spawn_out["result"]["terminal_session_id"]
+            .as_str()
+            .expect("second terminal");
 
         let resize = json!({
             "id": 21,
@@ -2827,8 +3974,8 @@ mod tests {
             "params":{
                 "command_id":"cmd-term-resize",
                 "workspace_id":"ws-1",
-                "surface_id":"sf-t-1",
-                "terminal_session_id": terminal_session_id,
+                "surface_id":"sf-t-2",
+                "terminal_session_id": second_terminal_session_id,
                 "auth":{"token":token},
                 "cols": 120,
                 "rows": 45
@@ -2838,6 +3985,7 @@ mod tests {
         let resize_out: Value =
             serde_json::from_str(&server.handle_json_line("c", &resize).await).expect("json");
         assert_eq!(resize_out["result"]["cols"], 120);
+        assert_eq!(resize_out["result"]["applied"], cfg!(windows));
 
         let kill = json!({
             "id": 22,
@@ -2845,8 +3993,8 @@ mod tests {
             "params":{
                 "command_id":"cmd-term-kill",
                 "workspace_id":"ws-1",
-                "surface_id":"sf-t-1",
-                "terminal_session_id": terminal_session_id,
+                "surface_id":"sf-t-2",
+                "terminal_session_id": second_terminal_session_id,
                 "auth":{"token":token}
             }
         })
@@ -2854,6 +4002,89 @@ mod tests {
         let kill_out: Value =
             serde_json::from_str(&server.handle_json_line("c", &kill).await).expect("json");
         assert_eq!(kill_out["result"]["killed"], true);
+    }
+
+    #[tokio::test]
+    async fn terminal_history_returns_sequence_buffer() {
+        let cfg = BackendConfig {
+            terminal_max_history_events: 32,
+            ..test_config("terminal-history")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+
+        let session = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-terminal-history"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let spawn = json!({
+            "id": 2,
+            "method":"terminal.spawn",
+            "params":{
+                "command_id":"cmd-term-history-spawn",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "auth":{"token":token},
+                "shell": test_terminal_shell()
+            }
+        })
+        .to_string();
+        let spawn_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &spawn).await).expect("json");
+        let terminal_session_id = spawn_out["result"]["terminal_session_id"]
+            .as_str()
+            .expect("terminal session");
+
+        let input = json!({
+            "id": 3,
+            "method":"terminal.input",
+            "params":{
+                "command_id":"cmd-term-history-input",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "terminal_session_id": terminal_session_id,
+                "auth":{"token":token},
+                "input": test_terminal_echo_command("history-sequence-ok")
+            }
+        })
+        .to_string();
+        let _: Value =
+            serde_json::from_str(&server.handle_json_line("c", &input).await).expect("json");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let history = json!({
+            "id": 4,
+            "method":"terminal.history",
+            "params":{
+                "command_id":"cmd-term-history-read",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "terminal_session_id": terminal_session_id,
+                "from_sequence": 1,
+                "max_events": 10,
+                "auth":{"token":token}
+            }
+        })
+        .to_string();
+        let history_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &history).await).expect("json");
+        assert!(
+            history_out["result"]["last_sequence"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+        let events = history_out["result"]["events"].as_array().expect("events");
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event["sequence"].as_u64().is_some()));
     }
 
     #[tokio::test]

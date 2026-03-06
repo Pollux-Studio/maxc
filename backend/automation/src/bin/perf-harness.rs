@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 struct ProfileConfig {
@@ -124,10 +124,14 @@ async fn run_profile(
     let mut samples = Vec::new();
     let started = Instant::now();
     let event_dir = temp_event_dir(name);
-    let server = RpcServer::new(BackendConfig {
+    let mut config = BackendConfig {
         event_dir: event_dir.to_string_lossy().to_string(),
         ..BackendConfig::default()
-    })?;
+    };
+    if name == "terminal_interactive" {
+        config.terminal_runtime = "process-stdio".to_string();
+    }
+    let server = RpcServer::new(config)?;
 
     match name {
         "rpc_health" => {
@@ -164,7 +168,8 @@ async fn run_profile(
                         "command_id":"cmd-term-spawn",
                         "workspace_id":"ws-1",
                         "surface_id":"sf-1",
-                        "auth":{"token": token}
+                        "auth":{"token": token},
+                        "shell": benchmark_terminal_shell()
                     }
                 }),
             )
@@ -173,6 +178,7 @@ async fn run_profile(
                 .as_str()
                 .ok_or("missing terminal session id")?
                 .to_string();
+            tokio::time::sleep(Duration::from_millis(75)).await;
             for iter in 0..(profile_cfg.warmup + profile_cfg.iterations) {
                 let req = json!({
                     "id": iter as i64 + 10,
@@ -183,7 +189,7 @@ async fn run_profile(
                         "surface_id":"sf-1",
                         "terminal_session_id": terminal_session_id,
                         "auth":{"token": token},
-                        "input": format!("echo {iter}")
+                        "input": benchmark_terminal_echo(iter)
                     }
                 });
                 let sample = measure_async(issue(&server, iter, req)).await?;
@@ -521,6 +527,22 @@ fn data_path(file_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file_name)
 }
 
+fn benchmark_terminal_shell() -> &'static str {
+    if cfg!(windows) {
+        "cmd"
+    } else {
+        "sh"
+    }
+}
+
+fn benchmark_terminal_echo(iter: usize) -> String {
+    if cfg!(windows) {
+        format!("echo {iter}")
+    } else {
+        format!("printf '{iter}\\n'")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +579,33 @@ mod tests {
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.5), 3.0);
         assert!(result.pass);
         assert_eq!(result.iterations, 4);
+    }
+
+    #[test]
+    fn summarize_failures_and_helpers_cover_edge_cases() {
+        let failing = summarize(
+            "slow",
+            2,
+            &[10.0, 20.0],
+            4.0,
+            &ThresholdConfig {
+                p95_ms: Some(5.0),
+                max_ms: Some(15.0),
+            },
+        );
+        assert!(!failing.pass);
+        assert_eq!(percentile(&[], 0.5), 0.0);
+        assert_eq!(
+            data_path("perf-profiles.json")
+                .file_name()
+                .and_then(|s| s.to_str()),
+            Some("perf-profiles.json")
+        );
+        assert_eq!(
+            benchmark_terminal_shell(),
+            if cfg!(windows) { "cmd" } else { "sh" }
+        );
+        assert!(!benchmark_terminal_echo(7).is_empty());
     }
 
     #[tokio::test]
@@ -612,5 +661,89 @@ mod tests {
         .await
         .expect("recovery profile");
         assert!(recovery.pass);
+    }
+
+    #[tokio::test]
+    async fn run_session_and_browser_profiles() {
+        let session = run_profile(
+            "session_lifecycle",
+            &ProfileConfig {
+                iterations: 2,
+                warmup: 0,
+                fixture_events: 0,
+            },
+            &ThresholdConfig::default(),
+        )
+        .await
+        .expect("session profile");
+        assert_eq!(session.profile, "session_lifecycle");
+
+        let browser_nav = run_profile(
+            "browser_navigation",
+            &ProfileConfig {
+                iterations: 2,
+                warmup: 0,
+                fixture_events: 0,
+            },
+            &ThresholdConfig::default(),
+        )
+        .await
+        .expect("browser nav profile");
+        assert_eq!(browser_nav.profile, "browser_navigation");
+
+        let browser_fanout = run_profile(
+            "browser_fanout",
+            &ProfileConfig {
+                iterations: 2,
+                warmup: 0,
+                fixture_events: 0,
+            },
+            &ThresholdConfig::default(),
+        )
+        .await
+        .expect("browser fanout profile");
+        assert_eq!(browser_fanout.profile, "browser_fanout");
+    }
+
+    #[tokio::test]
+    async fn issue_and_unknown_profile_errors_are_reported() {
+        let event_dir = temp_event_dir("issue-errors");
+        let server = RpcServer::new(BackendConfig {
+            event_dir: event_dir.to_string_lossy().to_string(),
+            ..BackendConfig::default()
+        })
+        .expect("server");
+
+        let token = create_token(&server).await.expect("token");
+        assert!(!token.is_empty());
+
+        let failure = issue(
+            &server,
+            1,
+            json!({
+                "id": 9,
+                "method": "session.refresh",
+                "params": {
+                    "command_id":"cmd-bad-refresh",
+                    "auth":{"token":"invalid"}
+                }
+            }),
+        )
+        .await;
+        assert!(failure.is_err());
+
+        let unknown = run_profile(
+            "not-a-profile",
+            &ProfileConfig {
+                iterations: 1,
+                warmup: 0,
+                fixture_events: 0,
+            },
+            &ThresholdConfig::default(),
+        )
+        .await;
+        assert!(unknown.is_err());
+
+        let _ = fs::remove_dir_all(event_dir);
     }
 }

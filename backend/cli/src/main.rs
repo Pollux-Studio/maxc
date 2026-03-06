@@ -40,6 +40,14 @@ enum Command {
         cols: u16,
         rows: u16,
     },
+    TerminalHistory {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        terminal_session_id: String,
+        from_sequence: Option<u64>,
+        max_events: Option<usize>,
+    },
     TerminalKill {
         token: String,
         workspace_id: String,
@@ -203,6 +211,14 @@ fn parse_terminal(args: &[String]) -> Result<Command, Box<dyn std::error::Error>
             terminal_session_id: required(&flags, "--terminal-session-id")?,
             cols: required(&flags, "--cols")?.parse()?,
             rows: required(&flags, "--rows")?.parse()?,
+        }),
+        "history" => Ok(Command::TerminalHistory {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            terminal_session_id: required(&flags, "--terminal-session-id")?,
+            from_sequence: optional_parse(&flags, "--from-sequence")?,
+            max_events: optional_parse(&flags, "--max-events")?,
         }),
         "kill" => Ok(Command::TerminalKill {
             token: required(&flags, "--token")?,
@@ -375,6 +391,25 @@ fn build_request(command: Command) -> RpcRequest {
                 "auth": {"token": token}
             })),
         ),
+        Command::TerminalHistory {
+            token,
+            workspace_id,
+            surface_id,
+            terminal_session_id,
+            from_sequence,
+            max_events,
+        } => request(
+            "terminal.history",
+            Some(json!({
+                "command_id": command_id("terminal-history"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "terminal_session_id": terminal_session_id,
+                "from_sequence": from_sequence,
+                "max_events": max_events,
+                "auth": {"token": token}
+            })),
+        ),
         Command::TerminalKill {
             token,
             workspace_id,
@@ -520,11 +555,239 @@ mod tests {
         assert_eq!(req.method, "terminal.spawn");
     }
 
+    #[test]
+    fn parse_terminal_history_flags() {
+        let (_, command) = parse_cli(vec![
+            "terminal".to_string(),
+            "history".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--terminal-session-id".to_string(),
+            "ts-1".to_string(),
+            "--from-sequence".to_string(),
+            "5".to_string(),
+            "--max-events".to_string(),
+            "10".to_string(),
+        ])
+        .expect("parse");
+        let req = build_request(command);
+        assert_eq!(req.method, "terminal.history");
+        let params = req.params.expect("params");
+        assert_eq!(params["from_sequence"], 5);
+        assert_eq!(params["max_events"], 10);
+    }
+
+    #[test]
+    fn parse_session_browser_and_pretty_commands() {
+        let (pretty, session_create) = parse_cli(vec![
+            "--pretty".to_string(),
+            "session".to_string(),
+            "create".to_string(),
+        ])
+        .expect("session create");
+        assert!(pretty);
+        assert!(matches!(session_create, Command::SessionCreate));
+
+        let (_, refresh) = parse_cli(vec![
+            "session".to_string(),
+            "refresh".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+        ])
+        .expect("session refresh");
+        let refresh_req = build_request(refresh);
+        assert_eq!(refresh_req.method, "session.refresh");
+        assert_eq!(refresh_req.params.expect("params")["auth"]["token"], "tok");
+
+        let (_, revoke) = parse_cli(vec![
+            "session".to_string(),
+            "revoke".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+        ])
+        .expect("session revoke");
+        assert_eq!(build_request(revoke).method, "session.revoke");
+
+        let (_, browser_create) = parse_cli(vec![
+            "browser".to_string(),
+            "create".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+        ])
+        .expect("browser create");
+        assert_eq!(build_request(browser_create).method, "browser.create");
+
+        let (_, tab_open) = parse_cli(vec![
+            "browser".to_string(),
+            "tab-open".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--browser-session-id".to_string(),
+            "bs-1".to_string(),
+            "--url".to_string(),
+            "https://example.com".to_string(),
+        ])
+        .expect("browser tab open");
+        let tab_open_req = build_request(tab_open);
+        assert_eq!(tab_open_req.method, "browser.tab.open");
+
+        let (_, goto) = parse_cli(vec![
+            "browser".to_string(),
+            "goto".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--browser-session-id".to_string(),
+            "bs-1".to_string(),
+            "--tab-id".to_string(),
+            "tab-1".to_string(),
+            "--url".to_string(),
+            "https://example.com/next".to_string(),
+        ])
+        .expect("browser goto");
+        let goto_req = build_request(goto);
+        assert_eq!(goto_req.method, "browser.goto");
+        assert_eq!(goto_req.params.expect("params")["tab_id"], "tab-1");
+
+        let (_, close) = parse_cli(vec![
+            "browser".to_string(),
+            "close".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--browser-session-id".to_string(),
+            "bs-1".to_string(),
+        ])
+        .expect("browser close");
+        assert_eq!(build_request(close).method, "browser.close");
+    }
+
+    #[test]
+    fn parse_terminal_input_resize_and_kill_commands() {
+        let (_, input) = parse_cli(vec![
+            "terminal".to_string(),
+            "input".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--terminal-session-id".to_string(),
+            "ts-1".to_string(),
+            "--input".to_string(),
+            "echo hi".to_string(),
+        ])
+        .expect("terminal input");
+        let input_req = build_request(input);
+        assert_eq!(input_req.method, "terminal.input");
+        assert_eq!(input_req.params.expect("params")["input"], "echo hi");
+
+        let (_, resize) = parse_cli(vec![
+            "terminal".to_string(),
+            "resize".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--terminal-session-id".to_string(),
+            "ts-1".to_string(),
+            "--cols".to_string(),
+            "140".to_string(),
+            "--rows".to_string(),
+            "50".to_string(),
+        ])
+        .expect("terminal resize");
+        let resize_req = build_request(resize);
+        assert_eq!(resize_req.method, "terminal.resize");
+        let resize_params = resize_req.params.expect("params");
+        assert_eq!(resize_params["cols"], 140);
+        assert_eq!(resize_params["rows"], 50);
+
+        let (_, kill) = parse_cli(vec![
+            "terminal".to_string(),
+            "kill".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--terminal-session-id".to_string(),
+            "ts-1".to_string(),
+        ])
+        .expect("terminal kill");
+        assert_eq!(build_request(kill).method, "terminal.kill");
+    }
+
+    #[test]
+    fn parse_errors_and_helpers_are_stable() {
+        assert!(parse_cli(vec![]).is_err());
+        assert!(parse_cli(vec!["wat".to_string()]).is_err());
+        assert!(parse_session(&[]).is_err());
+        assert!(parse_terminal(&[]).is_err());
+        assert!(parse_browser(&[]).is_err());
+        assert!(parse_flags(&["value".to_string()]).is_err());
+        assert!(parse_flags(&["--token".to_string()]).is_err());
+
+        let mut args = vec!["--pretty".to_string(), "health".to_string()];
+        assert!(remove_flag(&mut args, "--pretty"));
+        assert!(!remove_flag(&mut args, "--pretty"));
+        assert_eq!(args, vec!["health".to_string()]);
+
+        let mut flags = HashMap::new();
+        flags.insert("--value".to_string(), "42".to_string());
+        assert_eq!(required(&flags, "--value").expect("required"), "42");
+        assert!(required(&flags, "--missing").is_err());
+        assert_eq!(
+            optional_parse::<u16>(&flags, "--value").expect("optional"),
+            Some(42)
+        );
+        assert_eq!(
+            optional_parse::<u16>(&flags, "--missing").expect("optional missing"),
+            None
+        );
+        assert!(optional_parse::<u16>(
+            &HashMap::from([("--bad".to_string(), "x".to_string())]),
+            "--bad"
+        )
+        .is_err());
+
+        let auth = auth_payload("tok", "demo");
+        assert_eq!(auth["auth"]["token"], "tok");
+        assert_eq!(command_id("demo"), "cli-demo");
+        assert_eq!(request("system.health", None).method, "system.health");
+    }
+
     #[tokio::test]
     async fn cli_smoke_flows_against_in_process_server() {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_millis();
         let cfg = BackendConfig {
             event_dir: std::env::temp_dir()
-                .join("maxc-cli-smoke")
+                .join(format!("maxc-cli-smoke-{millis}"))
                 .to_string_lossy()
                 .to_string(),
             ..BackendConfig::default()
