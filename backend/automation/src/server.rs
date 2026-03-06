@@ -8,7 +8,7 @@ use maxc_storage::{
 };
 use rand::RngCore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,13 @@ struct BrowserAuditContext {
     surface_id: String,
     browser_session_id: Option<String>,
     tab_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalAuditContext {
+    workspace_id: String,
+    surface_id: String,
+    terminal_session_id: Option<String>,
 }
 
 impl SessionRecord {
@@ -62,9 +69,105 @@ struct ServerState {
     global_limiter: Mutex<RateLimiter>,
     connection_limiters: Mutex<HashMap<String, RateLimiter>>,
     raw_limiters: Mutex<HashMap<String, RateLimiter>>,
-    browser_subscriptions: StdMutex<HashMap<String, usize>>,
+    terminal_runtime: Mutex<HashMap<String, TerminalSessionRuntime>>,
+    browser_runtime: Mutex<HashMap<String, BrowserSessionRuntime>>,
+    terminal_subscriptions: StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
+    browser_subscriptions: StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
+    scheduler: StdMutex<SchedulerState>,
     inflight_by_connection: StdMutex<HashMap<String, usize>>,
     correlation: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalSessionRuntime {
+    cols: u16,
+    rows: u16,
+    alive: bool,
+    last_output: String,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserSessionRuntime {
+    attached: bool,
+    closed: bool,
+    tabs: HashMap<String, BrowserTabRuntime>,
+    tracing_enabled: bool,
+    network_interception: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserTabRuntime {
+    browser_tab_id: String,
+    url: String,
+    focused: bool,
+    closed: bool,
+    history: Vec<String>,
+    history_index: usize,
+    cookies: HashMap<String, String>,
+    storage: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct SubscriptionState {
+    queue: VecDeque<Value>,
+    dropped_events: u64,
+}
+
+impl SubscriptionState {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            dropped_events: 0,
+        }
+    }
+
+    fn push(&mut self, event: Value, limit: usize) {
+        self.queue.push_back(event);
+        while self.queue.len() > limit {
+            self.queue.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+    }
+
+    fn drain(&mut self) -> Vec<Value> {
+        self.queue.drain(..).collect()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SchedulerState {
+    interactive_inflight: usize,
+    background_inflight: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkloadClass {
+    Interactive,
+    Background,
+}
+
+#[derive(Debug)]
+struct SchedulerGuard {
+    class: WorkloadClass,
+    state: Arc<ServerState>,
+}
+
+impl Drop for SchedulerGuard {
+    fn drop(&mut self) {
+        let mut scheduler = self
+            .state
+            .scheduler
+            .lock()
+            .expect("scheduler lock poisoned");
+        match self.class {
+            WorkloadClass::Interactive => {
+                scheduler.interactive_inflight = scheduler.interactive_inflight.saturating_sub(1);
+            }
+            WorkloadClass::Background => {
+                scheduler.background_inflight = scheduler.background_inflight.saturating_sub(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +290,11 @@ impl RpcServer {
                 global_limiter: Mutex::new(global_limiter),
                 connection_limiters: Mutex::new(HashMap::new()),
                 raw_limiters: Mutex::new(HashMap::new()),
+                terminal_runtime: Mutex::new(HashMap::new()),
+                browser_runtime: Mutex::new(HashMap::new()),
+                terminal_subscriptions: StdMutex::new(HashMap::new()),
                 browser_subscriptions: StdMutex::new(HashMap::new()),
+                scheduler: StdMutex::new(SchedulerState::default()),
                 inflight_by_connection: StdMutex::new(HashMap::new()),
                 correlation: AtomicU64::new(1),
             }),
@@ -294,6 +401,9 @@ impl RpcServer {
             "session.refresh" => self.session_refresh(request.params).await,
             "session.revoke" => self.session_revoke(request.params).await,
             "system.health" => Ok(json!({ "ok": true })),
+            method if method.starts_with("terminal.") => {
+                self.terminal_dispatch(method, request.params).await
+            }
             method if method.starts_with("browser.") => {
                 self.browser_dispatch(method, request.params).await
             }
@@ -419,7 +529,9 @@ impl RpcServer {
         }
 
         let audit = extract_browser_audit(params_ref, method)?;
-        self.enforce_browser_limits(method, params_ref, &audit).await?;
+        self.enforce_browser_limits(method, params_ref, &audit)
+            .await?;
+        let _scheduler = self.acquire_scheduler(method)?;
 
         match method {
             "browser.create" => self.browser_create(command_id, audit).await,
@@ -436,9 +548,13 @@ impl RpcServer {
             }
             "browser.click"
             | "browser.type"
+            | "browser.key"
             | "browser.wait"
             | "browser.screenshot"
             | "browser.evaluate"
+            | "browser.storage.get"
+            | "browser.storage.set"
+            | "browser.network.intercept"
             | "browser.cookie.get"
             | "browser.cookie.set"
             | "browser.upload"
@@ -498,6 +614,336 @@ impl RpcServer {
         Ok(())
     }
 
+    fn acquire_scheduler(&self, method: &str) -> Result<SchedulerGuard, ServerError> {
+        let class = workload_class(method);
+        let mut scheduler = self
+            .state
+            .scheduler
+            .lock()
+            .expect("scheduler lock poisoned");
+        match class {
+            WorkloadClass::Interactive => {
+                let max = self.config.max_inflight_per_connection.max(1);
+                if scheduler.interactive_inflight >= max {
+                    return Err(ServerError::RateLimited);
+                }
+                scheduler.interactive_inflight += 1;
+            }
+            WorkloadClass::Background => {
+                let max = (self.config.queue_limit / 8).max(1);
+                if scheduler.background_inflight >= max {
+                    return Err(ServerError::RateLimited);
+                }
+                scheduler.background_inflight += 1;
+            }
+        }
+        drop(scheduler);
+        Ok(SchedulerGuard {
+            class,
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    async fn terminal_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
+        let now = now_unix_ms();
+        let session = self
+            .find_session(&token)
+            .await
+            .ok_or(ServerError::Unauthorized)?;
+        if !session.is_active(now) {
+            return Err(ServerError::Unauthorized);
+        }
+
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+        let audit = extract_terminal_audit(params_ref, method)?;
+        let _scheduler = self.acquire_scheduler(method)?;
+
+        match method {
+            "terminal.spawn" => self.terminal_spawn(command_id, audit, params_ref).await,
+            "terminal.input" => self.terminal_input(command_id, audit, params_ref).await,
+            "terminal.resize" => self.terminal_resize(command_id, audit, params_ref).await,
+            "terminal.kill" => self.terminal_kill(command_id, audit).await,
+            "terminal.subscribe" => self.terminal_subscribe(command_id, audit).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn terminal_spawn(
+        &self,
+        command_id: String,
+        audit: TerminalAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let cols = params
+            .get("cols")
+            .and_then(Value::as_u64)
+            .map(|v| v as u16)
+            .unwrap_or(120);
+        let rows = params
+            .get("rows")
+            .and_then(Value::as_u64)
+            .map(|v| v as u16)
+            .unwrap_or(30);
+        let shell = params
+            .get("shell")
+            .and_then(Value::as_str)
+            .unwrap_or("powershell")
+            .to_string();
+        let terminal_session_id = format!(
+            "ts-{}",
+            random_token()?.chars().take(12).collect::<String>()
+        );
+        {
+            let mut runtime = self.state.terminal_runtime.lock().await;
+            runtime.insert(
+                terminal_session_id.clone(),
+                TerminalSessionRuntime {
+                    cols,
+                    rows,
+                    alive: true,
+                    last_output: format!("{shell} started"),
+                },
+            );
+        }
+        self.publish_terminal_event(
+            &terminal_session_id,
+            json!({
+                "type": "terminal.spawned",
+                "terminal_session_id": terminal_session_id,
+                "workspace_id": audit.workspace_id,
+                "surface_id": audit.surface_id
+            }),
+        );
+        let result = json!({
+            "terminal_session_id": terminal_session_id,
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "shell": shell,
+            "cols": cols,
+            "rows": rows,
+            "runtime": "conpty-simulated"
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            result["terminal_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "automation_key": format!("terminal:{}:spawn", result["terminal_session_id"].as_str().unwrap_or_default()),
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn terminal_input(
+        &self,
+        command_id: String,
+        audit: TerminalAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let terminal_session_id = audit
+            .terminal_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let input = params
+            .get("input")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let echoed = {
+            let mut runtime = self.state.terminal_runtime.lock().await;
+            let session = runtime
+                .get_mut(&terminal_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if !session.alive {
+                return Err(ServerError::Conflict);
+            }
+            session.last_output = format!("echo:{input}");
+            session.last_output.clone()
+        };
+        self.publish_terminal_event(
+            &terminal_session_id,
+            json!({
+                "type":"terminal.output",
+                "terminal_session_id": terminal_session_id,
+                "output": echoed
+            }),
+        );
+        let result = json!({
+            "terminal_session_id": terminal_session_id,
+            "accepted": true,
+            "bytes": input.len(),
+            "output": echoed
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            result["terminal_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "automation_key": format!("terminal:{}:input", result["terminal_session_id"].as_str().unwrap_or_default()),
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn terminal_resize(
+        &self,
+        command_id: String,
+        audit: TerminalAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let terminal_session_id = audit
+            .terminal_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let cols = params
+            .get("cols")
+            .and_then(Value::as_u64)
+            .ok_or(ServerError::InvalidRequest)? as u16;
+        let rows = params
+            .get("rows")
+            .and_then(Value::as_u64)
+            .ok_or(ServerError::InvalidRequest)? as u16;
+        {
+            let mut runtime = self.state.terminal_runtime.lock().await;
+            let session = runtime
+                .get_mut(&terminal_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if !session.alive {
+                return Err(ServerError::Conflict);
+            }
+            session.cols = cols;
+            session.rows = rows;
+        }
+        self.publish_terminal_event(
+            &terminal_session_id,
+            json!({
+                "type":"terminal.resized",
+                "terminal_session_id": terminal_session_id,
+                "cols": cols,
+                "rows": rows
+            }),
+        );
+        let result = json!({
+            "terminal_session_id": terminal_session_id,
+            "cols": cols,
+            "rows": rows
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            result["terminal_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "automation_key": format!("terminal:{}:resize", result["terminal_session_id"].as_str().unwrap_or_default()),
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn terminal_kill(
+        &self,
+        command_id: String,
+        audit: TerminalAuditContext,
+    ) -> Result<Value, ServerError> {
+        let terminal_session_id = audit
+            .terminal_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let mut removed = None;
+        {
+            let mut runtime = self.state.terminal_runtime.lock().await;
+            if let Some(mut session) = runtime.remove(&terminal_session_id) {
+                session.alive = false;
+                removed = Some(session);
+            }
+        }
+        let _ = removed.ok_or(ServerError::NotFound)?;
+        self.cleanup_terminal_subscribers(&terminal_session_id);
+        self.publish_terminal_event(
+            &terminal_session_id,
+            json!({
+                "type":"terminal.killed",
+                "terminal_session_id": terminal_session_id
+            }),
+        );
+        let result = json!({
+            "terminal_session_id": terminal_session_id,
+            "killed": true
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            result["terminal_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "automation_key": format!("terminal:{}:kill", result["terminal_session_id"].as_str().unwrap_or_default()),
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn terminal_subscribe(
+        &self,
+        command_id: String,
+        audit: TerminalAuditContext,
+    ) -> Result<Value, ServerError> {
+        let terminal_session_id = audit
+            .terminal_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let subscriber_id = self.register_subscriber(
+            &self.state.terminal_subscriptions,
+            &terminal_session_id,
+            self.config.browser_subscription_limit,
+        )?;
+        let (events, dropped_events) = self.drain_subscription(
+            &self.state.terminal_subscriptions,
+            &terminal_session_id,
+            &subscriber_id,
+        )?;
+
+        let result = json!({
+            "subscribed": true,
+            "terminal_session_id": terminal_session_id,
+            "subscriber_id": subscriber_id,
+            "events": events,
+            "dropped_events": dropped_events
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            terminal_session_id.clone(),
+            command_id,
+            json!({
+                "automation_key": format!("terminal:{terminal_session_id}:subscribe"),
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
     async fn browser_create(
         &self,
         command_id: String,
@@ -512,6 +958,28 @@ impl RpcServer {
             "surface_id": audit.surface_id,
             "browser_session_id": browser_session_id
         });
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            runtime.insert(
+                browser_session_id.clone(),
+                BrowserSessionRuntime {
+                    attached: true,
+                    closed: false,
+                    tabs: HashMap::new(),
+                    tracing_enabled: false,
+                    network_interception: false,
+                },
+            );
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.session.created",
+                "browser_session_id": browser_session_id,
+                "workspace_id": audit.workspace_id,
+                "surface_id": audit.surface_id
+            }),
+        );
         let payload = json!({
             "workspace_id": audit.workspace_id,
             "surface_id": audit.surface_id,
@@ -539,6 +1007,20 @@ impl RpcServer {
         let browser_session_id = audit
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if session.closed {
+                return Err(ServerError::Conflict);
+            }
+            session.attached = true;
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({"type":"browser.session.attached","browser_session_id": browser_session_id}),
+        );
         let result = json!({"browser_session_id": browser_session_id, "attached": true});
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -567,6 +1049,20 @@ impl RpcServer {
         let browser_session_id = audit
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if session.closed {
+                return Err(ServerError::Conflict);
+            }
+            session.attached = false;
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({"type":"browser.session.detached","browser_session_id": browser_session_id}),
+        );
         let result = json!({"browser_session_id": browser_session_id, "attached": false});
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -595,6 +1091,23 @@ impl RpcServer {
         let browser_session_id = audit
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            session.closed = true;
+            session.attached = false;
+            for tab in session.tabs.values_mut() {
+                tab.closed = true;
+                tab.focused = false;
+            }
+        }
+        self.cleanup_browser_subscribers(&browser_session_id);
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({"type":"browser.session.closed","browser_session_id": browser_session_id}),
+        );
         let result = json!({"browser_session_id": browser_session_id, "closed": true});
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -633,6 +1146,40 @@ impl RpcServer {
             .and_then(Value::as_str)
             .unwrap_or("about:blank")
             .to_string();
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if session.closed {
+                return Err(ServerError::Conflict);
+            }
+            for tab in session.tabs.values_mut() {
+                tab.focused = false;
+            }
+            session.tabs.insert(
+                browser_tab_id.clone(),
+                BrowserTabRuntime {
+                    browser_tab_id: browser_tab_id.clone(),
+                    url: url.clone(),
+                    focused: true,
+                    closed: false,
+                    history: vec![url.clone()],
+                    history_index: 0,
+                    cookies: HashMap::new(),
+                    storage: HashMap::new(),
+                },
+            );
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.tab.opened",
+                "browser_session_id": browser_session_id,
+                "browser_tab_id": browser_tab_id,
+                "url": url
+            }),
+        );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -661,11 +1208,13 @@ impl RpcServer {
         let browser_session_id = audit
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
-        let projection = self.state.projection.lock().await;
-        let tabs: Vec<Value> = projection
-            .browser_tabs
+        let runtime = self.state.browser_runtime.lock().await;
+        let session = runtime
+            .get(&browser_session_id)
+            .ok_or(ServerError::NotFound)?;
+        let tabs: Vec<Value> = session
+            .tabs
             .values()
-            .filter(|tab| tab.browser_session_id == browser_session_id)
             .map(|tab| {
                 json!({
                     "browser_tab_id": tab.browser_tab_id,
@@ -687,6 +1236,33 @@ impl RpcServer {
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if session.closed {
+                return Err(ServerError::Conflict);
+            }
+            let mut found = false;
+            for (tab_id, tab) in &mut session.tabs {
+                tab.focused = tab_id == &browser_tab_id && !tab.closed;
+                if tab_id == &browser_tab_id && !tab.closed {
+                    found = true;
+                }
+            }
+            if !found {
+                return Err(ServerError::NotFound);
+            }
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.tab.focused",
+                "browser_session_id": browser_session_id,
+                "browser_tab_id": browser_tab_id
+            }),
+        );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -719,6 +1295,26 @@ impl RpcServer {
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            let tab = session
+                .tabs
+                .get_mut(&browser_tab_id)
+                .ok_or(ServerError::NotFound)?;
+            tab.closed = true;
+            tab.focused = false;
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.tab.closed",
+                "browser_session_id": browser_session_id,
+                "browser_tab_id": browser_tab_id
+            }),
+        );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -753,11 +1349,59 @@ impl RpcServer {
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
-        let url = params
+        let requested_url = params
             .get("url")
             .and_then(Value::as_str)
             .unwrap_or("about:blank")
             .to_string();
+        let url = {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            let tab = session
+                .tabs
+                .get_mut(&browser_tab_id)
+                .ok_or(ServerError::NotFound)?;
+            if tab.closed || session.closed {
+                return Err(ServerError::Conflict);
+            }
+            match method {
+                "browser.goto" => {
+                    tab.history.truncate(tab.history_index.saturating_add(1));
+                    tab.history.push(requested_url.clone());
+                    tab.history_index = tab.history.len().saturating_sub(1);
+                    tab.url = requested_url.clone();
+                }
+                "browser.reload" => {}
+                "browser.back" => {
+                    tab.history_index = tab.history_index.saturating_sub(1);
+                    if let Some(next) = tab.history.get(tab.history_index) {
+                        tab.url = next.clone();
+                    }
+                }
+                "browser.forward" => {
+                    if tab.history_index + 1 < tab.history.len() {
+                        tab.history_index += 1;
+                        if let Some(next) = tab.history.get(tab.history_index) {
+                            tab.url = next.clone();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            tab.url.clone()
+        };
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.navigation",
+                "method": method,
+                "browser_session_id": browser_session_id,
+                "browser_tab_id": browser_tab_id,
+                "url": url
+            }),
+        );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -795,11 +1439,63 @@ impl RpcServer {
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        let mut extra = json!({});
+        {
+            let mut runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get_mut(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            let tab = session
+                .tabs
+                .get_mut(&browser_tab_id)
+                .ok_or(ServerError::NotFound)?;
+            if tab.closed || session.closed {
+                return Err(ServerError::Conflict);
+            }
+            match method {
+                "browser.cookie.set" => {
+                    tab.cookies.insert("session".to_string(), "set".to_string());
+                }
+                "browser.cookie.get" => {
+                    extra = json!({
+                        "cookies": tab.cookies
+                    });
+                }
+                "browser.storage.set" => {
+                    tab.storage.insert("state".to_string(), "set".to_string());
+                }
+                "browser.storage.get" => {
+                    extra = json!({
+                        "storage": tab.storage
+                    });
+                }
+                "browser.trace.start" => {
+                    session.tracing_enabled = true;
+                }
+                "browser.trace.stop" => {
+                    session.tracing_enabled = false;
+                }
+                "browser.network.intercept" => {
+                    session.network_interception = true;
+                }
+                _ => {}
+            }
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.automation",
+                "method": method,
+                "browser_session_id": browser_session_id,
+                "browser_tab_id": browser_tab_id
+            }),
+        );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
             "method": method,
-            "ok": true
+            "ok": true,
+            "details": extra
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -827,25 +1523,26 @@ impl RpcServer {
         audit: BrowserAuditContext,
         _method: &str,
     ) -> Result<Value, ServerError> {
-        let browser_session_id = audit.browser_session_id.clone().unwrap_or_default();
-        let key = format!(
-            "{}:{}",
-            audit.workspace_id,
-            browser_session_id
-        );
-        {
-            let mut counts = self
-                .state
-                .browser_subscriptions
-                .lock()
-                .expect("subscription lock");
-            let count = counts.entry(key).or_insert(0);
-            if *count >= self.config.browser_subscription_limit {
-                return Err(ServerError::RateLimited);
-            }
-            *count += 1;
-        }
-        let result = json!({ "subscribed": true });
+        let browser_session_id = audit
+            .browser_session_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        let subscriber_id = self.register_subscriber(
+            &self.state.browser_subscriptions,
+            &browser_session_id,
+            self.config.browser_subscription_limit,
+        )?;
+        let (events, dropped_events) = self.drain_subscription(
+            &self.state.browser_subscriptions,
+            &browser_session_id,
+            &subscriber_id,
+        )?;
+        let result = json!({
+            "subscribed": true,
+            "subscriber_id": subscriber_id,
+            "events": events,
+            "dropped_events": dropped_events
+        });
         let payload = json!({
             "browser_session_id": browser_session_id,
             "result": result
@@ -878,6 +1575,31 @@ impl RpcServer {
             .and_then(Value::as_str)
             .unwrap_or("noop")
             .to_string();
+        {
+            let runtime = self.state.browser_runtime.lock().await;
+            let session = runtime
+                .get(&browser_session_id)
+                .ok_or(ServerError::NotFound)?;
+            if session.closed {
+                return Err(ServerError::Conflict);
+            }
+            let tab = session
+                .tabs
+                .get(&browser_tab_id)
+                .ok_or(ServerError::NotFound)?;
+            if tab.closed {
+                return Err(ServerError::Conflict);
+            }
+        }
+        self.publish_browser_event(
+            &browser_session_id,
+            json!({
+                "type":"browser.raw",
+                "browser_session_id": browser_session_id,
+                "browser_tab_id": browser_tab_id,
+                "raw_command": command
+            }),
+        );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -901,6 +1623,87 @@ impl RpcServer {
             payload,
         );
         self.persist_and_apply(event).await
+    }
+
+    fn register_subscriber(
+        &self,
+        subs: &StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
+        stream_key: &str,
+        limit: usize,
+    ) -> Result<String, ServerError> {
+        let mut map = subs.lock().expect("subscription lock poisoned");
+        let entry = map.entry(stream_key.to_string()).or_default();
+        if entry.len() >= limit {
+            return Err(ServerError::RateLimited);
+        }
+        let subscriber_id = format!(
+            "sub-{}",
+            random_token()
+                .map_err(|_| ServerError::Internal)?
+                .chars()
+                .take(10)
+                .collect::<String>()
+        );
+        entry.insert(subscriber_id.clone(), SubscriptionState::new());
+        Ok(subscriber_id)
+    }
+
+    fn drain_subscription(
+        &self,
+        subs: &StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
+        stream_key: &str,
+        subscriber_id: &str,
+    ) -> Result<(Vec<Value>, u64), ServerError> {
+        let mut map = subs.lock().expect("subscription lock poisoned");
+        let stream = map.get_mut(stream_key).ok_or(ServerError::NotFound)?;
+        let state = stream.get_mut(subscriber_id).ok_or(ServerError::NotFound)?;
+        let events = state.drain();
+        let dropped = state.dropped_events;
+        Ok((events, dropped))
+    }
+
+    fn publish_terminal_event(&self, terminal_session_id: &str, event: Value) {
+        let mut all = self
+            .state
+            .terminal_subscriptions
+            .lock()
+            .expect("subscription lock poisoned");
+        if let Some(subs) = all.get_mut(terminal_session_id) {
+            for sub in subs.values_mut() {
+                sub.push(event.clone(), self.config.queue_limit.max(1));
+            }
+        }
+    }
+
+    fn publish_browser_event(&self, browser_session_id: &str, event: Value) {
+        let mut all = self
+            .state
+            .browser_subscriptions
+            .lock()
+            .expect("subscription lock poisoned");
+        if let Some(subs) = all.get_mut(browser_session_id) {
+            for sub in subs.values_mut() {
+                sub.push(event.clone(), self.config.queue_limit.max(1));
+            }
+        }
+    }
+
+    fn cleanup_terminal_subscribers(&self, terminal_session_id: &str) {
+        let mut all = self
+            .state
+            .terminal_subscriptions
+            .lock()
+            .expect("subscription lock poisoned");
+        all.remove(terminal_session_id);
+    }
+
+    fn cleanup_browser_subscribers(&self, browser_session_id: &str) {
+        let mut all = self
+            .state
+            .browser_subscriptions
+            .lock()
+            .expect("subscription lock poisoned");
+        all.remove(browser_session_id);
     }
 
     async fn persist_and_apply(&self, event: EventRecord) -> Result<Value, ServerError> {
@@ -1088,9 +1891,13 @@ fn extract_browser_audit(params: &Value, method: &str) -> Result<BrowserAuditCon
             | "browser.forward"
             | "browser.click"
             | "browser.type"
+            | "browser.key"
             | "browser.wait"
             | "browser.screenshot"
             | "browser.evaluate"
+            | "browser.storage.get"
+            | "browser.storage.set"
+            | "browser.network.intercept"
             | "browser.cookie.get"
             | "browser.cookie.set"
             | "browser.upload"
@@ -1118,6 +1925,47 @@ fn extract_browser_audit(params: &Value, method: &str) -> Result<BrowserAuditCon
         browser_session_id,
         tab_id,
     })
+}
+
+fn extract_terminal_audit(
+    params: &Value,
+    method: &str,
+) -> Result<TerminalAuditContext, ServerError> {
+    let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
+    let workspace_id = object
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?
+        .to_string();
+    let surface_id = object
+        .get("surface_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?
+        .to_string();
+    let terminal_session_id = object
+        .get("terminal_session_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    let needs_session = method != "terminal.spawn";
+    if needs_session && terminal_session_id.is_none() {
+        return Err(ServerError::InvalidRequest);
+    }
+    Ok(TerminalAuditContext {
+        workspace_id,
+        surface_id,
+        terminal_session_id,
+    })
+}
+
+fn workload_class(method: &str) -> WorkloadClass {
+    match method {
+        "browser.goto" | "browser.reload" | "browser.back" | "browser.forward" | "browser.wait"
+        | "browser.screenshot" | "browser.download" | "browser.trace.stop" | "terminal.spawn" => {
+            WorkloadClass::Background
+        }
+        _ => WorkloadClass::Interactive,
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -1344,6 +2192,206 @@ mod tests {
         let second: Value =
             serde_json::from_str(&server.handle_json_line("c", &with_auth).await).expect("json");
         assert!(second.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_lifecycle_and_subscription_work() {
+        let cfg = BackendConfig {
+            queue_limit: 2,
+            ..test_config("terminal-lifecycle")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+
+        let session = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-terminal"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let spawn = json!({
+            "id": 2,
+            "method":"terminal.spawn",
+            "params":{
+                "command_id":"cmd-term-spawn",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "auth":{"token":token},
+                "cols": 100,
+                "rows": 40
+            }
+        })
+        .to_string();
+        let spawn_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &spawn).await).expect("json");
+        let terminal_session_id = spawn_out["result"]["terminal_session_id"]
+            .as_str()
+            .expect("terminal session");
+        assert_eq!(spawn_out["result"]["runtime"], "conpty-simulated");
+
+        let subscribe = json!({
+            "id": 3,
+            "method":"terminal.subscribe",
+            "params":{
+                "command_id":"cmd-term-sub",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "terminal_session_id": terminal_session_id,
+                "auth":{"token":token}
+            }
+        })
+        .to_string();
+        let subscribe_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &subscribe).await).expect("json");
+        assert_eq!(subscribe_out["result"]["subscribed"], true);
+        let subscriber_id = subscribe_out["result"]["subscriber_id"]
+            .as_str()
+            .expect("subscriber")
+            .to_string();
+
+        for idx in 0..4 {
+            let input = json!({
+                "id": 10 + idx,
+                "method":"terminal.input",
+                "params":{
+                    "command_id": format!("cmd-term-input-{idx}"),
+                    "workspace_id":"ws-1",
+                    "surface_id":"sf-t-1",
+                    "terminal_session_id": terminal_session_id,
+                    "auth":{"token":token},
+                    "input": format!("echo {idx}")
+                }
+            })
+            .to_string();
+            let out: Value =
+                serde_json::from_str(&server.handle_json_line("c", &input).await).expect("json");
+            assert_eq!(out["result"]["accepted"], true);
+        }
+
+        let (events, dropped_events) = server
+            .drain_subscription(
+                &server.state.terminal_subscriptions,
+                terminal_session_id,
+                &subscriber_id,
+            )
+            .expect("drain subscription");
+        assert_eq!(events.len(), 2);
+        assert!(dropped_events >= 2);
+
+        let resize = json!({
+            "id": 21,
+            "method":"terminal.resize",
+            "params":{
+                "command_id":"cmd-term-resize",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "terminal_session_id": terminal_session_id,
+                "auth":{"token":token},
+                "cols": 120,
+                "rows": 45
+            }
+        })
+        .to_string();
+        let resize_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &resize).await).expect("json");
+        assert_eq!(resize_out["result"]["cols"], 120);
+
+        let kill = json!({
+            "id": 22,
+            "method":"terminal.kill",
+            "params":{
+                "command_id":"cmd-term-kill",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-t-1",
+                "terminal_session_id": terminal_session_id,
+                "auth":{"token":token}
+            }
+        })
+        .to_string();
+        let kill_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &kill).await).expect("json");
+        assert_eq!(kill_out["result"]["killed"], true);
+    }
+
+    #[tokio::test]
+    async fn browser_advanced_controls_are_applied() {
+        let cfg = test_config("browser-advanced");
+        let server = RpcServer::new(cfg).expect("server");
+
+        let session = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-advanced"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let create = json!({
+            "id": 2,
+            "method": "browser.create",
+            "params": {
+                "command_id":"cmd-b-advanced-create",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let create_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &create).await).expect("json");
+        let bs = create_out["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session");
+
+        let tab_open = json!({
+            "id": 3,
+            "method":"browser.tab.open",
+            "params":{
+                "command_id":"cmd-b-advanced-tab",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "auth":{"token": token},
+                "url":"https://example.com"
+            }
+        })
+        .to_string();
+        let tab_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &tab_open).await).expect("json");
+        let tab = tab_out["result"]["browser_tab_id"].as_str().expect("tab");
+
+        for (idx, method) in [
+            "browser.storage.set",
+            "browser.storage.get",
+            "browser.network.intercept",
+            "browser.trace.start",
+            "browser.trace.stop",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let req = json!({
+                "id": 10 + idx as i64,
+                "method": method,
+                "params":{
+                    "command_id": format!("cmd-b-advanced-{idx}"),
+                    "workspace_id":"ws-1",
+                    "surface_id":"sf-1",
+                    "browser_session_id": bs,
+                    "tab_id": tab,
+                    "auth":{"token": token}
+                }
+            })
+            .to_string();
+            let out: Value =
+                serde_json::from_str(&server.handle_json_line("c", &req).await).expect("json");
+            assert!(out.get("result").is_some());
+        }
     }
 
     #[tokio::test]

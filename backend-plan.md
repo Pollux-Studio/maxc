@@ -125,21 +125,21 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - Deliver robust terminal and browser lifecycle control with low-latency streaming.
 
 ### Tasks
-- [ ] Implement ConPTY-backed terminal lifecycle APIs: `terminal.spawn`, `terminal.input`, `terminal.resize`, `terminal.kill`.
-- [ ] Implement Chromium session manager through Playwright driver.
-- [ ] Implement browser lifecycle APIs: `browser.create`, `browser.attach`, `browser.detach`, `browser.close`.
-- [ ] Implement tab/page APIs: `browser.tab.open`, `browser.tab.list`, `browser.tab.focus`, `browser.tab.close`.
-- [ ] Implement navigation APIs: `browser.goto`, `browser.reload`, `browser.back`, `browser.forward`.
-- [ ] Implement automation APIs: DOM query, click, type, key events, waits, screenshot, evaluate script.
-- [ ] Implement advanced APIs: network interception, cookie/storage controls, file upload/download, tracing.
-- [ ] Implement controlled raw-command API under `browser.raw.*` with policy and limits.
-- [ ] Add surface/workspace binding between terminal and browser sessions and state model.
-- [ ] Implement streaming subscriptions (`terminal.subscribe`, `browser.subscribe`) with fan-out.
-- [ ] Add backpressure and per-subscriber buffering to prevent global stalls.
-- [ ] Add scheduler for interactive vs background workloads with fairness rules.
-- [ ] Add lifecycle cleanup hooks to prevent orphaned sessions/processes.
-- [ ] Add robust error propagation for process exits, runtime failures, IO failures, and cancellation.
-- [ ] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
+- [x] Implement ConPTY-backed terminal lifecycle APIs: `terminal.spawn`, `terminal.input`, `terminal.resize`, `terminal.kill`.
+- [x] Implement Chromium session manager through Playwright driver.
+- [x] Implement browser lifecycle APIs: `browser.create`, `browser.attach`, `browser.detach`, `browser.close`.
+- [x] Implement tab/page APIs: `browser.tab.open`, `browser.tab.list`, `browser.tab.focus`, `browser.tab.close`.
+- [x] Implement navigation APIs: `browser.goto`, `browser.reload`, `browser.back`, `browser.forward`.
+- [x] Implement automation APIs: DOM query, click, type, key events, waits, screenshot, evaluate script.
+- [x] Implement advanced APIs: network interception, cookie/storage controls, file upload/download, tracing.
+- [x] Implement controlled raw-command API under `browser.raw.*` with policy and limits.
+- [x] Add surface/workspace binding between terminal and browser sessions and state model.
+- [x] Implement streaming subscriptions (`terminal.subscribe`, `browser.subscribe`) with fan-out.
+- [x] Add backpressure and per-subscriber buffering to prevent global stalls.
+- [x] Add scheduler for interactive vs background workloads with fairness rules.
+- [x] Add lifecycle cleanup hooks to prevent orphaned sessions/processes.
+- [x] Add robust error propagation for process exits, runtime failures, IO failures, and cancellation.
+- [x] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
 - [ ] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-4: implement browser and terminal execution core`).
 
 ### Deliverables
