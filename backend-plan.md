@@ -56,15 +56,15 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - Provide secure local control plane with authenticated JSON-RPC.
 
 ### Tasks
-- [ ] Implement async local IPC server (Windows named pipe) with Tokio.
-- [ ] Add JSON-RPC router and method dispatcher with middleware chain.
-- [ ] Implement session APIs: `session.create`, `session.refresh`, `session.revoke`.
-- [ ] Enforce OS ACL and token validation for all mutating endpoints.
-- [ ] Add input validation, request size limits, and per-client/global rate limits.
-- [ ] Add request timeouts, cancellation handling, and correlation IDs.
-- [ ] Add deterministic error mapping from internal errors to JSON-RPC errors.
-- [ ] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
-- [ ] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-2: add secure local rpc server`).
+- [x] Implement async local IPC server (Windows named pipe) with Tokio.
+- [x] Add JSON-RPC router and method dispatcher with middleware chain.
+- [x] Implement session APIs: `session.create`, `session.refresh`, `session.revoke`.
+- [x] Enforce OS ACL and token validation for all mutating endpoints.
+- [x] Add input validation, request size limits, and per-client/global rate limits.
+- [x] Add request timeouts, cancellation handling, and correlation IDs.
+- [x] Add deterministic error mapping from internal errors to JSON-RPC errors.
+- [x] **Phase Quality Gate (Mandatory):** review all changed code, add/update tests, run full suite, verify >=85% backend coverage.
+- [x] **Commit Phase Changes (Mandatory):** create one clean phase-scoped commit (example: `phase-2: add secure local rpc server`).
 
 ### Deliverables
 - Running authenticated IPC RPC server
