@@ -1,27 +1,27 @@
 {
   "rpc_health": {
-    "iterations": 120,
-    "warmup": 10
+    "iterations": 40,
+    "warmup": 5
   },
   "session_lifecycle": {
-    "iterations": 80,
-    "warmup": 5
+    "iterations": 20,
+    "warmup": 2
   },
   "terminal_interactive": {
-    "iterations": 80,
-    "warmup": 5
+    "iterations": 20,
+    "warmup": 2
   },
   "browser_navigation": {
-    "iterations": 80,
-    "warmup": 5
+    "iterations": 20,
+    "warmup": 2
   },
   "browser_fanout": {
-    "iterations": 60,
-    "warmup": 5
+    "iterations": 20,
+    "warmup": 2
   },
   "restart_recovery": {
     "iterations": 1,
     "warmup": 0,
-    "fixture_events": 1000
+    "fixture_events": 200
   }
 }

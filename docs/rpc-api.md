@@ -164,6 +164,11 @@ Automation:
 - `browser.subscribe`
 - `browser.raw.command`
 
+Browser runtime notes:
+
+- `browser.create`, `browser.tab.open`, navigation methods, `browser.evaluate`, and `browser.screenshot` now prefer a real Chromium-backed runtime and return additive fields such as `runtime`, `title`, `load_state`, `artifact_path`, and `artifact_bytes`.
+- When the backend cannot launch a browser in the current environment, browser sessions fall back to a synthetic runtime and continue to preserve the same RPC envelopes.
+
 Example:
 
 ```json

@@ -38,7 +38,7 @@ For frontend implementation, use `frontend-integration.md` together with `rpc-ap
 ## Important Runtime Notes
 
 - Terminal execution is now backed by real local processes through the `terminal.*` RPC surface. On Windows the backend prefers ConPTY for process execution and resize behavior; non-Windows and test flows fall back to `process-stdio`.
-- Browser execution is still synthetic and deterministic. It matches the API surface and reliability behavior, but it is not a real Playwright-managed browser runtime yet.
+- Browser execution now prefers a real Chromium-backed CDP runtime and falls back to the synthetic runtime only when the current environment cannot launch a browser process.
 - `system.health` is unauthenticated.
 - `system.readiness`, `system.diagnostics`, `system.metrics`, and `system.logs` require a valid session token.
 - The installed CLI binary name is `maxc-cli`. In examples below, use `cargo run -p maxc-cli -- ...` unless you rename the produced binary later.

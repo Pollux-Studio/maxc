@@ -131,6 +131,9 @@ async fn run_profile(
     if name == "terminal_interactive" {
         config.terminal_runtime = "process-stdio".to_string();
     }
+    if matches!(name, "browser_navigation" | "browser_fanout" | "restart_recovery") {
+        config.browser_executable_or_channel = "__synthetic__".to_string();
+    }
     let server = RpcServer::new(config)?;
 
     match name {

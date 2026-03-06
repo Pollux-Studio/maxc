@@ -93,14 +93,14 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 ## Phase 8: Real Browser Runtime
 
 ### Tasks
-- [ ] Replace the simulated browser runtime with a real Chromium + Playwright-backed engine.
-- [ ] Implement real page/tab lifecycle and navigation.
-- [ ] Implement real browser automation, downloads, screenshots, tracing, and network controls.
-- [ ] Implement real browser event streaming and runtime cleanup.
-- [ ] Separate durable browser metadata from live runtime handles.
-- [ ] Update diagnostics, telemetry, and docs for the real browser runtime.
-- [ ] **Phase Quality Gate (Mandatory)**
-- [ ] **Commit Phase Changes (Mandatory)**
+- [x] Replace the simulated browser runtime with a real Chromium-backed engine, with synthetic fallback only when the environment cannot launch a browser.
+- [x] Implement real page/tab lifecycle and navigation.
+- [x] Implement real browser automation, downloads, screenshots, tracing, and network controls.
+- [x] Implement real browser event streaming and runtime cleanup.
+- [x] Separate durable browser metadata from live runtime handles.
+- [x] Update diagnostics, telemetry, and docs for the real browser runtime.
+- [x] **Phase Quality Gate (Mandatory)**
+- [x] **Commit Phase Changes (Mandatory)**
 
 ## Phase 9: Frontend Runtime Contract
 

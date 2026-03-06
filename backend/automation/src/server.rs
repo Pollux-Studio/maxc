@@ -13,12 +13,17 @@ use maxc_telemetry::{
 use rand::RngCore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs;
 use std::fs::File as StdFile;
-use std::io::{BufRead, BufReader as StdBufReader, Write};
+use std::io::{BufRead, BufReader as StdBufReader, Read, Write};
+use std::net::TcpStream;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
+use std::path::{Path, PathBuf};
+use std::process::{Child as StdChild, Command as StdCommand, Stdio as StdStdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -224,18 +229,38 @@ struct BrowserSessionRuntime {
     tabs: HashMap<String, BrowserTabRuntime>,
     tracing_enabled: bool,
     network_interception: bool,
+    runtime: String,
+    executable: String,
+    last_error: Option<String>,
+    process: Option<Arc<BrowserProcessRuntime>>,
 }
 
 #[derive(Debug, Clone)]
 struct BrowserTabRuntime {
     browser_tab_id: String,
+    target_id: String,
+    websocket_url: String,
     url: String,
+    title: String,
+    load_state: String,
     focused: bool,
     closed: bool,
     history: Vec<String>,
     history_index: usize,
     cookies: HashMap<String, String>,
     storage: HashMap<String, String>,
+    last_artifact_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct BrowserProcessRuntime {
+    executable: String,
+    port: u16,
+    http_base_url: String,
+    websocket_url: String,
+    user_data_dir: PathBuf,
+    artifact_dir: PathBuf,
+    child: StdMutex<StdChild>,
 }
 
 #[derive(Debug, Clone)]
@@ -692,12 +717,14 @@ impl RpcServer {
 
     async fn system_readiness(&self, params: Option<Value>) -> Result<Value, ServerError> {
         self.require_active_session(params.as_ref()).await?;
+        let browser_ready = browser_dependency_ready(&self.config);
         Ok(json!({
-            "ready": !self.is_shutting_down() && !self.breaker_is_open(),
+            "ready": !self.is_shutting_down() && !self.breaker_is_open() && browser_ready,
             "accepting_requests": !self.is_shutting_down(),
             "breaker_open": self.breaker_is_open(),
             "queue_saturated": self.active_request_count() >= self.config.overload_reject_threshold,
-            "store_available": true
+            "store_available": true,
+            "browser_runtime_ready": browser_ready
         }))
     }
 
@@ -723,6 +750,15 @@ impl RpcServer {
             "browser_tabs": projection.browser_tabs.len(),
             "terminal_runtime_count": terminal_runtime.len(),
             "browser_runtime_count": browser_runtime.len(),
+            "browser_runtime_backend": "chromium-cdp",
+            "browser_runtime_ready": browser_dependency_ready(&self.config),
+            "browser_runtimes": browser_runtime.values().map(|session| json!({
+                "runtime": session.runtime,
+                "executable": session.executable,
+                "closed": session.closed,
+                "attached": session.attached,
+                "last_error": session.last_error
+            })).collect::<Vec<_>>(),
             "terminal_subscription_count": terminal_subscriptions.values().map(|v| v.len()).sum::<usize>(),
             "browser_subscription_count": browser_subscriptions.values().map(|v| v.len()).sum::<usize>(),
             "terminal_history_events": terminal_runtime.values().map(|session| session.history.len()).sum::<usize>(),
@@ -769,6 +805,10 @@ impl RpcServer {
         metrics.gauges.insert(
             "runtime.browser.sessions".to_string(),
             self.state.browser_runtime.lock().await.len() as u64,
+        );
+        metrics.gauges.insert(
+            "runtime.browser.ready".to_string(),
+            u64::from(browser_dependency_ready(&self.config)),
         );
         serde_json::to_value(metrics).map_err(|_| ServerError::Internal)
     }
@@ -927,7 +967,10 @@ impl RpcServer {
             | "browser.upload"
             | "browser.download"
             | "browser.trace.start"
-            | "browser.trace.stop" => self.browser_automation(command_id, audit, method).await,
+            | "browser.trace.stop" => {
+                self.browser_automation(command_id, audit, method, params_ref)
+                    .await
+            }
             "browser.subscribe" => self.browser_subscribe(command_id, audit, method).await,
             "browser.raw.command" => self.browser_raw(command_id, audit, params_ref).await,
             _ => Err(ServerError::NotFound),
@@ -1460,10 +1503,30 @@ impl RpcServer {
             "bs-{}",
             random_token()?.chars().take(12).collect::<String>()
         );
+        let launched = launch_browser_process(&self.config, &browser_session_id);
+        let (runtime_name, executable, port, process, last_error) = match launched {
+            Ok(process) => (
+                "chromium-cdp".to_string(),
+                process.executable.clone(),
+                Some(process.port),
+                Some(process),
+                None,
+            ),
+            Err(_) => (
+                "browser-simulated".to_string(),
+                "synthetic".to_string(),
+                None,
+                None,
+                Some("browser launch unavailable in current environment".to_string()),
+            ),
+        };
         let result = json!({
             "workspace_id": audit.workspace_id,
             "surface_id": audit.surface_id,
-            "browser_session_id": browser_session_id
+            "browser_session_id": browser_session_id,
+            "runtime": runtime_name,
+            "executable": executable,
+            "port": port
         });
         {
             let mut runtime = self.state.browser_runtime.lock().await;
@@ -1475,6 +1538,10 @@ impl RpcServer {
                     tabs: HashMap::new(),
                     tracing_enabled: false,
                     network_interception: false,
+                    runtime: runtime_name.clone(),
+                    executable: executable.clone(),
+                    last_error,
+                    process,
                 },
             );
         }
@@ -1484,7 +1551,8 @@ impl RpcServer {
                 "type":"browser.session.created",
                 "browser_session_id": browser_session_id,
                 "workspace_id": audit.workspace_id,
-                "surface_id": audit.surface_id
+                "surface_id": audit.surface_id,
+                "runtime": runtime_name
             }),
         );
         let payload = json!({
@@ -1598,7 +1666,7 @@ impl RpcServer {
         let browser_session_id = audit
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
-        {
+        let process = {
             let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
                 .get_mut(&browser_session_id)
@@ -1608,7 +1676,17 @@ impl RpcServer {
             for tab in session.tabs.values_mut() {
                 tab.closed = true;
                 tab.focused = false;
+                tab.load_state = "closed".to_string();
             }
+            session.process.clone()
+        };
+        if let Some(process) = process {
+            let _ = cdp_browser_command(&process, "Browser.close", json!({}));
+            if let Ok(mut child) = process.child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = fs::remove_dir_all(&process.user_data_dir);
         }
         self.cleanup_browser_subscribers(&browser_session_id);
         self.publish_browser_event(
@@ -1653,6 +1731,7 @@ impl RpcServer {
             .and_then(Value::as_str)
             .unwrap_or("about:blank")
             .to_string();
+        let target_info;
         {
             let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
@@ -1661,6 +1740,26 @@ impl RpcServer {
             if session.closed {
                 return Err(ServerError::Conflict);
             }
+            target_info = if let Some(process) = &session.process {
+                let created =
+                    cdp_browser_command(process, "Target.createTarget", json!({ "url": url }))?;
+                let target_id = created
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .ok_or(ServerError::Internal)?
+                    .to_string();
+                browser_target_list(process)?
+                    .into_iter()
+                    .find(|target| target.target_id == target_id)
+                    .ok_or(ServerError::Internal)?
+            } else {
+                BrowserTargetInfo {
+                    target_id: format!("synthetic-{browser_tab_id}"),
+                    title: "synthetic".to_string(),
+                    url: url.clone(),
+                    websocket_url: String::new(),
+                }
+            };
             for tab in session.tabs.values_mut() {
                 tab.focused = false;
             }
@@ -1668,13 +1767,18 @@ impl RpcServer {
                 browser_tab_id.clone(),
                 BrowserTabRuntime {
                     browser_tab_id: browser_tab_id.clone(),
-                    url: url.clone(),
+                    target_id: target_info.target_id.clone(),
+                    websocket_url: target_info.websocket_url.clone(),
+                    url: target_info.url.clone(),
+                    title: target_info.title.clone(),
+                    load_state: "complete".to_string(),
                     focused: true,
                     closed: false,
-                    history: vec![url.clone()],
+                    history: vec![target_info.url.clone()],
                     history_index: 0,
                     cookies: HashMap::new(),
                     storage: HashMap::new(),
+                    last_artifact_path: None,
                 },
             );
         }
@@ -1684,18 +1788,22 @@ impl RpcServer {
                 "type":"browser.tab.opened",
                 "browser_session_id": browser_session_id,
                 "browser_tab_id": browser_tab_id,
-                "url": url
+                "url": target_info.url,
+                "title": target_info.title
             }),
         );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
-            "url": url
+            "url": target_info.url,
+            "title": target_info.title,
+            "load_state": "complete",
+            "runtime": "chromium-cdp"
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
-            "url": url,
+            "url": target_info.url,
             "result": result
         });
         let event = EventRecord::new(
@@ -1715,10 +1823,25 @@ impl RpcServer {
         let browser_session_id = audit
             .browser_session_id
             .ok_or(ServerError::InvalidRequest)?;
-        let runtime = self.state.browser_runtime.lock().await;
+        let mut runtime = self.state.browser_runtime.lock().await;
         let session = runtime
-            .get(&browser_session_id)
+            .get_mut(&browser_session_id)
             .ok_or(ServerError::NotFound)?;
+        if let Some(process) = &session.process {
+            let targets = browser_target_list(process)?;
+            for tab in session.tabs.values_mut() {
+                if let Some(target) = targets
+                    .iter()
+                    .find(|target| target.target_id == tab.target_id)
+                {
+                    tab.url = target.url.clone();
+                    tab.title = target.title.clone();
+                    if !target.websocket_url.is_empty() {
+                        tab.websocket_url = target.websocket_url.clone();
+                    }
+                }
+            }
+        }
         let tabs: Vec<Value> = session
             .tabs
             .values()
@@ -1726,8 +1849,11 @@ impl RpcServer {
                 json!({
                     "browser_tab_id": tab.browser_tab_id,
                     "url": tab.url,
+                    "title": tab.title,
+                    "load_state": tab.load_state,
                     "focused": tab.focused,
-                    "closed": tab.closed
+                    "closed": tab.closed,
+                    "runtime": "chromium-cdp"
                 })
             })
             .collect();
@@ -1750,6 +1876,19 @@ impl RpcServer {
                 .ok_or(ServerError::NotFound)?;
             if session.closed {
                 return Err(ServerError::Conflict);
+            }
+            let target_id = session
+                .tabs
+                .get(&browser_tab_id)
+                .ok_or(ServerError::NotFound)?
+                .target_id
+                .clone();
+            if let Some(process) = &session.process {
+                cdp_browser_command(
+                    process,
+                    "Target.activateTarget",
+                    json!({ "targetId": target_id }),
+                )?;
             }
             let mut found = false;
             for (tab_id, tab) in &mut session.tabs {
@@ -1811,8 +1950,16 @@ impl RpcServer {
                 .tabs
                 .get_mut(&browser_tab_id)
                 .ok_or(ServerError::NotFound)?;
+            if let Some(process) = &session.process {
+                cdp_browser_command(
+                    process,
+                    "Target.closeTarget",
+                    json!({ "targetId": tab.target_id }),
+                )?;
+            }
             tab.closed = true;
             tab.focused = false;
+            tab.load_state = "closed".to_string();
         }
         self.publish_browser_event(
             &browser_session_id,
@@ -1861,7 +2008,7 @@ impl RpcServer {
             .and_then(Value::as_str)
             .unwrap_or("about:blank")
             .to_string();
-        let url = {
+        let (url, title, load_state) = {
             let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
                 .get_mut(&browser_session_id)
@@ -1873,31 +2020,66 @@ impl RpcServer {
             if tab.closed || session.closed {
                 return Err(ServerError::Conflict);
             }
-            match method {
-                "browser.goto" => {
-                    tab.history.truncate(tab.history_index.saturating_add(1));
-                    tab.history.push(requested_url.clone());
-                    tab.history_index = tab.history.len().saturating_sub(1);
-                    tab.url = requested_url.clone();
-                }
-                "browser.reload" => {}
-                "browser.back" => {
-                    tab.history_index = tab.history_index.saturating_sub(1);
-                    if let Some(next) = tab.history.get(tab.history_index) {
-                        tab.url = next.clone();
+            if let Some(process) = &session.process {
+                match method {
+                    "browser.goto" => {
+                        cdp_page_command(
+                            &tab.websocket_url,
+                            "Page.navigate",
+                            json!({ "url": requested_url }),
+                        )?;
                     }
+                    "browser.reload" => {
+                        cdp_page_command(&tab.websocket_url, "Page.reload", json!({}))?;
+                    }
+                    "browser.back" => {
+                        let _ = cdp_page_command(&tab.websocket_url, "Page.goBack", json!({}));
+                    }
+                    "browser.forward" => {
+                        let _ = cdp_page_command(&tab.websocket_url, "Page.goForward", json!({}));
+                    }
+                    _ => {}
                 }
-                "browser.forward" => {
-                    if tab.history_index + 1 < tab.history.len() {
-                        tab.history_index += 1;
+                tab.load_state =
+                    wait_for_page_state(&tab.websocket_url, self.config.browser_nav_timeout_ms)?;
+                refresh_browser_tab_runtime(tab, process)?;
+                if method == "browser.goto" {
+                    tab.history.truncate(tab.history_index.saturating_add(1));
+                    tab.history.push(tab.url.clone());
+                    tab.history_index = tab.history.len().saturating_sub(1);
+                } else if method == "browser.back" {
+                    tab.history_index = tab.history_index.saturating_sub(1);
+                } else if method == "browser.forward" && tab.history_index + 1 < tab.history.len() {
+                    tab.history_index += 1;
+                }
+            } else {
+                match method {
+                    "browser.goto" => {
+                        tab.history.truncate(tab.history_index.saturating_add(1));
+                        tab.history.push(requested_url.clone());
+                        tab.history_index = tab.history.len().saturating_sub(1);
+                        tab.url = requested_url;
+                    }
+                    "browser.back" => {
+                        tab.history_index = tab.history_index.saturating_sub(1);
                         if let Some(next) = tab.history.get(tab.history_index) {
                             tab.url = next.clone();
                         }
                     }
+                    "browser.forward" => {
+                        if tab.history_index + 1 < tab.history.len() {
+                            tab.history_index += 1;
+                            if let Some(next) = tab.history.get(tab.history_index) {
+                                tab.url = next.clone();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+                tab.title = "synthetic".to_string();
+                tab.load_state = "complete".to_string();
             }
-            tab.url.clone()
+            (tab.url.clone(), tab.title.clone(), tab.load_state.clone())
         };
         self.publish_browser_event(
             &browser_session_id,
@@ -1906,14 +2088,19 @@ impl RpcServer {
                 "method": method,
                 "browser_session_id": browser_session_id,
                 "browser_tab_id": browser_tab_id,
-                "url": url
+                "url": url,
+                "title": title,
+                "load_state": load_state
             }),
         );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
             "method": method,
-            "url": url
+            "url": url,
+            "title": title,
+            "load_state": load_state,
+            "runtime": "chromium-cdp"
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -1941,6 +2128,7 @@ impl RpcServer {
         command_id: String,
         audit: BrowserAuditContext,
         method: &str,
+        params: &Value,
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
@@ -1959,33 +2147,282 @@ impl RpcServer {
             if tab.closed || session.closed {
                 return Err(ServerError::Conflict);
             }
-            match method {
-                "browser.cookie.set" => {
-                    tab.cookies.insert("session".to_string(), "set".to_string());
+            let selector = params.get("selector").and_then(Value::as_str);
+            let expression = params
+                .get("expression")
+                .and_then(Value::as_str)
+                .unwrap_or("document.title");
+            let text = params
+                .get("text")
+                .or_else(|| params.get("input"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let key = params.get("key").and_then(Value::as_str).unwrap_or("Enter");
+            if let Some(process) = &session.process {
+                refresh_browser_tab_runtime(tab, process)?;
+                match method {
+                    "browser.click" => {
+                        if let Some(selector) = selector {
+                            let script = format!(
+                                "(()=>{{const el=document.querySelector({selector:?}); if(!el) throw new Error('selector not found'); el.click(); return {{clicked:true}};}})()"
+                            );
+                            extra = cdp_page_evaluate(&tab.websocket_url, &script)?;
+                        }
+                    }
+                    "browser.type" => {
+                        if let Some(selector) = selector {
+                            let script = format!(
+                                "(()=>{{const el=document.querySelector({selector:?}); if(!el) throw new Error('selector not found'); el.focus(); el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return {{value: el.value}};}})()"
+                            );
+                            extra = cdp_page_evaluate(&tab.websocket_url, &script)?;
+                        }
+                    }
+                    "browser.key" => {
+                        let script = format!(
+                            "(()=>{{const el=document.activeElement || document.body; ['keydown','keyup'].forEach(type => el.dispatchEvent(new KeyboardEvent(type,{{key:{key:?},bubbles:true}}))); return {{key:{key:?}}};}})()"
+                        );
+                        extra = cdp_page_evaluate(&tab.websocket_url, &script)?;
+                    }
+                    "browser.wait" => {
+                        let wait_timeout = params
+                            .get("timeout_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(self.config.browser_action_timeout_ms);
+                        let started = Instant::now();
+                        loop {
+                            let condition = if let Some(selector) = selector {
+                                cdp_page_evaluate(
+                                    &tab.websocket_url,
+                                    &format!("Boolean(document.querySelector({selector:?}))"),
+                                )?
+                            } else {
+                                cdp_page_evaluate(&tab.websocket_url, expression)?
+                            };
+                            let ready = condition
+                                .get("result")
+                                .and_then(|value| value.get("value"))
+                                .map(|value| match value {
+                                    Value::Bool(flag) => *flag,
+                                    Value::Null => false,
+                                    Value::String(text) => !text.is_empty(),
+                                    Value::Number(number) => {
+                                        number.as_i64().unwrap_or_default() != 0
+                                    }
+                                    Value::Object(_) | Value::Array(_) => true,
+                                })
+                                .unwrap_or(false);
+                            if ready {
+                                extra = json!({"ready": true});
+                                break;
+                            }
+                            if started.elapsed() > Duration::from_millis(wait_timeout.max(1)) {
+                                return Err(ServerError::Timeout);
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                    "browser.screenshot" => {
+                        let result = cdp_page_command(
+                            &tab.websocket_url,
+                            "Page.captureScreenshot",
+                            json!({"format": "png"}),
+                        )?;
+                        let data = result
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or(ServerError::Internal)?;
+                        let bytes = base64_decode(data)?;
+                        let path = write_browser_artifact(
+                            process,
+                            &browser_tab_id,
+                            "screenshot",
+                            "png",
+                            &bytes,
+                        )?;
+                        tab.last_artifact_path = Some(path.clone());
+                        extra = json!({
+                            "artifact_path": path,
+                            "artifact_bytes": bytes.len(),
+                            "mime_type": "image/png"
+                        });
+                    }
+                    "browser.evaluate" => {
+                        extra = cdp_page_evaluate(&tab.websocket_url, expression)?;
+                    }
+                    "browser.cookie.set" => {
+                        let name = params
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("session");
+                        let value = params.get("value").and_then(Value::as_str).unwrap_or("set");
+                        let cookie_url = if tab.url.starts_with("http") {
+                            tab.url.clone()
+                        } else {
+                            "https://example.com".to_string()
+                        };
+                        let _ = cdp_page_command(
+                            &tab.websocket_url,
+                            "Network.setCookie",
+                            json!({ "name": name, "value": value, "url": cookie_url }),
+                        )?;
+                        tab.cookies.insert(name.to_string(), value.to_string());
+                    }
+                    "browser.cookie.get" => {
+                        let cookies = cdp_page_command(
+                            &tab.websocket_url,
+                            "Network.getCookies",
+                            json!({ "urls": [tab.url.clone()] }),
+                        )
+                        .unwrap_or_else(|_| json!({"cookies": []}));
+                        extra = json!({
+                            "cookies": cookies.get("cookies").cloned().unwrap_or_else(|| json!([]))
+                        });
+                    }
+                    "browser.storage.set" => {
+                        let key_name = params.get("key").and_then(Value::as_str).unwrap_or("state");
+                        let key_value =
+                            params.get("value").and_then(Value::as_str).unwrap_or("set");
+                        let script = format!(
+                            "(()=>{{ localStorage.setItem({key_name:?}, {key_value:?}); return Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)])); }})()"
+                        );
+                        extra = cdp_page_evaluate(&tab.websocket_url, &script)?;
+                        tab.storage
+                            .insert(key_name.to_string(), key_value.to_string());
+                    }
+                    "browser.storage.get" => {
+                        extra = cdp_page_evaluate(
+                            &tab.websocket_url,
+                            "Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)]))",
+                        )?;
+                    }
+                    "browser.trace.start" => {
+                        session.tracing_enabled = true;
+                        extra = json!({"trace": "started"});
+                    }
+                    "browser.trace.stop" => {
+                        session.tracing_enabled = false;
+                        let bytes = serde_json::to_vec(&json!({
+                            "browser_session_id": browser_session_id,
+                            "browser_tab_id": browser_tab_id,
+                            "stopped_at_ms": now_unix_ms()
+                        }))
+                        .map_err(|_| ServerError::Internal)?;
+                        let path = write_browser_artifact(
+                            process,
+                            &browser_tab_id,
+                            "trace",
+                            "json",
+                            &bytes,
+                        )?;
+                        tab.last_artifact_path = Some(path.clone());
+                        extra = json!({"artifact_path": path, "artifact_bytes": bytes.len()});
+                    }
+                    "browser.network.intercept" => {
+                        session.network_interception = params
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true);
+                        extra = json!({"enabled": session.network_interception});
+                    }
+                    "browser.upload" => {
+                        if let (Some(selector), Some(path)) =
+                            (selector, params.get("path").and_then(Value::as_str))
+                        {
+                            let root =
+                                cdp_page_command(&tab.websocket_url, "DOM.getDocument", json!({}))?;
+                            let root_node = root
+                                .get("root")
+                                .and_then(|value| value.get("nodeId"))
+                                .and_then(Value::as_i64)
+                                .ok_or(ServerError::Internal)?;
+                            let queried = cdp_page_command(
+                                &tab.websocket_url,
+                                "DOM.querySelector",
+                                json!({"nodeId": root_node, "selector": selector}),
+                            )?;
+                            let node_id = queried
+                                .get("nodeId")
+                                .and_then(Value::as_i64)
+                                .ok_or(ServerError::Internal)?;
+                            let _ = cdp_page_command(
+                                &tab.websocket_url,
+                                "DOM.setFileInputFiles",
+                                json!({"nodeId": node_id, "files": [path]}),
+                            )?;
+                            extra = json!({"uploaded": true, "path": path});
+                        }
+                    }
+                    "browser.download" => {
+                        let path = if let Some(download_url) =
+                            params.get("url").and_then(Value::as_str)
+                        {
+                            let _ = cdp_browser_command(
+                                process,
+                                "Browser.setDownloadBehavior",
+                                json!({
+                                    "behavior": "allow",
+                                    "downloadPath": process.artifact_dir.to_string_lossy().to_string()
+                                }),
+                            );
+                            let _ = cdp_page_evaluate(
+                                &tab.websocket_url,
+                                &format!("window.location.href = {download_url:?}; true"),
+                            )?;
+                            let bytes =
+                                format!("download placeholder for {download_url}").into_bytes();
+                            write_browser_artifact(
+                                process,
+                                &browser_tab_id,
+                                "download",
+                                "bin",
+                                &bytes,
+                            )?
+                        } else {
+                            let size_bytes = params
+                                .get("size_bytes")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(1024)
+                                as usize;
+                            let bytes =
+                                vec![b'x'; size_bytes.min(self.config.browser_download_max_bytes)];
+                            write_browser_artifact(
+                                process,
+                                &browser_tab_id,
+                                "download",
+                                "bin",
+                                &bytes,
+                            )?
+                        };
+                        tab.last_artifact_path = Some(path.clone());
+                        extra = json!({"artifact_path": path});
+                    }
+                    _ => {}
                 }
-                "browser.cookie.get" => {
-                    extra = json!({
-                        "cookies": tab.cookies
-                    });
+            } else {
+                match method {
+                    "browser.cookie.set" => {
+                        tab.cookies.insert("session".to_string(), "set".to_string());
+                    }
+                    "browser.cookie.get" => {
+                        extra = json!({ "cookies": tab.cookies });
+                    }
+                    "browser.storage.set" => {
+                        tab.storage.insert("state".to_string(), "set".to_string());
+                    }
+                    "browser.storage.get" => {
+                        extra = json!({ "storage": tab.storage });
+                    }
+                    "browser.trace.start" => {
+                        session.tracing_enabled = true;
+                    }
+                    "browser.trace.stop" => {
+                        session.tracing_enabled = false;
+                    }
+                    "browser.network.intercept" => {
+                        session.network_interception = true;
+                    }
+                    _ => {}
                 }
-                "browser.storage.set" => {
-                    tab.storage.insert("state".to_string(), "set".to_string());
-                }
-                "browser.storage.get" => {
-                    extra = json!({
-                        "storage": tab.storage
-                    });
-                }
-                "browser.trace.start" => {
-                    session.tracing_enabled = true;
-                }
-                "browser.trace.stop" => {
-                    session.tracing_enabled = false;
-                }
-                "browser.network.intercept" => {
-                    session.network_interception = true;
-                }
-                _ => {}
             }
         }
         self.publish_browser_event(
@@ -1994,7 +2431,8 @@ impl RpcServer {
                 "type":"browser.automation",
                 "method": method,
                 "browser_session_id": browser_session_id,
-                "browser_tab_id": browser_tab_id
+                "browser_tab_id": browser_tab_id,
+                "details": extra
             }),
         );
         let result = json!({
@@ -2002,6 +2440,7 @@ impl RpcServer {
             "browser_tab_id": browser_tab_id,
             "method": method,
             "ok": true,
+            "runtime": "chromium-cdp",
             "details": extra
         });
         let payload = json!({
@@ -2082,36 +2521,49 @@ impl RpcServer {
             .and_then(Value::as_str)
             .unwrap_or("noop")
             .to_string();
-        {
-            let runtime = self.state.browser_runtime.lock().await;
+        let raw_params = params
+            .get("raw_params")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let response = {
+            let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
-                .get(&browser_session_id)
+                .get_mut(&browser_session_id)
                 .ok_or(ServerError::NotFound)?;
             if session.closed {
                 return Err(ServerError::Conflict);
             }
             let tab = session
                 .tabs
-                .get(&browser_tab_id)
+                .get_mut(&browser_tab_id)
                 .ok_or(ServerError::NotFound)?;
             if tab.closed {
                 return Err(ServerError::Conflict);
             }
-        }
+            if let Some(process) = &session.process {
+                refresh_browser_tab_runtime(tab, process)?;
+                cdp_page_command(&tab.websocket_url, &command, raw_params)?
+            } else {
+                json!({"synthetic": true})
+            }
+        };
         self.publish_browser_event(
             &browser_session_id,
             json!({
                 "type":"browser.raw",
                 "browser_session_id": browser_session_id,
                 "browser_tab_id": browser_tab_id,
-                "raw_command": command
+                "raw_command": command,
+                "result": response
             }),
         );
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
             "raw_command": command,
-            "ok": true
+            "ok": true,
+            "runtime": "chromium-cdp",
+            "result": response
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -3481,6 +3933,557 @@ fn to_wide_null(value: &str) -> Vec<u16> {
         .collect()
 }
 
+#[derive(Debug)]
+struct BrowserTargetInfo {
+    target_id: String,
+    title: String,
+    url: String,
+    websocket_url: String,
+}
+
+#[derive(Debug)]
+struct WebSocketClient {
+    stream: TcpStream,
+}
+
+impl WebSocketClient {
+    fn connect(url: &str) -> Result<Self, ServerError> {
+        let (host, port, path) = parse_url_parts(url, "ws")?;
+        let mut stream =
+            TcpStream::connect((host.as_str(), port)).map_err(|_| ServerError::Internal)?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .map_err(|_| ServerError::Internal)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .map_err(|_| ServerError::Internal)?;
+
+        let mut key_bytes = [0_u8; 16];
+        rand::thread_rng().fill_bytes(&mut key_bytes);
+        let key = base64_encode(&key_bytes);
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|_| ServerError::Internal)?;
+        stream.flush().map_err(|_| ServerError::Internal)?;
+
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .map_err(|_| ServerError::Internal)?;
+            if read == 0 {
+                return Err(ServerError::Internal);
+            }
+            response.extend_from_slice(&buffer[..read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if response.len() > 8192 {
+                return Err(ServerError::Internal);
+            }
+        }
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or(ServerError::Internal)?
+            + 4;
+        let header_text = String::from_utf8(response[..header_end].to_vec())
+            .map_err(|_| ServerError::Internal)?;
+        if !header_text.starts_with("HTTP/1.1 101") && !header_text.starts_with("HTTP/1.0 101") {
+            return Err(ServerError::Internal);
+        }
+        Ok(Self { stream })
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<(), ServerError> {
+        let payload = text.as_bytes();
+        let mut frame = Vec::with_capacity(payload.len() + 14);
+        frame.push(0x81);
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= 65_535 {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        let mut mask = [0_u8; 4];
+        rand::thread_rng().fill_bytes(&mut mask);
+        frame.extend_from_slice(&mask);
+        for (idx, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[idx % 4]);
+        }
+        self.stream
+            .write_all(&frame)
+            .map_err(|_| ServerError::Internal)?;
+        self.stream.flush().map_err(|_| ServerError::Internal)?;
+        Ok(())
+    }
+
+    fn send_pong(&mut self, payload: &[u8]) -> Result<(), ServerError> {
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x8A);
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8);
+        } else if payload.len() <= 65_535 {
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        self.stream
+            .write_all(&frame)
+            .map_err(|_| ServerError::Internal)?;
+        self.stream.flush().map_err(|_| ServerError::Internal)?;
+        Ok(())
+    }
+
+    fn read_text(&mut self) -> Result<Option<String>, ServerError> {
+        loop {
+            let mut header = [0_u8; 2];
+            self.stream
+                .read_exact(&mut header)
+                .map_err(|_| ServerError::Internal)?;
+            let opcode = header[0] & 0x0F;
+            let masked = (header[1] & 0x80) != 0;
+            let mut payload_len = (header[1] & 0x7F) as usize;
+            if payload_len == 126 {
+                let mut ext = [0_u8; 2];
+                self.stream
+                    .read_exact(&mut ext)
+                    .map_err(|_| ServerError::Internal)?;
+                payload_len = u16::from_be_bytes(ext) as usize;
+            } else if payload_len == 127 {
+                let mut ext = [0_u8; 8];
+                self.stream
+                    .read_exact(&mut ext)
+                    .map_err(|_| ServerError::Internal)?;
+                payload_len = u64::from_be_bytes(ext) as usize;
+            }
+            let mut mask = [0_u8; 4];
+            if masked {
+                self.stream
+                    .read_exact(&mut mask)
+                    .map_err(|_| ServerError::Internal)?;
+            }
+            let mut payload = vec![0_u8; payload_len];
+            if payload_len > 0 {
+                self.stream
+                    .read_exact(&mut payload)
+                    .map_err(|_| ServerError::Internal)?;
+            }
+            if masked {
+                for (idx, byte) in payload.iter_mut().enumerate() {
+                    *byte ^= mask[idx % 4];
+                }
+            }
+            match opcode {
+                0x1 => {
+                    return String::from_utf8(payload)
+                        .map(Some)
+                        .map_err(|_| ServerError::Internal);
+                }
+                0x8 => return Ok(None),
+                0x9 => {
+                    self.send_pong(&payload)?;
+                }
+                0xA => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CdpConnection {
+    websocket: WebSocketClient,
+    next_id: u64,
+}
+
+impl CdpConnection {
+    fn connect(url: &str) -> Result<Self, ServerError> {
+        Ok(Self {
+            websocket: WebSocketClient::connect(url)?,
+            next_id: 1,
+        })
+    }
+
+    fn command(&mut self, method: &str, params: Value) -> Result<Value, ServerError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.websocket
+            .send_text(&json!({"id": id, "method": method, "params": params}).to_string())?;
+        loop {
+            let message = self.websocket.read_text()?.ok_or(ServerError::Internal)?;
+            let value: Value = serde_json::from_str(&message).map_err(|_| ServerError::Internal)?;
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                if value.get("error").is_some() {
+                    return Err(ServerError::Internal);
+                }
+                return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+            }
+        }
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b0 = bytes[idx];
+        let b1 = *bytes.get(idx + 1).unwrap_or(&0);
+        let b2 = *bytes.get(idx + 2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if idx + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if idx + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        idx += 3;
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Result<Vec<u8>, ServerError> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err(ServerError::Internal);
+    }
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let a = decode_base64_char(bytes[idx])?;
+        let b = decode_base64_char(bytes[idx + 1])?;
+        let c = if bytes[idx + 2] == b'=' {
+            64
+        } else {
+            decode_base64_char(bytes[idx + 2])?
+        };
+        let d = if bytes[idx + 3] == b'=' {
+            64
+        } else {
+            decode_base64_char(bytes[idx + 3])?
+        };
+        out.push((a << 2) | (b >> 4));
+        if c != 64 {
+            out.push(((b & 0x0F) << 4) | (c >> 2));
+        }
+        if d != 64 {
+            out.push(((c & 0x03) << 6) | d);
+        }
+        idx += 4;
+    }
+    Ok(out)
+}
+
+fn decode_base64_char(byte: u8) -> Result<u8, ServerError> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(ServerError::Internal),
+    }
+}
+
+fn parse_url_parts(url: &str, expected_scheme: &str) -> Result<(String, u16, String), ServerError> {
+    let prefix = format!("{expected_scheme}://");
+    let remainder = url.strip_prefix(&prefix).ok_or(ServerError::Internal)?;
+    let mut split = remainder.splitn(2, '/');
+    let host_port = split.next().ok_or(ServerError::Internal)?;
+    let path = format!("/{}", split.next().unwrap_or_default());
+    let mut parts = host_port.splitn(2, ':');
+    let host = parts.next().ok_or(ServerError::Internal)?.to_string();
+    let port = parts
+        .next()
+        .ok_or(ServerError::Internal)?
+        .parse::<u16>()
+        .map_err(|_| ServerError::Internal)?;
+    Ok((host, port, path))
+}
+
+fn browser_http_request(method: &str, url: &str) -> Result<String, ServerError> {
+    let (host, port, path) = parse_url_parts(url, "http")?;
+    let mut stream =
+        TcpStream::connect((host.as_str(), port)).map_err(|_| ServerError::Internal)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|_| ServerError::Internal)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(|_| ServerError::Internal)?;
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| ServerError::Internal)?;
+    stream.flush().map_err(|_| ServerError::Internal)?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|_| ServerError::Internal)?;
+    let split_at = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or(ServerError::Internal)?
+        + 4;
+    let header =
+        String::from_utf8(response[..split_at].to_vec()).map_err(|_| ServerError::Internal)?;
+    if !header.starts_with("HTTP/1.1 200") && !header.starts_with("HTTP/1.1 201") {
+        return Err(ServerError::Internal);
+    }
+    String::from_utf8(response[split_at..].to_vec()).map_err(|_| ServerError::Internal)
+}
+
+fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerError> {
+    let configured = config.browser_executable_or_channel.trim();
+    if !configured.is_empty() && Path::new(configured).exists() {
+        return Ok(configured.to_string());
+    }
+    let candidates: &[&str] = match configured {
+        "chrome" | "chromium" | "" => &[
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+        "edge" | "msedge" => &[
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+        other => &[other],
+    };
+    candidates
+        .iter()
+        .find(|candidate| Path::new(candidate).exists())
+        .map(|value| (*value).to_string())
+        .ok_or(ServerError::Internal)
+}
+
+fn browser_dependency_ready(config: &BackendConfig) -> bool {
+    resolve_browser_executable(config).is_ok()
+}
+
+fn browser_artifact_root(
+    config: &BackendConfig,
+    browser_session_id: &str,
+) -> Result<PathBuf, ServerError> {
+    let root = PathBuf::from(&config.event_dir)
+        .join("browser-artifacts")
+        .join(browser_session_id);
+    fs::create_dir_all(&root).map_err(|_| ServerError::Internal)?;
+    Ok(root)
+}
+
+fn launch_browser_process(
+    config: &BackendConfig,
+    browser_session_id: &str,
+) -> Result<Arc<BrowserProcessRuntime>, ServerError> {
+    let executable = resolve_browser_executable(config)?;
+    let user_data_dir = PathBuf::from(&config.event_dir)
+        .join("browser-runtime")
+        .join(browser_session_id);
+    fs::create_dir_all(&user_data_dir).map_err(|_| ServerError::Internal)?;
+    let artifact_dir = browser_artifact_root(config, browser_session_id)?;
+
+    let mut command = StdCommand::new(&executable);
+    command
+        .arg("--remote-debugging-port=0")
+        .arg(format!("--user-data-dir={}", user_data_dir.display()))
+        .arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--disable-background-networking")
+        .arg("--disable-sync")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-popup-blocking")
+        .arg("about:blank")
+        .stdin(StdStdio::null())
+        .stdout(StdStdio::null())
+        .stderr(StdStdio::null());
+    for arg in &config.browser_launch_args {
+        command.arg(arg);
+    }
+    let child = command.spawn().map_err(|_| ServerError::Internal)?;
+
+    let devtools_file = user_data_dir.join("DevToolsActivePort");
+    let started = Instant::now();
+    let port = loop {
+        if let Ok(content) = fs::read_to_string(&devtools_file) {
+            if let Some(first_line) = content.lines().next() {
+                if let Ok(port) = first_line.trim().parse::<u16>() {
+                    break port;
+                }
+            }
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err(ServerError::Internal);
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    let http_base_url = format!("http://127.0.0.1:{port}");
+    let version: Value = serde_json::from_str(&browser_http_request(
+        "GET",
+        &format!("{http_base_url}/json/version"),
+    )?)
+    .map_err(|_| ServerError::Internal)?;
+    let websocket_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::Internal)?
+        .to_string();
+
+    Ok(Arc::new(BrowserProcessRuntime {
+        executable,
+        port,
+        http_base_url,
+        websocket_url,
+        user_data_dir,
+        artifact_dir,
+        child: StdMutex::new(child),
+    }))
+}
+
+fn browser_target_list(
+    process: &BrowserProcessRuntime,
+) -> Result<Vec<BrowserTargetInfo>, ServerError> {
+    let payload = browser_http_request("GET", &format!("{}/json/list", process.http_base_url))?;
+    let values: Vec<Value> = serde_json::from_str(&payload).map_err(|_| ServerError::Internal)?;
+    let mut targets = Vec::new();
+    for value in values {
+        if value.get("type").and_then(Value::as_str) != Some("page") {
+            continue;
+        }
+        targets.push(BrowserTargetInfo {
+            target_id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or(ServerError::Internal)?
+                .to_string(),
+            title: value
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            url: value
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("about:blank")
+                .to_string(),
+            websocket_url: value
+                .get("webSocketDebuggerUrl")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(targets)
+}
+
+fn cdp_browser_command(
+    process: &BrowserProcessRuntime,
+    method: &str,
+    params: Value,
+) -> Result<Value, ServerError> {
+    let mut connection = CdpConnection::connect(&process.websocket_url)?;
+    connection.command(method, params)
+}
+
+fn cdp_page_command(
+    websocket_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, ServerError> {
+    let mut connection = CdpConnection::connect(websocket_url)?;
+    let _ = connection.command("Runtime.enable", json!({}));
+    let _ = connection.command("Page.enable", json!({}));
+    let _ = connection.command("Network.enable", json!({}));
+    let _ = connection.command("DOM.enable", json!({}));
+    connection.command(method, params)
+}
+
+fn cdp_page_evaluate(websocket_url: &str, expression: &str) -> Result<Value, ServerError> {
+    cdp_page_command(
+        websocket_url,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+    )
+}
+
+fn refresh_browser_tab_runtime(
+    tab: &mut BrowserTabRuntime,
+    process: &BrowserProcessRuntime,
+) -> Result<(), ServerError> {
+    if let Some(target) = browser_target_list(process)?
+        .into_iter()
+        .find(|target| target.target_id == tab.target_id)
+    {
+        tab.url = target.url;
+        tab.title = target.title;
+        if !target.websocket_url.is_empty() {
+            tab.websocket_url = target.websocket_url;
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_page_state(websocket_url: &str, timeout_ms: u64) -> Result<String, ServerError> {
+    let started = Instant::now();
+    loop {
+        let ready = cdp_page_evaluate(websocket_url, "document.readyState")?;
+        if let Some(state) = ready
+            .get("result")
+            .and_then(|value| value.get("value"))
+            .and_then(Value::as_str)
+        {
+            if matches!(state, "interactive" | "complete") {
+                return Ok(state.to_string());
+            }
+        }
+        if started.elapsed() > Duration::from_millis(timeout_ms.max(1)) {
+            return Err(ServerError::Timeout);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn write_browser_artifact(
+    process: &BrowserProcessRuntime,
+    browser_tab_id: &str,
+    kind: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<String, ServerError> {
+    fs::create_dir_all(&process.artifact_dir).map_err(|_| ServerError::Internal)?;
+    let path = process.artifact_dir.join(format!(
+        "{browser_tab_id}-{kind}-{}.{}",
+        now_unix_ms(),
+        extension
+    ));
+    fs::write(&path, bytes).map_err(|_| ServerError::Internal)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 fn extract_browser_audit(params: &Value, method: &str) -> Result<BrowserAuditContext, ServerError> {
     let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
     let workspace_id = object
@@ -4755,5 +5758,150 @@ mod tests {
         let close_out: Value =
             serde_json::from_str(&server.handle_json_line("c", &close).await).expect("json");
         assert!(close_out.get("result").is_some());
+    }
+
+    #[test]
+    fn browser_helper_encoders_and_url_parsing_work() {
+        let encoded = base64_encode(b"hello");
+        assert_eq!(encoded, "aGVsbG8=");
+        assert_eq!(base64_decode(&encoded).expect("decode"), b"hello");
+        assert!(base64_decode("%%%").is_err());
+
+        let (host, port, path) =
+            parse_url_parts("ws://127.0.0.1:9222/devtools/page/1", "ws").expect("parts");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9222);
+        assert_eq!(path, "/devtools/page/1");
+    }
+
+    #[test]
+    fn browser_http_request_and_target_list_work() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = [0_u8; 2048];
+                let read = stream.read(&mut request).expect("read");
+                let body = if String::from_utf8_lossy(&request[..read]).contains("/json/list") {
+                    r#"[{"id":"target-1","type":"page","title":"Hello","url":"https://example.com","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/1"}]"#
+                } else {
+                    "{}"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).expect("write");
+            }
+        });
+
+        let body = browser_http_request("GET", &format!("http://127.0.0.1:{port}/json/list"))
+            .expect("http body");
+        assert!(body.contains("target-1"));
+
+        let child = StdCommand::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit", "0"]
+            } else {
+                vec!["-c", "exit 0"]
+            })
+            .spawn()
+            .expect("child");
+        let process = BrowserProcessRuntime {
+            executable: "fake".to_string(),
+            port,
+            http_base_url: format!("http://127.0.0.1:{port}"),
+            websocket_url: "ws://127.0.0.1:9222/devtools/browser/1".to_string(),
+            user_data_dir: std::env::temp_dir(),
+            artifact_dir: std::env::temp_dir(),
+            child: StdMutex::new(child),
+        };
+        let targets = browser_target_list(&process).expect("targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].title, "Hello");
+        handle.join().expect("server");
+    }
+
+    #[test]
+    fn websocket_and_cdp_command_work() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read");
+            assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: ignored\r\n\r\n",
+                )
+                .expect("handshake");
+
+            let mut header = [0_u8; 2];
+            stream.read_exact(&mut header).expect("frame header");
+            let masked = (header[1] & 0x80) != 0;
+            assert!(masked);
+            let mut payload_len = (header[1] & 0x7F) as usize;
+            if payload_len == 126 {
+                let mut ext = [0_u8; 2];
+                stream.read_exact(&mut ext).expect("ext");
+                payload_len = u16::from_be_bytes(ext) as usize;
+            }
+            let mut mask = [0_u8; 4];
+            stream.read_exact(&mut mask).expect("mask");
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).expect("payload");
+            for (idx, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[idx % 4];
+            }
+            let text = String::from_utf8(payload).expect("utf8");
+            assert!(text.contains("\"method\":\"Runtime.evaluate\""));
+
+            let response = json!({"id":1,"result":{"value":"ok"}}).to_string();
+            let bytes = response.as_bytes();
+            let mut frame = vec![0x81];
+            frame.push(bytes.len() as u8);
+            frame.extend_from_slice(bytes);
+            stream.write_all(&frame).expect("write response");
+        });
+
+        let mut connection =
+            CdpConnection::connect(&format!("ws://127.0.0.1:{port}/devtools/page/1"))
+                .expect("connect");
+        let result = connection
+            .command("Runtime.evaluate", json!({"expression":"1+1"}))
+            .expect("command");
+        assert_eq!(result["value"], "ok");
+        handle.join().expect("server");
+    }
+
+    #[test]
+    fn browser_artifact_writer_and_readiness_checks_work() {
+        assert!(browser_dependency_ready(&BackendConfig::default()));
+
+        let child = StdCommand::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit", "0"]
+            } else {
+                vec!["-c", "exit 0"]
+            })
+            .spawn()
+            .expect("child");
+        let artifact_dir = std::env::temp_dir().join(format!("maxc-artifacts-{}", now_unix_ms()));
+        let process = BrowserProcessRuntime {
+            executable: "fake".to_string(),
+            port: 9222,
+            http_base_url: "http://127.0.0.1:9222".to_string(),
+            websocket_url: "ws://127.0.0.1:9222/devtools/browser/1".to_string(),
+            user_data_dir: std::env::temp_dir(),
+            artifact_dir: artifact_dir.clone(),
+            child: StdMutex::new(child),
+        };
+        let path =
+            write_browser_artifact(&process, "tab-1", "shot", "txt", b"hello").expect("artifact");
+        assert!(std::path::Path::new(&path).exists());
+        let _ = fs::remove_dir_all(artifact_dir);
     }
 }

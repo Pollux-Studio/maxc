@@ -5,9 +5,9 @@ This document is the frontend contract for the current backend. Use it with `rpc
 ## Current Backend Boundary
 
 - The backend exposes a local JSON-RPC service.
-- The backend provides real terminal execution and deterministic simulated browser execution.
+- The backend provides real terminal execution and a real Chromium-backed browser runtime when the environment can launch a browser process.
 - Frontend work should treat the RPC interface, IDs, errors, readiness, and diagnostics behavior as the stable integration surface.
-- Frontend work can rely on real Windows ConPTY-backed terminal execution when `runtime` reports `conpty`, but should still treat terminal rendering as driven by RPC events and history responses rather than hidden local state. Browser behavior remains simulated until Phase 8 lands.
+- Frontend work can rely on real Windows ConPTY-backed terminal execution when `runtime` reports `conpty`, and on real browser execution when browser responses report `runtime: "chromium-cdp"`. The frontend should still treat rendering as driven by RPC events and returned state rather than hidden local state.
 
 ## Core Frontend Flows
 
@@ -238,6 +238,6 @@ Display at minimum:
 ## Known Backend Limits
 
 - Terminal sessions now run real local processes and stream real output through `terminal.subscribe`.
-- Browser sessions remain synthetic today.
+- Browser sessions prefer the real Chromium-backed runtime and fall back to a synthetic session only when the backend cannot launch a browser in the current environment.
 - Non-Windows named-pipe transport is not implemented in the CLI.
 - The frontend should build against the RPC contract, not hidden assumptions about process or browser embedding internals.
