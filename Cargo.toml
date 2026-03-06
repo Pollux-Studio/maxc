@@ -2,6 +2,7 @@
 members = [
   "backend/core",
   "backend/automation",
+  "backend/browser",
   "backend/terminal",
   "backend/storage",
   "backend/security",

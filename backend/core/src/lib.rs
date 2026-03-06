@@ -100,6 +100,17 @@ pub struct BackendConfig {
     pub segment_max_bytes: u64,
     pub snapshot_interval_events: u64,
     pub snapshot_retain_count: usize,
+    pub browser_runtime: String,
+    pub browser_driver: String,
+    pub browser_executable_or_channel: String,
+    pub browser_launch_args: Vec<String>,
+    pub browser_max_contexts: usize,
+    pub browser_nav_timeout_ms: u64,
+    pub browser_action_timeout_ms: u64,
+    pub browser_screenshot_max_bytes: usize,
+    pub browser_download_max_bytes: usize,
+    pub browser_subscription_limit: usize,
+    pub browser_raw_rate_limit_per_sec: u32,
     pub log_level: String,
 }
 
@@ -124,6 +135,17 @@ impl Default for BackendConfig {
             segment_max_bytes: 1_048_576,
             snapshot_interval_events: 100,
             snapshot_retain_count: 3,
+            browser_runtime: "chromium".to_string(),
+            browser_driver: "playwright".to_string(),
+            browser_executable_or_channel: "chromium".to_string(),
+            browser_launch_args: Vec::new(),
+            browser_max_contexts: 8,
+            browser_nav_timeout_ms: 30_000,
+            browser_action_timeout_ms: 10_000,
+            browser_screenshot_max_bytes: 5_242_880,
+            browser_download_max_bytes: 52_428_800,
+            browser_subscription_limit: 32,
+            browser_raw_rate_limit_per_sec: 10,
             log_level: "info".to_string(),
         }
     }
@@ -235,6 +257,85 @@ impl BackendConfig {
                         value: value.clone(),
                     })?;
         }
+        if let Some(value) = get("MAXC_BROWSER_RUNTIME") {
+            cfg.browser_runtime = value;
+        }
+        if let Some(value) = get("MAXC_BROWSER_DRIVER") {
+            cfg.browser_driver = value;
+        }
+        if let Some(value) = get("MAXC_BROWSER_EXECUTABLE_OR_CHANNEL") {
+            cfg.browser_executable_or_channel = value;
+        }
+        if let Some(value) = get("MAXC_BROWSER_LAUNCH_ARGS") {
+            cfg.browser_launch_args = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_BROWSER_MAX_CONTEXTS") {
+            cfg.browser_max_contexts =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_MAX_CONTEXTS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BROWSER_NAV_TIMEOUT_MS") {
+            cfg.browser_nav_timeout_ms =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_NAV_TIMEOUT_MS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BROWSER_ACTION_TIMEOUT_MS") {
+            cfg.browser_action_timeout_ms =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_ACTION_TIMEOUT_MS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BROWSER_SCREENSHOT_MAX_BYTES") {
+            cfg.browser_screenshot_max_bytes =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_SCREENSHOT_MAX_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BROWSER_DOWNLOAD_MAX_BYTES") {
+            cfg.browser_download_max_bytes =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_DOWNLOAD_MAX_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BROWSER_SUBSCRIPTION_LIMIT") {
+            cfg.browser_subscription_limit =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_SUBSCRIPTION_LIMIT",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC") {
+            cfg.browser_raw_rate_limit_per_sec =
+                value
+                    .parse::<u32>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC",
+                        value: value.clone(),
+                    })?;
+        }
 
         if let Some(value) = get("MAXC_LOG_LEVEL") {
             cfg.log_level = value;
@@ -317,6 +418,66 @@ impl BackendConfig {
                 value: self.snapshot_retain_count.to_string(),
             });
         }
+        if self.browser_runtime.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_RUNTIME",
+                value: self.browser_runtime.clone(),
+            });
+        }
+        if self.browser_driver.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_DRIVER",
+                value: self.browser_driver.clone(),
+            });
+        }
+        if self.browser_executable_or_channel.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_EXECUTABLE_OR_CHANNEL",
+                value: self.browser_executable_or_channel.clone(),
+            });
+        }
+        if self.browser_max_contexts == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_MAX_CONTEXTS",
+                value: self.browser_max_contexts.to_string(),
+            });
+        }
+        if self.browser_nav_timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_NAV_TIMEOUT_MS",
+                value: self.browser_nav_timeout_ms.to_string(),
+            });
+        }
+        if self.browser_action_timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_ACTION_TIMEOUT_MS",
+                value: self.browser_action_timeout_ms.to_string(),
+            });
+        }
+        if self.browser_screenshot_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_SCREENSHOT_MAX_BYTES",
+                value: self.browser_screenshot_max_bytes.to_string(),
+            });
+        }
+        if self.browser_download_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_DOWNLOAD_MAX_BYTES",
+                value: self.browser_download_max_bytes.to_string(),
+            });
+        }
+        if self.browser_subscription_limit == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_SUBSCRIPTION_LIMIT",
+                value: self.browser_subscription_limit.to_string(),
+            });
+        }
+        if self.browser_raw_rate_limit_per_sec == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC",
+                value: self.browser_raw_rate_limit_per_sec.to_string(),
+            });
+        }
 
         let valid_levels = ["trace", "debug", "info", "warn", "error"];
         if !valid_levels.contains(&self.log_level.as_str()) {
@@ -389,6 +550,16 @@ mod tests {
         assert_eq!(cfg.segment_max_bytes, 1_048_576);
         assert_eq!(cfg.snapshot_interval_events, 100);
         assert_eq!(cfg.snapshot_retain_count, 3);
+        assert_eq!(cfg.browser_runtime, "chromium");
+        assert_eq!(cfg.browser_driver, "playwright");
+        assert_eq!(cfg.browser_executable_or_channel, "chromium");
+        assert_eq!(cfg.browser_max_contexts, 8);
+        assert_eq!(cfg.browser_nav_timeout_ms, 30_000);
+        assert_eq!(cfg.browser_action_timeout_ms, 10_000);
+        assert_eq!(cfg.browser_screenshot_max_bytes, 5_242_880);
+        assert_eq!(cfg.browser_download_max_bytes, 52_428_800);
+        assert_eq!(cfg.browser_subscription_limit, 32);
+        assert_eq!(cfg.browser_raw_rate_limit_per_sec, 10);
         assert_eq!(cfg.log_level, "debug");
     }
 
@@ -424,6 +595,17 @@ mod tests {
             "MAXC_SEGMENT_MAX_BYTES" => Some("8192".to_string()),
             "MAXC_SNAPSHOT_INTERVAL_EVENTS" => Some("10".to_string()),
             "MAXC_SNAPSHOT_RETAIN_COUNT" => Some("2".to_string()),
+            "MAXC_BROWSER_RUNTIME" => Some("chromium".to_string()),
+            "MAXC_BROWSER_DRIVER" => Some("playwright".to_string()),
+            "MAXC_BROWSER_EXECUTABLE_OR_CHANNEL" => Some("chrome-beta".to_string()),
+            "MAXC_BROWSER_LAUNCH_ARGS" => Some("--headless=new;--disable-gpu".to_string()),
+            "MAXC_BROWSER_MAX_CONTEXTS" => Some("12".to_string()),
+            "MAXC_BROWSER_NAV_TIMEOUT_MS" => Some("45000".to_string()),
+            "MAXC_BROWSER_ACTION_TIMEOUT_MS" => Some("12000".to_string()),
+            "MAXC_BROWSER_SCREENSHOT_MAX_BYTES" => Some("1024".to_string()),
+            "MAXC_BROWSER_DOWNLOAD_MAX_BYTES" => Some("2048".to_string()),
+            "MAXC_BROWSER_SUBSCRIPTION_LIMIT" => Some("9".to_string()),
+            "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC" => Some("3".to_string()),
             "MAXC_LOG_LEVEL" => Some("warn".to_string()),
             _ => None,
         })
@@ -441,6 +623,20 @@ mod tests {
         assert_eq!(cfg.segment_max_bytes, 8192);
         assert_eq!(cfg.snapshot_interval_events, 10);
         assert_eq!(cfg.snapshot_retain_count, 2);
+        assert_eq!(cfg.browser_runtime, "chromium");
+        assert_eq!(cfg.browser_driver, "playwright");
+        assert_eq!(cfg.browser_executable_or_channel, "chrome-beta");
+        assert_eq!(
+            cfg.browser_launch_args,
+            vec!["--headless=new".to_string(), "--disable-gpu".to_string()]
+        );
+        assert_eq!(cfg.browser_max_contexts, 12);
+        assert_eq!(cfg.browser_nav_timeout_ms, 45_000);
+        assert_eq!(cfg.browser_action_timeout_ms, 12_000);
+        assert_eq!(cfg.browser_screenshot_max_bytes, 1024);
+        assert_eq!(cfg.browser_download_max_bytes, 2048);
+        assert_eq!(cfg.browser_subscription_limit, 9);
+        assert_eq!(cfg.browser_raw_rate_limit_per_sec, 3);
         assert_eq!(cfg.log_level, "warn");
     }
 
@@ -546,6 +742,45 @@ mod tests {
             bad_snapshot_retain,
             ConfigError::InvalidValue {
                 key: "MAXC_SNAPSHOT_RETAIN_COUNT",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_browser_contexts = BackendConfig::from_env_map(|key| match key {
+            "MAXC_BROWSER_MAX_CONTEXTS" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_browser_contexts,
+            ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_MAX_CONTEXTS",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_browser_nav_timeout = BackendConfig::from_env_map(|key| match key {
+            "MAXC_BROWSER_NAV_TIMEOUT_MS" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_browser_nav_timeout,
+            ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_NAV_TIMEOUT_MS",
+                value: "bad".to_string(),
+            }
+        );
+
+        let bad_browser_raw_rate = BackendConfig::from_env_map(|key| match key {
+            "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC" => Some("bad".to_string()),
+            _ => None,
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            bad_browser_raw_rate,
+            ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC",
                 value: "bad".to_string(),
             }
         );
@@ -657,6 +892,42 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::InvalidValue {
                 key: "MAXC_SNAPSHOT_RETAIN_COUNT",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            browser_runtime: "".to_string(),
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_RUNTIME",
+                value: "".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            browser_driver: "".to_string(),
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_DRIVER",
+                value: "".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            browser_subscription_limit: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_SUBSCRIPTION_LIMIT",
                 value: "0".to_string(),
             })
         );

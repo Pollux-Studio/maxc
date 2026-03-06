@@ -28,6 +28,16 @@ pub enum EventType {
     SessionCreated,
     SessionRefreshed,
     SessionRevoked,
+    BrowserSessionCreated,
+    BrowserSessionAttached,
+    BrowserSessionDetached,
+    BrowserSessionClosed,
+    BrowserTabOpened,
+    BrowserTabFocused,
+    BrowserTabClosed,
+    BrowserNavigationRequested,
+    BrowserNavigationCompleted,
+    BrowserNavigationFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +48,8 @@ pub struct EventRecord {
     pub command_id: String,
     pub timestamp_ms: u64,
     pub schema_version: u16,
+    #[serde(default = "default_payload_version")]
+    pub payload_version: u16,
     pub payload: Value,
 }
 
@@ -56,9 +68,14 @@ impl EventRecord {
             command_id: command_id.into(),
             timestamp_ms: now_unix_ms(),
             schema_version: EVENT_SCHEMA_VERSION,
+            payload_version: 1,
             payload,
         }
     }
+}
+
+fn default_payload_version() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,9 +94,31 @@ pub struct SessionProjection {
     pub revoked: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSessionProjection {
+    pub browser_session_id: String,
+    pub workspace_id: String,
+    pub surface_id: String,
+    pub attached: bool,
+    pub closed: bool,
+    pub active_tab_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabProjection {
+    pub browser_tab_id: String,
+    pub browser_session_id: String,
+    pub url: String,
+    pub focused: bool,
+    pub closed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectionState {
     pub sessions: HashMap<String, SessionProjection>,
+    pub browser_sessions: HashMap<String, BrowserSessionProjection>,
+    pub browser_tabs: HashMap<String, BrowserTabProjection>,
+    pub browser_automation_state: HashMap<String, Value>,
     pub command_results: HashMap<String, Value>,
     pub last_cursor: ReplayCursor,
 }
@@ -119,6 +158,116 @@ impl ProjectionState {
                     StoreError::InvalidPayload("revoke for unknown session".to_string())
                 })?;
                 session.revoked = true;
+            }
+            EventType::BrowserSessionCreated => {
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let surface_id = payload_str(&record.payload, "surface_id")?;
+                self.browser_sessions.insert(
+                    browser_session_id.to_string(),
+                    BrowserSessionProjection {
+                        browser_session_id: browser_session_id.to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        surface_id: surface_id.to_string(),
+                        attached: true,
+                        closed: false,
+                        active_tab_id: None,
+                    },
+                );
+            }
+            EventType::BrowserSessionAttached => {
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                let session = self
+                    .browser_sessions
+                    .get_mut(browser_session_id)
+                    .ok_or_else(|| {
+                        StoreError::InvalidPayload("attach for unknown browser session".to_string())
+                    })?;
+                session.attached = true;
+            }
+            EventType::BrowserSessionDetached => {
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                let session = self
+                    .browser_sessions
+                    .get_mut(browser_session_id)
+                    .ok_or_else(|| {
+                        StoreError::InvalidPayload("detach for unknown browser session".to_string())
+                    })?;
+                session.attached = false;
+            }
+            EventType::BrowserSessionClosed => {
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                let session = self
+                    .browser_sessions
+                    .get_mut(browser_session_id)
+                    .ok_or_else(|| {
+                        StoreError::InvalidPayload("close for unknown browser session".to_string())
+                    })?;
+                session.closed = true;
+                session.attached = false;
+            }
+            EventType::BrowserTabOpened => {
+                let browser_tab_id = payload_str(&record.payload, "browser_tab_id")?;
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                let url = payload_str(&record.payload, "url")?;
+                let tab = BrowserTabProjection {
+                    browser_tab_id: browser_tab_id.to_string(),
+                    browser_session_id: browser_session_id.to_string(),
+                    url: url.to_string(),
+                    focused: true,
+                    closed: false,
+                };
+                self.browser_tabs.insert(browser_tab_id.to_string(), tab);
+                if let Some(session) = self.browser_sessions.get_mut(browser_session_id) {
+                    session.active_tab_id = Some(browser_tab_id.to_string());
+                }
+            }
+            EventType::BrowserTabFocused => {
+                let browser_tab_id = payload_str(&record.payload, "browser_tab_id")?;
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                for tab in self
+                    .browser_tabs
+                    .values_mut()
+                    .filter(|t| t.browser_session_id == browser_session_id)
+                {
+                    tab.focused = tab.browser_tab_id == browser_tab_id;
+                }
+                if let Some(session) = self.browser_sessions.get_mut(browser_session_id) {
+                    session.active_tab_id = Some(browser_tab_id.to_string());
+                }
+            }
+            EventType::BrowserTabClosed => {
+                let browser_tab_id = payload_str(&record.payload, "browser_tab_id")?;
+                if let Some(tab) = self.browser_tabs.get_mut(browser_tab_id) {
+                    tab.closed = true;
+                    tab.focused = false;
+                }
+            }
+            EventType::BrowserNavigationRequested
+            | EventType::BrowserNavigationCompleted
+            | EventType::BrowserNavigationFailed => {
+                if let Some(key) = record
+                    .payload
+                    .get("automation_key")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                {
+                    self.browser_automation_state
+                        .insert(key, record.payload.clone());
+                }
+                if let Some(browser_tab_id) = record
+                    .payload
+                    .get("browser_tab_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                {
+                    let maybe_url = record.payload.get("url").and_then(Value::as_str);
+                    if let Some(url) = maybe_url {
+                        if let Some(tab) = self.browser_tabs.get_mut(&browser_tab_id) {
+                            tab.url = url.to_string();
+                        }
+                    }
+                }
             }
         }
 
@@ -649,6 +798,91 @@ mod tests {
 
         let snapshots = list_snapshots(&dir).expect("list");
         assert!(snapshots.len() <= 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn browser_events_are_projected_and_recovered() {
+        let dir = temp_dir("store-browser");
+        let cfg = EventStoreConfig {
+            event_dir: dir.clone(),
+            segment_max_bytes: 4096,
+            snapshot_interval_events: 2,
+            snapshot_retain_count: 2,
+        };
+        let mut store = EventStore::new(cfg).expect("store");
+        let mut projection = ProjectionState::default();
+
+        let session_created = EventRecord::new(
+            "evt-browser-1",
+            EventType::BrowserSessionCreated,
+            "bs-1",
+            "cmd-browser-1",
+            json!({
+                "browser_session_id": "bs-1",
+                "workspace_id": "ws-1",
+                "surface_id": "sf-1",
+                "result": {"browser_session_id":"bs-1"}
+            }),
+        );
+        let cursor = store.append(&session_created).expect("append");
+        projection.apply(&session_created, cursor).expect("apply");
+        store
+            .maybe_snapshot_and_compact(&projection)
+            .expect("snapshot");
+
+        let tab_opened = EventRecord::new(
+            "evt-browser-2",
+            EventType::BrowserTabOpened,
+            "bs-1",
+            "cmd-browser-2",
+            json!({
+                "browser_tab_id": "tab-1",
+                "browser_session_id": "bs-1",
+                "url": "https://example.com",
+                "result": {"browser_tab_id":"tab-1"}
+            }),
+        );
+        let cursor = store.append(&tab_opened).expect("append");
+        projection.apply(&tab_opened, cursor).expect("apply");
+        store
+            .maybe_snapshot_and_compact(&projection)
+            .expect("snapshot");
+
+        let nav_completed = EventRecord::new(
+            "evt-browser-3",
+            EventType::BrowserNavigationCompleted,
+            "tab-1",
+            "cmd-browser-3",
+            json!({
+                "browser_tab_id": "tab-1",
+                "url": "https://example.com/page",
+                "automation_key": "tab-1:last-nav",
+                "result": {"ok":true}
+            }),
+        );
+        let cursor = store.append(&nav_completed).expect("append");
+        projection.apply(&nav_completed, cursor).expect("apply");
+        store
+            .maybe_snapshot_and_compact(&projection)
+            .expect("snapshot");
+
+        let mut recovery_store = EventStore::new(EventStoreConfig {
+            event_dir: dir.clone(),
+            segment_max_bytes: 4096,
+            snapshot_interval_events: 2,
+            snapshot_retain_count: 2,
+        })
+        .expect("store");
+        let recovered = recovery_store.recover().expect("recover");
+        let session = recovered.browser_sessions.get("bs-1").expect("session");
+        assert_eq!(session.workspace_id, "ws-1");
+        let tab = recovered.browser_tabs.get("tab-1").expect("tab");
+        assert_eq!(tab.url, "https://example.com/page");
+        assert!(recovered.command_results.contains_key("cmd-browser-3"));
+        assert!(recovered
+            .browser_automation_state
+            .contains_key("tab-1:last-nav"));
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -1,4 +1,5 @@
 use crate::{RpcErrorCode, RpcId, RpcRequest, RpcSuccess};
+use maxc_browser::{BrowserSessionId, BrowserTabId};
 use maxc_core::{BackendConfig, CommandId};
 use maxc_security::SessionToken;
 use maxc_storage::{
@@ -22,6 +23,14 @@ pub struct SessionRecord {
     pub expires_at_ms: u64,
     pub last_seen_ms: u64,
     pub revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserAuditContext {
+    workspace_id: String,
+    surface_id: String,
+    browser_session_id: Option<String>,
+    tab_id: Option<String>,
 }
 
 impl SessionRecord {
@@ -52,6 +61,8 @@ struct ServerState {
     store: Mutex<EventStore>,
     global_limiter: Mutex<RateLimiter>,
     connection_limiters: Mutex<HashMap<String, RateLimiter>>,
+    raw_limiters: Mutex<HashMap<String, RateLimiter>>,
+    browser_subscriptions: StdMutex<HashMap<String, usize>>,
     inflight_by_connection: StdMutex<HashMap<String, usize>>,
     correlation: AtomicU64,
 }
@@ -175,6 +186,8 @@ impl RpcServer {
                 store: Mutex::new(store),
                 global_limiter: Mutex::new(global_limiter),
                 connection_limiters: Mutex::new(HashMap::new()),
+                raw_limiters: Mutex::new(HashMap::new()),
+                browser_subscriptions: StdMutex::new(HashMap::new()),
                 inflight_by_connection: StdMutex::new(HashMap::new()),
                 correlation: AtomicU64::new(1),
             }),
@@ -281,6 +294,9 @@ impl RpcServer {
             "session.refresh" => self.session_refresh(request.params).await,
             "session.revoke" => self.session_revoke(request.params).await,
             "system.health" => Ok(json!({ "ok": true })),
+            method if method.starts_with("browser.") => {
+                self.browser_dispatch(method, request.params).await
+            }
             _ => Err(ServerError::NotFound),
         }
     }
@@ -375,6 +391,512 @@ impl RpcServer {
             random_event_id(),
             EventType::SessionRevoked,
             token,
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
+        let now = now_unix_ms();
+        let session = self
+            .find_session(&token)
+            .await
+            .ok_or(ServerError::Unauthorized)?;
+        if !session.is_active(now) {
+            return Err(ServerError::Unauthorized);
+        }
+
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        let audit = extract_browser_audit(params_ref, method)?;
+        self.enforce_browser_limits(method, params_ref, &audit).await?;
+
+        match method {
+            "browser.create" => self.browser_create(command_id, audit).await,
+            "browser.attach" => self.browser_attach(command_id, audit).await,
+            "browser.detach" => self.browser_detach(command_id, audit).await,
+            "browser.close" => self.browser_close(command_id, audit).await,
+            "browser.tab.open" => self.browser_tab_open(command_id, audit, params_ref).await,
+            "browser.tab.list" => self.browser_tab_list(audit).await,
+            "browser.tab.focus" => self.browser_tab_focus(command_id, audit).await,
+            "browser.tab.close" => self.browser_tab_close(command_id, audit).await,
+            "browser.goto" | "browser.reload" | "browser.back" | "browser.forward" => {
+                self.browser_navigation(command_id, audit, method, params_ref)
+                    .await
+            }
+            "browser.click"
+            | "browser.type"
+            | "browser.wait"
+            | "browser.screenshot"
+            | "browser.evaluate"
+            | "browser.cookie.get"
+            | "browser.cookie.set"
+            | "browser.upload"
+            | "browser.download"
+            | "browser.trace.start"
+            | "browser.trace.stop" => self.browser_automation(command_id, audit, method).await,
+            "browser.subscribe" => self.browser_subscribe(command_id, audit, method).await,
+            "browser.raw.command" => self.browser_raw(command_id, audit, params_ref).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn enforce_browser_limits(
+        &self,
+        method: &str,
+        params: &Value,
+        audit: &BrowserAuditContext,
+    ) -> Result<(), ServerError> {
+        if method == "browser.raw.command" {
+            let allow_raw = params
+                .get("allow_raw")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !allow_raw {
+                return Err(ServerError::Unauthorized);
+            }
+            let mut map = self.state.raw_limiters.lock().await;
+            let limiter = map.entry(audit.workspace_id.clone()).or_insert_with(|| {
+                RateLimiter::new(
+                    self.config.browser_raw_rate_limit_per_sec,
+                    self.config.browser_raw_rate_limit_per_sec,
+                )
+            });
+            if !limiter.allow() {
+                return Err(ServerError::RateLimited);
+            }
+        }
+
+        if method == "browser.screenshot" {
+            let requested = params
+                .get("expected_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if requested > self.config.browser_screenshot_max_bytes as u64 {
+                return Err(ServerError::InvalidRequest);
+            }
+        }
+        if method == "browser.download" {
+            let requested = params
+                .get("size_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if requested > self.config.browser_download_max_bytes as u64 {
+                return Err(ServerError::InvalidRequest);
+            }
+        }
+        Ok(())
+    }
+
+    async fn browser_create(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = format!(
+            "bs-{}",
+            random_token()?.chars().take(12).collect::<String>()
+        );
+        let result = json!({
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "browser_session_id": browser_session_id
+        });
+        let payload = json!({
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "browser_session_id": browser_session_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserSessionCreated,
+            payload["browser_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_attach(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let result = json!({"browser_session_id": browser_session_id, "attached": true});
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserSessionAttached,
+            payload["browser_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_detach(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let result = json!({"browser_session_id": browser_session_id, "attached": false});
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserSessionDetached,
+            payload["browser_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_close(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let result = json!({"browser_session_id": browser_session_id, "closed": true});
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserSessionClosed,
+            payload["browser_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_tab_open(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let browser_tab_id = format!(
+            "tab-{}",
+            random_token()?.chars().take(10).collect::<String>()
+        );
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("about:blank")
+            .to_string();
+        let result = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "url": url
+        });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "url": url,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserTabOpened,
+            payload["browser_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_tab_list(&self, audit: BrowserAuditContext) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let projection = self.state.projection.lock().await;
+        let tabs: Vec<Value> = projection
+            .browser_tabs
+            .values()
+            .filter(|tab| tab.browser_session_id == browser_session_id)
+            .map(|tab| {
+                json!({
+                    "browser_tab_id": tab.browser_tab_id,
+                    "url": tab.url,
+                    "focused": tab.focused,
+                    "closed": tab.closed
+                })
+            })
+            .collect();
+        Ok(json!({ "tabs": tabs }))
+    }
+
+    async fn browser_tab_focus(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        let result = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "focused": true
+        });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserTabFocused,
+            payload["browser_tab_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_tab_close(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        let result = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "closed": true
+        });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserTabClosed,
+            payload["browser_tab_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_navigation(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("about:blank")
+            .to_string();
+        let result = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "method": method,
+            "url": url
+        });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "method": method,
+            "url": url,
+            "automation_key": format!("{browser_tab_id}:last-nav"),
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationCompleted,
+            payload["browser_tab_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_automation(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+        method: &str,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        let result = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "method": method,
+            "ok": true
+        });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "method": method,
+            "automation_key": format!("{browser_tab_id}:last-op"),
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            payload["browser_tab_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_subscribe(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+        _method: &str,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit.browser_session_id.clone().unwrap_or_default();
+        let key = format!(
+            "{}:{}",
+            audit.workspace_id,
+            browser_session_id
+        );
+        {
+            let mut counts = self
+                .state
+                .browser_subscriptions
+                .lock()
+                .expect("subscription lock");
+            let count = counts.entry(key).or_insert(0);
+            if *count >= self.config.browser_subscription_limit {
+                return Err(ServerError::RateLimited);
+            }
+            *count += 1;
+        }
+        let result = json!({ "subscribed": true });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            payload["browser_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn browser_raw(
+        &self,
+        command_id: String,
+        audit: BrowserAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
+        let command = params
+            .get("raw_command")
+            .and_then(Value::as_str)
+            .unwrap_or("noop")
+            .to_string();
+        let result = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "raw_command": command,
+            "ok": true
+        });
+        let payload = json!({
+            "browser_session_id": browser_session_id,
+            "browser_tab_id": browser_tab_id,
+            "automation_key": format!("{browser_tab_id}:raw"),
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::BrowserNavigationRequested,
+            payload["browser_tab_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             command_id,
             payload,
         );
@@ -527,6 +1049,75 @@ fn extract_command_id(params: Option<&Value>) -> Result<String, ServerError> {
     let command_id =
         CommandId::new(command_id.to_string()).map_err(|_| ServerError::InvalidRequest)?;
     Ok(command_id.as_str().to_string())
+}
+
+fn extract_browser_audit(params: &Value, method: &str) -> Result<BrowserAuditContext, ServerError> {
+    let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
+    let workspace_id = object
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?
+        .to_string();
+    let surface_id = object
+        .get("surface_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?
+        .to_string();
+
+    let session_required = method != "browser.create";
+    let browser_session_id = object
+        .get("browser_session_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    if session_required && browser_session_id.is_none() {
+        return Err(ServerError::InvalidRequest);
+    }
+    if let Some(ref session) = browser_session_id {
+        if BrowserSessionId::new(session.clone()).is_none() {
+            return Err(ServerError::InvalidRequest);
+        }
+    }
+
+    let tab_required = matches!(
+        method,
+        "browser.tab.focus"
+            | "browser.tab.close"
+            | "browser.goto"
+            | "browser.reload"
+            | "browser.back"
+            | "browser.forward"
+            | "browser.click"
+            | "browser.type"
+            | "browser.wait"
+            | "browser.screenshot"
+            | "browser.evaluate"
+            | "browser.cookie.get"
+            | "browser.cookie.set"
+            | "browser.upload"
+            | "browser.download"
+            | "browser.trace.start"
+            | "browser.trace.stop"
+            | "browser.raw.command"
+    );
+    let tab_id = object
+        .get("tab_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    if tab_required && tab_id.is_none() {
+        return Err(ServerError::InvalidRequest);
+    }
+    if let Some(ref tab) = tab_id {
+        if BrowserTabId::new(tab.clone()).is_none() {
+            return Err(ServerError::InvalidRequest);
+        }
+    }
+
+    Ok(BrowserAuditContext {
+        workspace_id,
+        surface_id,
+        browser_session_id,
+        tab_id,
+    })
 }
 
 fn now_unix_ms() -> u64 {
@@ -709,5 +1300,404 @@ mod tests {
         let second = server.handle_json_line("c", &req).await;
         let parsed: Value = serde_json::from_str(&second).expect("json");
         assert_eq!(parsed["error"]["code"], "RATE_LIMITED");
+    }
+
+    #[tokio::test]
+    async fn browser_create_requires_auth_token_and_audit_fields() {
+        let cfg = test_config("browser-auth");
+        let server = RpcServer::new(cfg).expect("server");
+        let no_auth = json!({
+            "id": 1,
+            "method": "browser.create",
+            "params": {
+                "command_id": "cmd-b1",
+                "workspace_id": "ws-1",
+                "surface_id": "sf-1"
+            }
+        })
+        .to_string();
+        let first: Value =
+            serde_json::from_str(&server.handle_json_line("c", &no_auth).await).expect("json");
+        assert_eq!(first["error"]["code"], "UNAUTHORIZED");
+
+        let session = json!({
+            "id": 2,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-1"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let with_auth = json!({
+            "id": 3,
+            "method": "browser.create",
+            "params": {
+                "command_id": "cmd-b2",
+                "workspace_id": "ws-1",
+                "surface_id": "sf-1",
+                "auth": {"token": token}
+            }
+        })
+        .to_string();
+        let second: Value =
+            serde_json::from_str(&server.handle_json_line("c", &with_auth).await).expect("json");
+        assert!(second.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn browser_raw_requires_allow_raw_and_limits() {
+        let cfg = BackendConfig {
+            browser_raw_rate_limit_per_sec: 1,
+            ..test_config("browser-raw")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        let session = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-raw"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let create = json!({
+            "id": 2,
+            "method": "browser.create",
+            "params": {
+                "command_id":"cmd-bcreate",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let create_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &create).await).expect("json");
+        let browser_session_id = create_out["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session");
+
+        let tab_open = json!({
+            "id":3,
+            "method":"browser.tab.open",
+            "params":{
+                "command_id":"cmd-tab-open",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": browser_session_id,
+                "auth":{"token": token},
+                "url":"https://example.com"
+            }
+        })
+        .to_string();
+        let tab_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &tab_open).await).expect("json");
+        let tab_id = tab_out["result"]["browser_tab_id"].as_str().expect("tab");
+
+        let raw_denied = json!({
+            "id":4,
+            "method":"browser.raw.command",
+            "params":{
+                "command_id":"cmd-raw-1",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": browser_session_id,
+                "tab_id": tab_id,
+                "auth":{"token": token},
+                "raw_command":"Network.enable"
+            }
+        })
+        .to_string();
+        let denied: Value =
+            serde_json::from_str(&server.handle_json_line("c", &raw_denied).await).expect("json");
+        assert_eq!(denied["error"]["code"], "UNAUTHORIZED");
+
+        let raw_allowed = json!({
+            "id":5,
+            "method":"browser.raw.command",
+            "params":{
+                "command_id":"cmd-raw-2",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": browser_session_id,
+                "tab_id": tab_id,
+                "auth":{"token": token},
+                "allow_raw": true,
+                "raw_command":"Network.enable"
+            }
+        })
+        .to_string();
+        let allowed: Value =
+            serde_json::from_str(&server.handle_json_line("c", &raw_allowed).await).expect("json");
+        assert!(allowed.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn browser_command_idempotency_returns_same_result() {
+        let cfg = test_config("browser-idem");
+        let server = RpcServer::new(cfg).expect("server");
+        let session = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-idem"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let req = json!({
+            "id": 2,
+            "method": "browser.create",
+            "params": {
+                "command_id":"cmd-browser-idem-1",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let first: Value =
+            serde_json::from_str(&server.handle_json_line("c", &req).await).expect("json");
+        let second: Value =
+            serde_json::from_str(&server.handle_json_line("c", &req).await).expect("json");
+        assert_eq!(first["result"], second["result"]);
+    }
+
+    #[tokio::test]
+    async fn browser_full_route_matrix_is_dispatched() {
+        let cfg = test_config("browser-matrix");
+        let server = RpcServer::new(cfg).expect("server");
+
+        let session = json!({
+            "id": 1,
+            "method": "session.create",
+            "params": {"command_id":"cmd-auth-matrix"}
+        })
+        .to_string();
+        let session_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &session).await).expect("json");
+        let token = session_out["result"]["token"].as_str().expect("token");
+
+        let create = json!({
+            "id": 2,
+            "method": "browser.create",
+            "params": {
+                "command_id":"cmd-bm-1",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let create_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &create).await).expect("json");
+        let bs = create_out["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session");
+
+        for (idx, method) in ["browser.attach", "browser.detach", "browser.attach"]
+            .iter()
+            .enumerate()
+        {
+            let req = json!({
+                "id": 10 + idx as i64,
+                "method": method,
+                "params": {
+                    "command_id": format!("cmd-bm-attach-{idx}"),
+                    "workspace_id":"ws-1",
+                    "surface_id":"sf-1",
+                    "browser_session_id": bs,
+                    "auth":{"token": token}
+                }
+            })
+            .to_string();
+            let out: Value =
+                serde_json::from_str(&server.handle_json_line("c", &req).await).expect("json");
+            assert!(out.get("result").is_some());
+        }
+
+        let tab_open = json!({
+            "id": 30,
+            "method": "browser.tab.open",
+            "params": {
+                "command_id":"cmd-bm-tab-open",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "auth":{"token": token},
+                "url":"https://example.com"
+            }
+        })
+        .to_string();
+        let tab_open_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &tab_open).await).expect("json");
+        let tab = tab_open_out["result"]["browser_tab_id"]
+            .as_str()
+            .expect("tab");
+
+        let list = json!({
+            "id": 31,
+            "method":"browser.tab.list",
+            "params":{
+                "command_id":"cmd-bm-tab-list",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let list_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &list).await).expect("json");
+        assert!(list_out["result"]["tabs"].is_array());
+
+        for (idx, method) in [
+            "browser.tab.focus",
+            "browser.goto",
+            "browser.reload",
+            "browser.back",
+            "browser.forward",
+            "browser.click",
+            "browser.type",
+            "browser.wait",
+            "browser.evaluate",
+            "browser.cookie.get",
+            "browser.cookie.set",
+            "browser.upload",
+            "browser.trace.start",
+            "browser.trace.stop",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut params = json!({
+                "command_id": format!("cmd-bm-op-{idx}"),
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "tab_id": tab,
+                "auth":{"token": token}
+            });
+            if *method == "browser.goto" {
+                params["url"] = json!("https://example.com/next");
+            }
+            let req = json!({
+                "id": 40 + idx as i64,
+                "method": method,
+                "params": params
+            })
+            .to_string();
+            let out: Value =
+                serde_json::from_str(&server.handle_json_line("c", &req).await).expect("json");
+            assert!(out.get("result").is_some());
+        }
+
+        let screenshot = json!({
+            "id": 70,
+            "method":"browser.screenshot",
+            "params":{
+                "command_id":"cmd-bm-shot",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "tab_id": tab,
+                "auth":{"token": token},
+                "expected_bytes": 512
+            }
+        })
+        .to_string();
+        let screenshot_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &screenshot).await).expect("json");
+        assert!(screenshot_out.get("result").is_some());
+
+        let download = json!({
+            "id": 71,
+            "method":"browser.download",
+            "params":{
+                "command_id":"cmd-bm-download",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "tab_id": tab,
+                "auth":{"token": token},
+                "size_bytes": 1024
+            }
+        })
+        .to_string();
+        let download_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &download).await).expect("json");
+        assert!(download_out.get("result").is_some());
+
+        let subscribe = json!({
+            "id": 72,
+            "method":"browser.subscribe",
+            "params":{
+                "command_id":"cmd-bm-sub",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let subscribe_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &subscribe).await).expect("json");
+        assert!(subscribe_out.get("result").is_some());
+
+        let raw = json!({
+            "id": 73,
+            "method":"browser.raw.command",
+            "params":{
+                "command_id":"cmd-bm-raw",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "tab_id": tab,
+                "auth":{"token": token},
+                "allow_raw": true,
+                "raw_command":"Runtime.evaluate"
+            }
+        })
+        .to_string();
+        let raw_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &raw).await).expect("json");
+        assert!(raw_out.get("result").is_some());
+
+        let tab_close = json!({
+            "id": 74,
+            "method":"browser.tab.close",
+            "params":{
+                "command_id":"cmd-bm-tab-close",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "tab_id": tab,
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let tab_close_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &tab_close).await).expect("json");
+        assert!(tab_close_out.get("result").is_some());
+
+        let close = json!({
+            "id": 75,
+            "method":"browser.close",
+            "params":{
+                "command_id":"cmd-bm-close",
+                "workspace_id":"ws-1",
+                "surface_id":"sf-1",
+                "browser_session_id": bs,
+                "auth":{"token": token}
+            }
+        })
+        .to_string();
+        let close_out: Value =
+            serde_json::from_str(&server.handle_json_line("c", &close).await).expect("json");
+        assert!(close_out.get("result").is_some());
     }
 }

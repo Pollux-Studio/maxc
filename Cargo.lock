@@ -41,6 +41,7 @@ checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 name = "maxc-automation"
 version = "0.1.0"
 dependencies = [
+ "maxc-browser",
  "maxc-core",
  "maxc-security",
  "maxc-storage",
@@ -49,6 +50,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "maxc-browser"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
