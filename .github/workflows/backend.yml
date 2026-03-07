@@ -59,5 +59,21 @@ jobs:
       - name: backend synthetic perf guardrails
         run: cargo run -p maxc-automation --bin perf-harness -- --mode synthetic --profile ci --json
 
+      - name: probe backend real browser runtime
+        id: browser_probe
+        shell: pwsh
+        run: |
+          $probe = cargo run -p maxc-automation --bin perf-harness -- --probe-real-browser-runtime --json | Out-String
+          $probe | Set-Content -Path browser-probe.json
+          $available = (Get-Content browser-probe.json | ConvertFrom-Json).available
+          "available=$available" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: backend real runtime perf guardrails
+        if: steps.browser_probe.outputs.available == 'True'
         run: cargo run -p maxc-automation --bin perf-harness -- --mode real-runtime --profile ci --json
+
+      - name: skip backend real runtime perf guardrails
+        if: steps.browser_probe.outputs.available != 'True'
+        shell: pwsh
+        run: |
+          Write-Host "Skipping real-runtime browser perf guardrails because no launchable real browser runtime is available on this runner."

@@ -5823,6 +5823,15 @@ struct BrowserLaunchTarget {
     executable: String,
 }
 
+fn is_webview2_executable_path(value: &str) -> bool {
+    let normalized = value.replace('/', "\\");
+    normalized
+        .rsplit('\\')
+        .next()
+        .map(|name| name.eq_ignore_ascii_case("msedgewebview2.exe"))
+        .unwrap_or(false)
+}
+
 fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerError> {
     let configured = config.browser_executable_or_channel.trim();
     if configured.eq_ignore_ascii_case("__synthetic__") {
@@ -5830,6 +5839,12 @@ fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerEr
     }
     if configured.eq_ignore_ascii_case("webview2") {
         return resolve_webview2_executable();
+    }
+    if !configured.is_empty()
+        && Path::new(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return Err(ServerError::Internal);
     }
     if !configured.is_empty() && Path::new(configured).exists() {
         return Ok(configured.to_string());
@@ -5910,6 +5925,16 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
             })
             .unwrap_or_default();
     }
+    let configured = config.browser_executable_or_channel.trim();
+    if !configured.is_empty()
+        && Path::new(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return vec![BrowserLaunchTarget {
+            runtime: "webview2".to_string(),
+            executable: configured.to_string(),
+        }];
+    }
     let mut targets = Vec::new();
     if let Ok(executable) = resolve_browser_executable(config) {
         targets.push(BrowserLaunchTarget {
@@ -5932,7 +5957,10 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
 }
 
 fn preferred_browser_runtime_name(config: &BackendConfig) -> &'static str {
-    if resolve_browser_executable(config).is_ok() {
+    let configured = config.browser_executable_or_channel.trim();
+    if configured.eq_ignore_ascii_case("webview2") || is_webview2_executable_path(configured) {
+        "webview2"
+    } else if resolve_browser_executable(config).is_ok() {
         "chromium-cdp"
     } else if resolve_webview2_executable().is_ok() {
         "webview2"
@@ -8236,6 +8264,24 @@ mod tests {
             assert!(targets.iter().any(|target| target.runtime == "webview2"));
         }
         let _ = fs::remove_file(temp_executable);
+    }
+
+    #[test]
+    fn explicit_webview2_path_maps_to_webview2_runtime() {
+        let temp_dir = std::env::temp_dir().join(format!("maxc-webview2-{}", now_unix_ms()));
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let temp_executable = temp_dir.join("msedgewebview2.exe");
+        fs::write(&temp_executable, b"stub").expect("stub executable");
+        let config = BackendConfig {
+            browser_executable_or_channel: temp_executable.to_string_lossy().to_string(),
+            ..BackendConfig::default()
+        };
+        let targets = browser_launch_targets(&config);
+        assert_eq!(
+            targets.first().map(|target| target.runtime.as_str()),
+            Some("webview2")
+        );
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]
