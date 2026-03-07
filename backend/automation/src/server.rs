@@ -8261,7 +8261,8 @@ mod tests {
 
     #[test]
     fn explicit_webview2_path_maps_to_webview2_runtime() {
-        let temp_executable = std::env::temp_dir().join("msedgewebview2.exe");
+        let temp_executable =
+            std::env::temp_dir().join(format!("msedgewebview2-{}.exe", now_unix_ms()));
         fs::write(&temp_executable, b"stub").expect("stub executable");
         let config = BackendConfig {
             browser_executable_or_channel: temp_executable.to_string_lossy().to_string(),
