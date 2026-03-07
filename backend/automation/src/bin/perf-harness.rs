@@ -40,6 +40,14 @@ struct BrowserLaunchTarget {
     config_value: String,
 }
 
+fn is_webview2_executable_path(value: &str) -> bool {
+    PathBuf::from(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("msedgewebview2.exe"))
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = run_cli(std::env::args().skip(1).collect()).await?;
@@ -883,6 +891,16 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
             })
             .unwrap_or_default();
     }
+    let configured = config.browser_executable_or_channel.trim();
+    if !configured.is_empty()
+        && PathBuf::from(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return vec![BrowserLaunchTarget {
+            executable: configured.to_string(),
+            config_value: "webview2".to_string(),
+        }];
+    }
 
     let mut targets = Vec::new();
     if let Some(executable) = resolve_browser_executable(config) {
@@ -1256,5 +1274,21 @@ mod tests {
             ..BackendConfig::default()
         };
         assert!(browser_launch_targets(&synthetic).is_empty());
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("maxc-webview2-test-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let explicit_webview2 = temp_dir.join("msedgewebview2.exe");
+        fs::write(&explicit_webview2, b"stub").expect("stub executable");
+        let cfg = BackendConfig {
+            browser_executable_or_channel: explicit_webview2.to_string_lossy().to_string(),
+            ..BackendConfig::default()
+        };
+        let targets = browser_launch_targets(&cfg);
+        assert_eq!(
+            targets.first().map(|target| target.config_value.as_str()),
+            Some("webview2")
+        );
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
