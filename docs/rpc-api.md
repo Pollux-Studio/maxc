@@ -219,6 +219,11 @@ Returns:
 - `terminal_session_id`
 - `status`
 
+Behavior:
+- `input` is written as raw bytes exactly as provided by the caller.
+- The backend does not append `\n` or `\r\n`.
+- Send newline, control bytes, escape sequences, or partial input explicitly when needed.
+
 ### `terminal.resize`
 
 Required params:
@@ -286,6 +291,8 @@ Terminal events are ordered and include additive fields such as:
 - `status`
 - `runtime`
 
+`terminal.output` events are chunk-based. They may contain partial prompts, carriage-return updates, ANSI escape sequences, or other data that is not newline-delimited.
+
 ### `terminal.kill`
 
 Required params:
@@ -318,6 +325,11 @@ Typical create result fields:
 - `attached`
 - `closed`
 - `executable`
+
+Runtime selection order:
+- `chromium-cdp`
+- `webview2` on Windows when Chromium launch fails
+- `browser-simulated` as the final fallback
 
 ### Tabs
 
@@ -431,6 +443,8 @@ Browser events are ordered and include additive fields such as:
 - `url`
 - `title`
 - `load_state`
+
+`runtime` may be `chromium-cdp`, `webview2`, or `browser-simulated` depending on the backend fallback path.
 
 ## Agent Methods
 

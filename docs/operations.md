@@ -34,6 +34,8 @@ Use:
 - `system.metrics` for counters, gauges, and latency summaries
 - `system.logs` for recent request-level and lifecycle events
 
+`browser_runtime_ready` means the backend can start at least one real browser runtime. Browser create still reports the runtime actually selected for that session: `chromium-cdp`, `webview2`, or `browser-simulated`.
+
 ## Scopes and Auth
 
 - `system.health` requires no auth.
@@ -51,6 +53,11 @@ Use:
   - `MAXC_ARTIFACT_MAX_FILES_PER_SESSION`
 - Inspect current artifact counts and bytes through diagnostics and metrics.
 - Metrics also expose artifact cleanup run counts and evicted file or byte counts.
+
+## Terminal Stream Handling
+
+- `terminal.input` is a raw stdin write. Operators and frontend clients must send newline or control input explicitly.
+- `terminal.output` is chunk-based, not line-based. Prompts, progress updates, and ANSI-driven screen changes can arrive without a trailing newline.
 
 ## Graceful Shutdown
 

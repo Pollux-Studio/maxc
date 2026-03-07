@@ -87,7 +87,9 @@ The backend reads `BackendConfig` from environment variables. Defaults are defin
 ## Operational Notes
 
 - `system.readiness` depends on actual terminal runtime availability, browser runtime availability, artifact-root writability, and event-store writability.
+- Browser runtime selection prefers Chromium, then WebView2 on Windows, then `browser-simulated` as the last fallback. `MAXC_BROWSER_EXECUTABLE_OR_CHANNEL` only controls the Chromium attempt.
 - `MAXC_EVENT_DIR` affects both recovery and browser artifact storage, so unwritable paths degrade readiness.
 - Browser upload, download, trace, and raw-command behavior should be considered unsafe-by-default for untrusted local workflows unless the matching allowlists and toggles are set.
 - Narrower scopes through `MAXC_DEFAULT_SESSION_SCOPES` are useful for operator-only or diagnostics-only clients.
 - Use terminal and agent allowlists before exposing backend execution to semi-trusted local automation.
+- `MAXC_TERMINAL_MAX_INPUT_BYTES` limits raw input bytes per `terminal.input` call. The backend does not append newline characters for you.

@@ -75,5 +75,6 @@ cargo run -p maxc-cli -- agent detach browser --token <token> --workspace-id ws-
 - Create a session first and reuse the returned token until refresh or revoke.
 - The CLI does not add client-side retries, caching, or state repair.
 - The CLI is backend-focused. It is suitable for smoke checks and operator workflows, not for streaming terminal rendering.
+- `terminal input` sends the exact provided value. Add newline characters explicitly when needed.
 - Use shell-safe quoting for `--input`, `--prompt`, and `--url`.
 - Use `--pretty` for manual inspection and default compact output for scripting.

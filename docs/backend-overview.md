@@ -13,7 +13,8 @@ The backend is a local Rust control plane built around a JSON-RPC server. It man
 ## Runtime Behavior
 
 - Terminal sessions run real local processes. Windows prefers ConPTY when configured and available; fallback and non-Windows execution use `process-stdio`.
-- Browser sessions prefer a real Chromium-backed CDP runtime. When Chromium cannot launch, the backend falls back to a synthetic browser runtime without changing RPC method names.
+- Terminal input is a raw byte stream and terminal output is published as raw chunks, so prompts, carriage-return updates, and ANSI control output are preserved.
+- Browser sessions prefer a real Chromium-backed CDP runtime. When Chromium launch fails on Windows, the backend tries WebView2 before falling back to `browser-simulated`, without changing RPC method names.
 - Agent workers run on top of the terminal runtime. Each worker owns one primary terminal session and may hold one browser attachment at a time.
 - Runtime subscriptions and history APIs expose ordered `sequence` and `timestamp_ms` values for reconnect-safe UI redraw.
 

@@ -6,7 +6,7 @@ This document is the screen-level contract for building a frontend against the b
 
 - The backend exposes a local JSON-RPC service.
 - Terminal execution is real process execution.
-- Browser execution prefers a real Chromium-backed runtime and falls back to a synthetic runtime when the environment cannot launch a browser.
+- Browser execution tries `chromium-cdp` first, then `webview2` on Windows, and falls back to `browser-simulated` only when no real browser runtime starts.
 - Agent workers are backend-managed terminal-backed workers with optional browser attachment.
 - Frontend should never rely on hidden local process or browser state. It should render from RPC responses, history APIs, and subscription events.
 
@@ -109,9 +109,11 @@ Keep this state at minimum:
 
 ### Live interaction
 - Send user input through `terminal.input`.
+- Treat `terminal.input` as a raw byte write. If the UI wants Enter, Ctrl+C, arrow keys, or escape sequences, it must send those exact bytes or characters explicitly.
 - Send viewport changes through `terminal.resize`.
 - Update pane state from subscription events and mutation responses.
 - `terminal.resize.applied` tells the UI whether the resize reached the runtime. Do not assume success from the request alone.
+- Do not assume terminal output is line-based. `terminal.output` events may contain partial prompts, carriage-return progress updates, and ANSI sequences.
 
 ### Reconnect and redraw
 1. Detect reconnect need when the subscription disconnects, the pane is restored, or the next event sequence is not exactly `last_sequence + 1`.
@@ -151,8 +153,10 @@ Keep this state at minimum:
 7. Use current pane state plus the recovered events to rebuild tab/UI state.
 
 ### Runtime fallback handling
-- If browser responses report a synthetic runtime, the frontend should still work against the same method names and event shapes.
+- Browser `runtime` may be `chromium-cdp`, `webview2`, or `browser-simulated`.
+- If browser responses report a fallback runtime, the frontend should still work against the same method names and event shapes.
 - Gate browser features from `system.readiness.browser_runtime_ready`, not from assumptions about the local environment.
+- Readiness is satisfied when at least one real browser runtime is available. A specific session may still report `browser-simulated` if all real launch attempts failed for that create call.
 
 ## Agent Screen Contract
 
@@ -234,7 +238,7 @@ Recommended polling:
 2. `system.readiness`
 3. `terminal.spawn`
 4. `terminal.subscribe`
-5. `terminal.input`
+5. `terminal.input` with explicit bytes for text, Enter, or control sequences
 6. `terminal.history` on reconnect
 7. `terminal.kill`
 

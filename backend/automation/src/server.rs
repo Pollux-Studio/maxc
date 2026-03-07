@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::fs::File as StdFile;
-use std::io::{BufRead, BufReader as StdBufReader, Read, Write};
+use std::io::{BufReader as StdBufReader, Read, Write};
 use std::net::TcpStream;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -315,6 +315,7 @@ struct AgentTaskRuntime {
 
 #[derive(Debug)]
 struct BrowserProcessRuntime {
+    runtime: String,
     executable: String,
     port: u16,
     http_base_url: String,
@@ -827,13 +828,32 @@ impl RpcServer {
         let metrics = self.metrics_snapshot();
         let artifact_stats = self.collect_artifact_stats();
         let dependency = self.dependency_status();
+        let browser_runtime_backend = {
+            let mut names = browser_runtime
+                .values()
+                .map(|session| session.runtime.as_str())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            names.dedup();
+            match names.as_slice() {
+                [] => {
+                    if browser_dependency_ready(&self.config) {
+                        preferred_browser_runtime_name(&self.config)
+                    } else {
+                        "browser-simulated"
+                    }
+                }
+                [single] => single,
+                _ => "mixed",
+            }
+        };
         Ok(json!({
             "sessions": projection.sessions.len(),
             "browser_sessions": projection.browser_sessions.len(),
             "browser_tabs": projection.browser_tabs.len(),
             "terminal_runtime_count": terminal_runtime.len(),
             "browser_runtime_count": browser_runtime.len(),
-            "browser_runtime_backend": "chromium-cdp",
+            "browser_runtime_backend": browser_runtime_backend,
             "browser_runtime_ready": dependency.browser_runtime_ready,
             "browser_runtimes": browser_runtime.values().map(|session| json!({
                 "workspace_id": session.workspace_id,
@@ -2437,7 +2457,7 @@ impl RpcServer {
         let launched = launch_browser_process(&self.config, &browser_session_id);
         let (runtime_name, executable, port, process, last_error) = match launched {
             Ok(process) => (
-                "chromium-cdp".to_string(),
+                process.runtime.clone(),
                 process.executable.clone(),
                 Some(process.port),
                 Some(process),
@@ -2752,13 +2772,20 @@ impl RpcServer {
             }),
         )
         .await;
+        let runtime_name = {
+            let runtime = self.state.browser_runtime.lock().await;
+            runtime
+                .get(&browser_session_id)
+                .map(|session| session.runtime.clone())
+                .unwrap_or_else(|| "browser-simulated".to_string())
+        };
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
             "url": target_info.url,
             "title": target_info.title,
             "load_state": "complete",
-            "runtime": "chromium-cdp"
+            "runtime": runtime_name
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -2805,6 +2832,7 @@ impl RpcServer {
                 }
             }
         }
+        let runtime_name = session.runtime.clone();
         let tabs: Vec<Value> = session
             .tabs
             .values()
@@ -2816,7 +2844,7 @@ impl RpcServer {
                     "load_state": tab.load_state,
                     "focused": tab.focused,
                     "closed": tab.closed,
-                    "runtime": "chromium-cdp"
+                    "runtime": runtime_name
                 })
             })
             .collect();
@@ -3055,6 +3083,13 @@ impl RpcServer {
             }
             (tab.url.clone(), tab.title.clone(), tab.load_state.clone())
         };
+        let runtime_name = {
+            let runtime = self.state.browser_runtime.lock().await;
+            runtime
+                .get(&browser_session_id)
+                .map(|session| session.runtime.clone())
+                .unwrap_or_else(|| "browser-simulated".to_string())
+        };
         self.publish_browser_event(
             &browser_session_id,
             json!({
@@ -3075,7 +3110,7 @@ impl RpcServer {
             "url": url,
             "title": title,
             "load_state": load_state,
-            "runtime": "chromium-cdp"
+            "runtime": runtime_name
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -3404,6 +3439,13 @@ impl RpcServer {
                 }
             }
         }
+        let runtime_name = {
+            let runtime = self.state.browser_runtime.lock().await;
+            runtime
+                .get(&browser_session_id)
+                .map(|session| session.runtime.clone())
+                .unwrap_or_else(|| "browser-simulated".to_string())
+        };
         self.publish_browser_event(
             &browser_session_id,
             json!({
@@ -3420,7 +3462,7 @@ impl RpcServer {
             "browser_tab_id": browser_tab_id,
             "method": method,
             "ok": true,
-            "runtime": "chromium-cdp",
+            "runtime": runtime_name,
             "details": extra
         });
         let payload = json!({
@@ -3595,12 +3637,19 @@ impl RpcServer {
             }),
         )
         .await;
+        let runtime_name = {
+            let runtime = self.state.browser_runtime.lock().await;
+            runtime
+                .get(&browser_session_id)
+                .map(|session| session.runtime.clone())
+                .unwrap_or_else(|| "browser-simulated".to_string())
+        };
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
             "raw_command": command,
             "ok": true,
-            "runtime": "chromium-cdp",
+            "runtime": runtime_name,
             "result": response
         });
         let payload = json!({
@@ -3760,34 +3809,23 @@ impl RpcServer {
         let terminal_for_reader = terminal_session_id.clone();
         tokio::task::spawn_blocking(move || {
             let mut reader = StdBufReader::new(output);
-            let mut line = String::new();
+            let mut buffer = vec![0_u8; 4096];
             loop {
-                line.clear();
-                match reader.read_line(&mut line) {
+                match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+                    Ok(read) => {
+                        let chunk = buffer[..read].to_vec();
                         let state = state.clone();
                         let terminal = terminal_for_reader.clone();
                         runtime.block_on(async move {
-                            {
-                                let mut runtime = state.terminal_runtime.lock().await;
-                                if let Some(session) = runtime.get_mut(&terminal) {
-                                    session.last_output = trimmed.clone();
-                                }
-                            }
-                            publish_terminal_event_for_state(
+                            publish_terminal_output_chunk(
                                 &state,
                                 queue_limit,
                                 history_events,
                                 history_bytes,
                                 &terminal,
-                                json!({
-                                    "type": "terminal.output",
-                                    "terminal_session_id": terminal,
-                                    "stream": "stdout",
-                                    "output": trimmed
-                                }),
+                                "stdout",
+                                &chunk,
                             )
                             .await;
                         });
@@ -4836,17 +4874,8 @@ async fn write_to_terminal_input(
                 .write_all(input.as_bytes())
                 .await
                 .map_err(|_| ServerError::Internal)?;
-            let bytes = if input.ends_with('\n') {
-                input.len()
-            } else {
-                writer
-                    .write_all(b"\n")
-                    .await
-                    .map_err(|_| ServerError::Internal)?;
-                input.len() + 1
-            };
             writer.flush().await.map_err(|_| ServerError::Internal)?;
-            Ok(bytes)
+            Ok(input.len())
         }
         TerminalInputHandle::BlockingPipe(file) => {
             let input = input.to_string();
@@ -4855,21 +4884,48 @@ async fn write_to_terminal_input(
                 writer
                     .write_all(input.as_bytes())
                     .map_err(|_| ServerError::Internal)?;
-                let bytes = if input.ends_with('\n') {
-                    input.len()
-                } else {
-                    writer
-                        .write_all(b"\r\n")
-                        .map_err(|_| ServerError::Internal)?;
-                    input.len() + 2
-                };
                 writer.flush().map_err(|_| ServerError::Internal)?;
-                Ok(bytes)
+                Ok(input.len())
             })
             .await
             .map_err(|_| ServerError::Internal)?
         }
     }
+}
+
+async fn publish_terminal_output_chunk(
+    state: &Arc<ServerState>,
+    queue_limit: usize,
+    history_limit_events: usize,
+    history_limit_bytes: usize,
+    terminal_session_id: &str,
+    stream: &str,
+    chunk: &[u8],
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    let output = String::from_utf8_lossy(chunk).into_owned();
+    {
+        let mut runtime = state.terminal_runtime.lock().await;
+        if let Some(session) = runtime.get_mut(terminal_session_id) {
+            session.last_output = output.clone();
+        }
+    }
+    publish_terminal_event_for_state(
+        state,
+        queue_limit,
+        history_limit_events,
+        history_limit_bytes,
+        terminal_session_id,
+        json!({
+            "type": "terminal.output",
+            "terminal_session_id": terminal_session_id,
+            "stream": stream,
+            "output": output
+        }),
+    )
+    .await;
 }
 
 async fn publish_terminal_event_for_state(
@@ -5058,32 +5114,23 @@ fn spawn_terminal_output_task<R>(
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
+        let mut reader = reader;
+        let mut buffer = vec![0_u8; 4096];
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    {
-                        let mut runtime = state.terminal_runtime.lock().await;
-                        if let Some(session) = runtime.get_mut(&terminal_session_id) {
-                            session.last_output = line.clone();
-                        }
-                    }
-                    publish_terminal_event_for_state(
+            match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    publish_terminal_output_chunk(
                         &state,
                         queue_limit,
                         queue_limit.saturating_mul(64),
                         queue_limit.saturating_mul(1024),
                         &terminal_session_id,
-                        json!({
-                            "type": "terminal.output",
-                            "terminal_session_id": terminal_session_id,
-                            "stream": stream,
-                            "output": line
-                        }),
+                        stream,
+                        &buffer[..read],
                     )
                     .await;
                 }
-                Ok(None) => break,
                 Err(_) => {
                     publish_terminal_event_for_state(
                         &state,
@@ -5157,6 +5204,15 @@ fn selected_terminal_runtime_name(config: &BackendConfig) -> &'static str {
     } else {
         "process-stdio"
     }
+}
+
+#[cfg(windows)]
+fn conpty_creation_flags(has_env_block: bool) -> u32 {
+    let mut flags = EXTENDED_STARTUPINFO_PRESENT;
+    if has_env_block {
+        flags |= windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+    }
+    flags
 }
 
 fn terminal_dependency_ready(config: &BackendConfig) -> bool {
@@ -5323,7 +5379,7 @@ fn spawn_terminal_process_conpty(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT,
+            conpty_creation_flags(!env_block.is_empty()),
             env_ptr,
             cwd.as_mut_ptr(),
             &startup.StartupInfo,
@@ -5753,6 +5809,12 @@ fn browser_http_request(method: &str, url: &str) -> Result<String, ServerError> 
     String::from_utf8(response[split_at..].to_vec()).map_err(|_| ServerError::Internal)
 }
 
+#[derive(Debug, Clone)]
+struct BrowserLaunchTarget {
+    runtime: String,
+    executable: String,
+}
+
 fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerError> {
     let configured = config.browser_executable_or_channel.trim();
     if configured.eq_ignore_ascii_case("__synthetic__") {
@@ -5781,8 +5843,74 @@ fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerEr
         .ok_or(ServerError::Internal)
 }
 
+fn resolve_webview2_executable() -> Result<String, ServerError> {
+    #[cfg(not(windows))]
+    {
+        Err(ServerError::Internal)
+    }
+    #[cfg(windows)]
+    {
+        let roots = [
+            PathBuf::from("C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application"),
+            PathBuf::from("C:\\Program Files\\Microsoft\\EdgeWebView\\Application"),
+        ];
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            let mut versions = fs::read_dir(&root)
+                .map_err(|_| ServerError::Internal)?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            versions.sort();
+            versions.reverse();
+            for version_dir in versions {
+                let candidate = version_dir.join("msedgewebview2.exe");
+                if candidate.exists() {
+                    return Ok(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+        Err(ServerError::Internal)
+    }
+}
+
+fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
+    let mut targets = Vec::new();
+    if let Ok(executable) = resolve_browser_executable(config) {
+        targets.push(BrowserLaunchTarget {
+            runtime: "chromium-cdp".to_string(),
+            executable,
+        });
+    }
+    if let Ok(executable) = resolve_webview2_executable() {
+        if !targets
+            .iter()
+            .any(|target| target.executable.eq_ignore_ascii_case(executable.as_str()))
+        {
+            targets.push(BrowserLaunchTarget {
+                runtime: "webview2".to_string(),
+                executable,
+            });
+        }
+    }
+    targets
+}
+
+fn preferred_browser_runtime_name(config: &BackendConfig) -> &'static str {
+    if resolve_browser_executable(config).is_ok() {
+        "chromium-cdp"
+    } else if resolve_webview2_executable().is_ok() {
+        "webview2"
+    } else {
+        "browser-simulated"
+    }
+}
+
 fn browser_dependency_ready(config: &BackendConfig) -> bool {
-    resolve_browser_executable(config).is_ok()
+    !browser_launch_targets(config).is_empty()
 }
 
 fn browser_artifact_root(
@@ -5796,11 +5924,19 @@ fn browser_artifact_root(
     Ok(root)
 }
 
-fn launch_browser_process(
+fn cleanup_failed_browser_launch(mut child: StdChild, user_data_dir: &Path, artifact_dir: &Path) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(user_data_dir);
+    let _ = fs::remove_dir_all(artifact_dir);
+}
+
+fn launch_browser_process_for_target(
     config: &BackendConfig,
     browser_session_id: &str,
+    target: &BrowserLaunchTarget,
 ) -> Result<Arc<BrowserProcessRuntime>, ServerError> {
-    let executable = resolve_browser_executable(config)?;
+    let executable = target.executable.clone();
     let user_data_dir = PathBuf::from(&config.event_dir)
         .join("browser-runtime")
         .join(browser_session_id);
@@ -5838,24 +5974,38 @@ fn launch_browser_process(
             }
         }
         if started.elapsed() > Duration::from_secs(10) {
+            cleanup_failed_browser_launch(child, &user_data_dir, &artifact_dir);
             return Err(ServerError::Internal);
         }
         thread::sleep(Duration::from_millis(50));
     };
 
     let http_base_url = format!("http://127.0.0.1:{port}");
-    let version: Value = serde_json::from_str(&browser_http_request(
-        "GET",
-        &format!("{http_base_url}/json/version"),
-    )?)
-    .map_err(|_| ServerError::Internal)?;
-    let websocket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or(ServerError::Internal)?
-        .to_string();
+    let version_payload =
+        match browser_http_request("GET", &format!("{http_base_url}/json/version")) {
+            Ok(payload) => payload,
+            Err(_) => {
+                cleanup_failed_browser_launch(child, &user_data_dir, &artifact_dir);
+                return Err(ServerError::Internal);
+            }
+        };
+    let version: Value = match serde_json::from_str(&version_payload) {
+        Ok(value) => value,
+        Err(_) => {
+            cleanup_failed_browser_launch(child, &user_data_dir, &artifact_dir);
+            return Err(ServerError::Internal);
+        }
+    };
+    let websocket_url = match version.get("webSocketDebuggerUrl").and_then(Value::as_str) {
+        Some(value) => value.to_string(),
+        None => {
+            cleanup_failed_browser_launch(child, &user_data_dir, &artifact_dir);
+            return Err(ServerError::Internal);
+        }
+    };
 
     Ok(Arc::new(BrowserProcessRuntime {
+        runtime: target.runtime.clone(),
         executable,
         port,
         http_base_url,
@@ -5864,6 +6014,20 @@ fn launch_browser_process(
         artifact_dir,
         child: StdMutex::new(child),
     }))
+}
+
+fn launch_browser_process(
+    config: &BackendConfig,
+    browser_session_id: &str,
+) -> Result<Arc<BrowserProcessRuntime>, ServerError> {
+    let mut last_error = None;
+    for target in browser_launch_targets(config) {
+        match launch_browser_process_for_target(config, browser_session_id, &target) {
+            Ok(process) => return Ok(process),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(ServerError::Internal))
 }
 
 fn browser_target_list(
@@ -7808,6 +7972,7 @@ mod tests {
             .spawn()
             .expect("child");
         let process = BrowserProcessRuntime {
+            runtime: "chromium-cdp".to_string(),
             executable: "fake".to_string(),
             port,
             http_base_url: format!("http://127.0.0.1:{port}"),
@@ -7889,6 +8054,7 @@ mod tests {
             .expect("child");
         let artifact_dir = std::env::temp_dir().join(format!("maxc-artifacts-{}", now_unix_ms()));
         let process = BrowserProcessRuntime {
+            runtime: "chromium-cdp".to_string(),
             executable: "fake".to_string(),
             port: 9222,
             http_base_url: "http://127.0.0.1:9222".to_string(),
@@ -7901,6 +8067,138 @@ mod tests {
             write_browser_artifact(&process, "tab-1", "shot", "txt", b"hello").expect("artifact");
         assert!(std::path::Path::new(&path).exists());
         let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_input_preserves_raw_bytes() {
+        let path = std::env::temp_dir().join(format!("maxc-terminal-input-{}.txt", now_unix_ms()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        let written = write_to_terminal_input(
+            TerminalInputHandle::BlockingPipe(Arc::new(StdMutex::new(file))),
+            "\u{3}\u{1b}[A",
+        )
+        .await
+        .expect("write");
+        assert_eq!(written, "\u{3}\u{1b}[A".len());
+        let content = fs::read(&path).expect("read");
+        assert_eq!(content, b"\x03\x1b[A");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_task_emits_partial_chunks_without_newline() {
+        let server = RpcServer::new(test_config("terminal-chunks")).expect("server");
+        let terminal_session_id = "ts-chunk".to_string();
+        {
+            let mut runtime = server.state.terminal_runtime.lock().await;
+            runtime.insert(
+                terminal_session_id.clone(),
+                TerminalSessionRuntime {
+                    workspace_id: "ws-1".to_string(),
+                    surface_id: "sf-1".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    alive: true,
+                    last_output: String::new(),
+                    program: "test".to_string(),
+                    cwd: ".".to_string(),
+                    pid: 1,
+                    runtime: "process-stdio".to_string(),
+                    status: "ready".to_string(),
+                    exit_code: None,
+                    input: None,
+                    kill_tx: None,
+                    next_sequence: 1,
+                    history: VecDeque::new(),
+                    history_bytes: 0,
+                    #[cfg(windows)]
+                    conpty: None,
+                },
+            );
+        }
+        let (mut writer, reader) = tokio::io::duplex(64);
+        spawn_terminal_output_task(
+            server.state.clone(),
+            server.config.queue_limit.max(1),
+            terminal_session_id.clone(),
+            reader,
+            "stdout",
+        );
+        writer
+            .write_all(b"prompt> \rprogress 10%")
+            .await
+            .expect("write");
+        drop(writer);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let runtime = server.state.terminal_runtime.lock().await;
+        let session = runtime.get(&terminal_session_id).expect("session");
+        assert_eq!(session.last_output, "prompt> \rprogress 10%");
+        let event = session.history.back().expect("event");
+        assert_eq!(event["type"], "terminal.output");
+        assert_eq!(event["output"], "prompt> \rprogress 10%");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_creation_flags_include_unicode_env_when_needed() {
+        let with_env = conpty_creation_flags(true);
+        let without_env = conpty_creation_flags(false);
+        assert_ne!(with_env, without_env);
+        assert_eq!(
+            with_env & windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+            windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT
+        );
+        assert_eq!(
+            without_env & windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_failed_browser_launch_removes_runtime_state() {
+        let root = std::env::temp_dir().join(format!("maxc-browser-cleanup-{}", now_unix_ms()));
+        let user_data_dir = root.join("runtime");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&user_data_dir).expect("runtime dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let child = StdCommand::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec!["/C", "ping", "127.0.0.1", "-n", "6", ">NUL"]
+            } else {
+                vec!["-c", "sleep 5"]
+            })
+            .spawn()
+            .expect("child");
+        cleanup_failed_browser_launch(child, &user_data_dir, &artifact_dir);
+        assert!(!user_data_dir.exists());
+        assert!(!artifact_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_launch_target_resolution_prefers_chromium_then_webview2() {
+        let temp_executable =
+            std::env::temp_dir().join(format!("maxc-browser-bin-{}.exe", now_unix_ms()));
+        fs::write(&temp_executable, b"stub").expect("stub executable");
+        let config = BackendConfig {
+            browser_executable_or_channel: temp_executable.to_string_lossy().to_string(),
+            ..BackendConfig::default()
+        };
+        let targets = browser_launch_targets(&config);
+        assert_eq!(
+            targets.first().map(|target| target.runtime.as_str()),
+            Some("chromium-cdp")
+        );
+        if resolve_webview2_executable().is_ok() {
+            assert!(targets.iter().any(|target| target.runtime == "webview2"));
+        }
+        let _ = fs::remove_file(temp_executable);
     }
 
     #[tokio::test]
