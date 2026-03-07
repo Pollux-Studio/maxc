@@ -233,6 +233,7 @@ struct TerminalLaunchSpec {
 #[derive(Clone)]
 enum TerminalInputHandle {
     Process(Arc<Mutex<ChildStdin>>),
+    #[cfg(windows)]
     BlockingPipe(Arc<StdMutex<StdFile>>),
 }
 
@@ -4780,6 +4781,9 @@ async fn spawn_terminal_process(
     _cols: u16,
     _rows: u16,
 ) -> Result<SpawnedTerminalProcess, ServerError> {
+    #[cfg(not(windows))]
+    let _ = config;
+
     #[cfg(windows)]
     if config.terminal_runtime == "conpty" {
         return spawn_terminal_process_conpty(launch, _cols, _rows);
@@ -4877,6 +4881,7 @@ async fn write_to_terminal_input(
             writer.flush().await.map_err(|_| ServerError::Internal)?;
             Ok(input.len())
         }
+        #[cfg(windows)]
         TerminalInputHandle::BlockingPipe(file) => {
             let input = input.to_string();
             tokio::task::spawn_blocking(move || {
@@ -5820,6 +5825,9 @@ fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerEr
     if configured.eq_ignore_ascii_case("__synthetic__") {
         return Err(ServerError::Internal);
     }
+    if configured.eq_ignore_ascii_case("webview2") {
+        return resolve_webview2_executable();
+    }
     if !configured.is_empty() && Path::new(configured).exists() {
         return Ok(configured.to_string());
     }
@@ -5878,6 +5886,27 @@ fn resolve_webview2_executable() -> Result<String, ServerError> {
 }
 
 fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
+    if config
+        .browser_executable_or_channel
+        .trim()
+        .eq_ignore_ascii_case("__synthetic__")
+    {
+        return Vec::new();
+    }
+    if config
+        .browser_executable_or_channel
+        .trim()
+        .eq_ignore_ascii_case("webview2")
+    {
+        return resolve_webview2_executable()
+            .map(|executable| {
+                vec![BrowserLaunchTarget {
+                    runtime: "webview2".to_string(),
+                    executable,
+                }]
+            })
+            .unwrap_or_default();
+    }
     let mut targets = Vec::new();
     if let Ok(executable) = resolve_browser_executable(config) {
         targets.push(BrowserLaunchTarget {
@@ -8069,6 +8098,7 @@ mod tests {
         let _ = fs::remove_dir_all(artifact_dir);
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn terminal_input_preserves_raw_bytes() {
         let path = std::env::temp_dir().join(format!("maxc-terminal-input-{}.txt", now_unix_ms()));

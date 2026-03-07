@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
+use std::process::{Command as StdCommand, Stdio as StdStdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +32,12 @@ struct BenchmarkResult {
     max_ms: f64,
     throughput_ops_per_sec: f64,
     pass: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserLaunchTarget {
+    executable: String,
+    config_value: String,
 }
 
 #[tokio::main]
@@ -174,11 +182,8 @@ async fn run_profile(
         if matches!(
             name,
             "browser_create_latency" | "browser_navigation_latency" | "browser_screenshot_latency"
-        ) && !browser_runtime_available(&config)
-        {
-            return Err(
-                "real-runtime browser benchmarks require a local Chromium or Edge install".into(),
-            );
+        ) {
+            pin_real_browser_target(&mut config)?;
         }
     }
     let server = RpcServer::new(config)?;
@@ -792,13 +797,16 @@ fn threshold_file_name(mode: &str) -> &'static str {
     }
 }
 
-fn browser_runtime_available(config: &BackendConfig) -> bool {
+fn resolve_browser_executable(config: &BackendConfig) -> Option<String> {
     let configured = config.browser_executable_or_channel.trim();
     if configured.eq_ignore_ascii_case("__synthetic__") {
-        return false;
+        return None;
+    }
+    if configured.eq_ignore_ascii_case("webview2") {
+        return resolve_webview2_executable();
     }
     if !configured.is_empty() && PathBuf::from(configured).exists() {
-        return true;
+        return Some(configured.to_string());
     }
     let candidates: &[&str] = match configured {
         "chrome" | "chromium" | "" => &[
@@ -815,7 +823,156 @@ fn browser_runtime_available(config: &BackendConfig) -> bool {
     };
     candidates
         .iter()
-        .any(|candidate| PathBuf::from(candidate).exists())
+        .find(|candidate| PathBuf::from(candidate).exists())
+        .map(|candidate| (*candidate).to_string())
+}
+
+fn resolve_webview2_executable() -> Option<String> {
+    #[cfg(not(windows))]
+    {
+        None
+    }
+    #[cfg(windows)]
+    {
+        let roots = [
+            PathBuf::from("C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application"),
+            PathBuf::from("C:\\Program Files\\Microsoft\\EdgeWebView\\Application"),
+        ];
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            let mut versions = fs::read_dir(&root)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            versions.sort();
+            versions.reverse();
+            for version_dir in versions {
+                let candidate = version_dir.join("msedgewebview2.exe");
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
+    if config
+        .browser_executable_or_channel
+        .trim()
+        .eq_ignore_ascii_case("__synthetic__")
+    {
+        return Vec::new();
+    }
+    if config
+        .browser_executable_or_channel
+        .trim()
+        .eq_ignore_ascii_case("webview2")
+    {
+        return resolve_webview2_executable()
+            .map(|executable| {
+                vec![BrowserLaunchTarget {
+                    executable,
+                    config_value: "webview2".to_string(),
+                }]
+            })
+            .unwrap_or_default();
+    }
+
+    let mut targets = Vec::new();
+    if let Some(executable) = resolve_browser_executable(config) {
+        targets.push(BrowserLaunchTarget {
+            config_value: executable.clone(),
+            executable,
+        });
+    }
+    if let Some(executable) = resolve_webview2_executable() {
+        if !targets
+            .iter()
+            .any(|target| target.executable.eq_ignore_ascii_case(executable.as_str()))
+        {
+            targets.push(BrowserLaunchTarget {
+                executable,
+                config_value: "webview2".to_string(),
+            });
+        }
+    }
+    targets
+}
+
+fn pin_real_browser_target(config: &mut BackendConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(target) = browser_launch_targets(config)
+        .into_iter()
+        .find(browser_target_launchable)
+    {
+        config.browser_executable_or_channel = target.config_value;
+        return Ok(());
+    }
+    Err("real-runtime browser benchmarks require a launchable local Chromium, Edge, or WebView2 runtime".into())
+}
+
+fn browser_target_launchable(target: &BrowserLaunchTarget) -> bool {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_millis();
+    let probe_dir = std::env::temp_dir().join(format!("maxc-perf-browser-probe-{millis}"));
+    if fs::create_dir_all(&probe_dir).is_err() {
+        return false;
+    }
+
+    let mut command = StdCommand::new(&target.executable);
+    command
+        .arg("--remote-debugging-port=0")
+        .arg(format!("--user-data-dir={}", probe_dir.display()))
+        .arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--disable-background-networking")
+        .arg("--disable-sync")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-popup-blocking")
+        .arg("about:blank")
+        .stdin(StdStdio::null())
+        .stdout(StdStdio::null())
+        .stderr(StdStdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&probe_dir);
+            return false;
+        }
+    };
+
+    let devtools_file = probe_dir.join("DevToolsActivePort");
+    let started = Instant::now();
+    let launched = loop {
+        if let Ok(content) = fs::read_to_string(&devtools_file) {
+            if content
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse::<u16>().ok())
+                .is_some()
+            {
+                break true;
+            }
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&probe_dir);
+    launched
 }
 
 fn temp_event_dir(label: &str) -> PathBuf {
@@ -1098,6 +1255,6 @@ mod tests {
             browser_executable_or_channel: "__synthetic__".to_string(),
             ..BackendConfig::default()
         };
-        assert!(!browser_runtime_available(&synthetic));
+        assert!(browser_launch_targets(&synthetic).is_empty());
     }
 }

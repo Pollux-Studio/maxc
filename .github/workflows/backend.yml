@@ -36,6 +36,7 @@ jobs:
         run: cargo llvm-cov --workspace --all-features --fail-under-lines 85
 
   validate-windows-runtime:
+    needs: validate-linux
     runs-on: windows-latest
     steps:
       - name: Checkout

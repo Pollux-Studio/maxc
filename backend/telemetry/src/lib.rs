@@ -101,7 +101,9 @@ impl LatencyMetric {
         self.total_ms += value_ms;
         self.max_ms = self.max_ms.max(value_ms);
         if self.samples.len() == 256 {
-            self.samples.pop_front();
+            if let Some(evicted) = self.samples.pop_front() {
+                self.total_ms -= evicted;
+            }
         }
         self.samples.push_back(value_ms);
     }
@@ -212,5 +214,20 @@ mod tests {
         let snapshot = metric.snapshot();
         assert_eq!(snapshot.count, 2);
         assert!(snapshot.p95_ms >= 5.0);
+    }
+
+    #[test]
+    fn latency_snapshot_avg_tracks_bounded_window() {
+        let mut metric = LatencyMetric::new();
+        for value in 1..=300 {
+            metric.record(value as f64);
+        }
+
+        let snapshot = metric.snapshot();
+        assert_eq!(snapshot.count, 256);
+
+        let expected_sum: f64 = (45..=300).map(|value| value as f64).sum();
+        let expected_avg = expected_sum / 256.0;
+        assert!((snapshot.avg_ms - expected_avg).abs() < f64::EPSILON);
     }
 }

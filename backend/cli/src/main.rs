@@ -1,6 +1,10 @@
 use maxc_automation::{RpcId, RpcRequest};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 enum Command {
@@ -901,7 +905,12 @@ fn auth_payload(token: &str, command: &str) -> Value {
 }
 
 fn command_id(prefix: &str) -> String {
-    format!("cli-{prefix}")
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis();
+    let counter = COMMAND_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("cli-{prefix}-{timestamp_ms}-{counter}")
 }
 
 #[cfg(test)]
@@ -1382,11 +1391,36 @@ mod tests {
 
         let auth = auth_payload("tok", "demo");
         assert_eq!(auth["auth"]["token"], "tok");
-        assert_eq!(command_id("demo"), "cli-demo");
+        let first = command_id("demo");
+        let second = command_id("demo");
+        assert!(first.starts_with("cli-demo-"));
+        assert!(second.starts_with("cli-demo-"));
+        assert_ne!(first, second);
         assert_eq!(request("system.health", None).method, "system.health");
         assert!(NamedPipeTransport::new("pipe-demo")
             .pipe_name
             .contains("pipe-demo"));
+    }
+
+    #[test]
+    fn mutating_requests_get_fresh_command_ids() {
+        let first = build_request(Command::SessionCreate);
+        let second = build_request(Command::SessionCreate);
+        let first_command = first
+            .params
+            .as_ref()
+            .and_then(|params| params.get("command_id"))
+            .and_then(Value::as_str)
+            .expect("first command id");
+        let second_command = second
+            .params
+            .as_ref()
+            .and_then(|params| params.get("command_id"))
+            .and_then(Value::as_str)
+            .expect("second command id");
+        assert_ne!(first_command, second_command);
+        assert!(first_command.starts_with("cli-session-create-"));
+        assert!(second_command.starts_with("cli-session-create-"));
     }
 
     #[tokio::test]
