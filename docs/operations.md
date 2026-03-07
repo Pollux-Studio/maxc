@@ -30,6 +30,20 @@ Use these in order:
 
 `system.diagnostics` gives the broad operational picture. `system.metrics` is better for counters and latency. `system.logs` is best for recent event history and request-level tracing.
 
+## Security and Scope Checks
+
+- Tokens now carry scopes. Use diagnostics-only tokens for operator screens when possible.
+- A method can fail with `UNAUTHORIZED` even with a valid token if the token lacks the required scope.
+- Cross-workspace or cross-surface runtime access is rejected instead of silently reusing the resource.
+- Raw browser commands remain available by default for trusted local development, but operators should disable them with `MAXC_BROWSER_ALLOW_RAW_COMMANDS=false` for stricter local setups.
+
+## Artifact Retention
+
+- Screenshots, downloads, and traces are retained under the backend artifact root with bounded cleanup.
+- Cleanup runs on backend startup and after artifact writes.
+- Retention is controlled by `MAXC_ARTIFACT_MAX_FILES`, `MAXC_ARTIFACT_MAX_TOTAL_BYTES`, `MAXC_ARTIFACT_TTL_MS`, and `MAXC_ARTIFACT_MAX_FILES_PER_SESSION`.
+- Use `system.diagnostics` or `system.metrics` to inspect current retained artifact counts and bytes.
+
 ## Graceful Shutdown
 
 - Shutdown flips the backend into reject-new-work mode.

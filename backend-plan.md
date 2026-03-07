@@ -125,12 +125,12 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 ## Phase 11: Security and Isolation
 
 ### Tasks
-- [ ] Add allow/deny policy for spawned programs, cwd roots, env forwarding, and raw browser access.
-- [ ] Add per-session quotas and artifact retention rules.
-- [ ] Add redaction and stronger audit behavior for runtime and diagnostics data.
-- [ ] Add token-scope and ownership controls for runtime and agent actions.
-- [ ] **Phase Quality Gate (Mandatory)**
-- [ ] **Commit Phase Changes (Mandatory)**
+- [x] Add allow/deny policy for spawned programs, cwd roots, env forwarding, and raw browser access.
+- [x] Add per-session quotas and artifact retention rules.
+- [x] Add redaction and stronger audit behavior for runtime and diagnostics data.
+- [x] Add token-scope and ownership controls for runtime and agent actions.
+- [x] **Phase Quality Gate (Mandatory)**
+- [x] **Commit Phase Changes (Mandatory)**
 
 ## Phase 12: Real Runtime Release Gate
 

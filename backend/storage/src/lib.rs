@@ -96,6 +96,8 @@ pub struct ReplayCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProjection {
     pub token: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
     pub last_seen_ms: u64,
@@ -163,10 +165,12 @@ impl ProjectionState {
                 let issued_at_ms = payload_u64(&record.payload, "issued_at_ms")?;
                 let expires_at_ms = payload_u64(&record.payload, "expires_at_ms")?;
                 let last_seen_ms = payload_u64(&record.payload, "last_seen_ms")?;
+                let scopes = payload_string_array(&record.payload, "scopes");
                 self.sessions.insert(
                     token.to_string(),
                     SessionProjection {
                         token: token.to_string(),
+                        scopes,
                         issued_at_ms,
                         expires_at_ms,
                         last_seen_ms,
@@ -181,6 +185,7 @@ impl ProjectionState {
                 let session = self.sessions.get_mut(token).ok_or_else(|| {
                     StoreError::InvalidPayload("refresh for unknown session".to_string())
                 })?;
+                session.scopes = payload_string_array(&record.payload, "scopes");
                 session.expires_at_ms = expires_at_ms;
                 session.last_seen_ms = last_seen_ms;
             }
@@ -706,6 +711,20 @@ fn payload_u64(payload: &Value, key: &str) -> Result<u64, StoreError> {
         .get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| StoreError::InvalidPayload(format!("missing numeric payload key: {key}")))
+}
+
+fn payload_string_array(payload: &Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn checksum(bytes: &[u8]) -> u32 {

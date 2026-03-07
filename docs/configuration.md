@@ -39,6 +39,11 @@ The backend reads `BackendConfig` from environment variables. Defaults are defin
 | `MAXC_BROWSER_DOWNLOAD_MAX_BYTES` | `52428800` | Download size cap |
 | `MAXC_BROWSER_SUBSCRIPTION_LIMIT` | `32` | Browser and terminal subscriber count cap |
 | `MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC` | `10` | Raw-command throttle |
+| `MAXC_BROWSER_ALLOW_RAW_COMMANDS` | `true` | Permissive local-dev default for `browser.raw.command` |
+| `MAXC_BROWSER_ALLOWED_DOWNLOAD_ROOTS` | empty | Optional semicolon-delimited allowlist for backend-managed download roots |
+| `MAXC_BROWSER_ALLOWED_UPLOAD_ROOTS` | empty | Optional semicolon-delimited allowlist for upload source paths |
+| `MAXC_BROWSER_ALLOWED_TRACE_ROOTS` | empty | Optional semicolon-delimited allowlist for trace artifact roots |
+| `MAXC_BROWSER_MAX_TABS_PER_SESSION` | `16` | Open-tab cap per browser session |
 
 ## Reliability and Operability
 
@@ -53,6 +58,16 @@ The backend reads `BackendConfig` from environment variables. Defaults are defin
 | `MAXC_TERMINAL_MAX_ENV_BYTES` | `8192` | Max combined environment bytes for spawned terminal sessions |
 | `MAXC_TERMINAL_ALLOWED_CWD_ROOTS` | empty | Optional semicolon-delimited working-directory allowlist |
 | `MAXC_TERMINAL_ALLOWED_PROGRAMS` | empty | Optional semicolon-delimited program allowlist |
+| `MAXC_ENV_ALLOWLIST` | empty | Optional semicolon-delimited env-key allowlist for terminal and agent launches |
+| `MAXC_AGENT_ALLOWED_WORKSPACE_ROOTS` | empty | Optional semicolon-delimited cwd/workspace allowlist for agent workers |
+| `MAXC_AGENT_ALLOWED_PROGRAMS` | empty | Optional semicolon-delimited program allowlist for agent-backed terminal launches |
+| `MAXC_AGENT_MAX_WORKERS` | `8` | Concurrent agent worker cap |
+| `MAXC_AGENT_MAX_TASKS_PER_WORKER` | `8` | Running-task cap per worker |
+| `MAXC_ARTIFACT_MAX_FILES` | `256` | Global retained browser artifact file cap |
+| `MAXC_ARTIFACT_MAX_TOTAL_BYTES` | `268435456` | Global retained browser artifact byte cap |
+| `MAXC_ARTIFACT_TTL_MS` | `86400000` | Artifact retention TTL |
+| `MAXC_ARTIFACT_MAX_FILES_PER_SESSION` | `64` | Per-browser-session artifact file cap |
+| `MAXC_DEFAULT_SESSION_SCOPES` | `diagnostics;runtime;agent` | Default token scopes returned by `session.create` |
 | `MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS` | `3000` | Graceful shutdown wait window |
 | `MAXC_OVERLOAD_REJECT_THRESHOLD` | `1024` | Reject-new-work threshold |
 | `MAXC_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failure count before opening breaker |
@@ -64,5 +79,9 @@ The backend reads `BackendConfig` from environment variables. Defaults are defin
 - Use defaults for local development first.
 - Raise `MAXC_EVENT_DIR` to a persistent path in CI or long-lived runs.
 - Configure `MAXC_TERMINAL_ALLOWED_CWD_ROOTS` and `MAXC_TERMINAL_ALLOWED_PROGRAMS` before exposing terminal spawn to untrusted local workflows.
+- Keep `MAXC_BROWSER_ALLOW_RAW_COMMANDS=true` only for trusted local workflows. Set it to `false` and require explicit config when tightening local security.
+- Set the browser and agent allowlists before letting untrusted agents control uploads, downloads, or custom programs.
+- Use `MAXC_DEFAULT_SESSION_SCOPES` to issue diagnostics-only tokens for operator panels and narrower runtime tokens for UI clients.
+- Tune artifact retention with the `MAXC_ARTIFACT_*` settings instead of relying on manual cleanup.
 - Lower `MAXC_OVERLOAD_REJECT_THRESHOLD` only when testing overload behavior.
 - Keep `MAXC_BREAKER_FAILURE_THRESHOLD` and `MAXC_BREAKER_COOLDOWN_MS` conservative in development so failures are visible quickly.

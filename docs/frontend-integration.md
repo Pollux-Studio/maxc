@@ -15,7 +15,7 @@ This document is the frontend contract for the current backend. Use it with `rpc
 
 1. Check backend reachability with `system.health`.
 2. Create a session with `session.create`.
-3. Store the returned token in frontend runtime state.
+3. Store the returned token and `scopes` in frontend runtime state.
 4. Call `system.readiness` before enabling terminal, browser, or diagnostics actions.
 
 Disable mutating controls when:
@@ -31,6 +31,7 @@ Disable mutating controls when:
 ### 2. Session lifecycle
 
 - `session.create` creates a token for authenticated methods.
+- `session.create` returns token `scopes`; the frontend should use them to hide actions the token cannot perform.
 - `session.refresh` replaces or extends session validity.
 - `session.revoke` invalidates the token.
 - On `UNAUTHORIZED`, the frontend should clear the stored token, create a new session, and retry only if the action is safe to retry.
@@ -159,9 +160,9 @@ Map backend errors to frontend behavior:
 - `INVALID_REQUEST`: validation problem; show actionable input error.
 - `UNAUTHORIZED`: session missing or expired; clear token and re-authenticate.
 - `NOT_FOUND`: stale UI state; refresh the affected runtime object.
-- `CONFLICT`: invalid lifecycle action; refresh object state and disable impossible action.
+- `CONFLICT`: invalid lifecycle action or exclusive resource ownership; refresh object state and disable impossible action.
 - `TIMEOUT`: show retry affordance; do not assume mutation succeeded unless command replay confirms it.
-- `RATE_LIMITED`: backend overloaded, breaker open, or shutting down; disable repeated retries and surface backend state.
+- `RATE_LIMITED`: backend overloaded, breaker open, shutting down, or blocked by configured policy/quota; disable repeated retries and surface backend state.
 - `INTERNAL`: backend fault; show diagnostics link and preserve correlation data if present.
 
 ### Polling and Subscriptions

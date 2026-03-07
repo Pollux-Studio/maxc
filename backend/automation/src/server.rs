@@ -1,6 +1,6 @@
 use crate::{RpcErrorCode, RpcId, RpcRequest, RpcSuccess};
 use maxc_browser::{BrowserSessionId, BrowserTabId};
-use maxc_core::{BackendConfig, CommandId};
+use maxc_core::{BackendConfig, CommandId, SessionScope};
 use maxc_security::SessionToken;
 use maxc_storage::{
     EventRecord, EventStore, EventStoreConfig, EventType, ProjectionState, SessionProjection,
@@ -54,6 +54,7 @@ use windows_sys::Win32::System::Threading::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub token: String,
+    pub scopes: Vec<String>,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
     pub last_seen_ms: u64,
@@ -79,6 +80,7 @@ impl SessionRecord {
     fn from_projection(value: &SessionProjection) -> Self {
         Self {
             token: value.token.clone(),
+            scopes: value.scopes.clone(),
             issued_at_ms: value.issued_at_ms,
             expires_at_ms: value.expires_at_ms,
             last_seen_ms: value.last_seen_ms,
@@ -88,6 +90,10 @@ impl SessionRecord {
 
     fn is_active(&self, now_ms: u64) -> bool {
         !self.revoked && self.expires_at_ms > now_ms
+    }
+
+    fn has_scope(&self, scope: SessionScope) -> bool {
+        self.scopes.iter().any(|value| value == scope.as_str())
     }
 }
 
@@ -301,6 +307,12 @@ struct BrowserProcessRuntime {
     child: StdMutex<StdChild>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ArtifactStats {
+    files: u64,
+    bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 struct SubscriptionState {
     queue: VecDeque<Value>,
@@ -509,7 +521,7 @@ impl RpcServer {
         let mut store = EventStore::new(store_cfg)?;
         let projection = store.recover()?;
         let global_limiter = RateLimiter::new(config.rate_limit_per_sec, config.burst_limit);
-        Ok(Self {
+        let server = Self {
             config,
             state: Arc::new(ServerState {
                 projection: Mutex::new(projection),
@@ -533,7 +545,9 @@ impl RpcServer {
                 inflight_by_connection: StdMutex::new(HashMap::new()),
                 correlation: AtomicU64::new(1),
             }),
-        })
+        };
+        let _ = server.enforce_artifact_retention(None);
+        Ok(server)
     }
 
     #[cfg(test)]
@@ -759,7 +773,8 @@ impl RpcServer {
     }
 
     async fn system_readiness(&self, params: Option<Value>) -> Result<Value, ServerError> {
-        self.require_active_session(params.as_ref()).await?;
+        self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
+            .await?;
         let browser_ready = browser_dependency_ready(&self.config);
         let terminal_ready = true;
         Ok(json!({
@@ -774,7 +789,8 @@ impl RpcServer {
     }
 
     async fn system_diagnostics(&self, params: Option<Value>) -> Result<Value, ServerError> {
-        self.require_active_session(params.as_ref()).await?;
+        self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
+            .await?;
         let projection = self.state.projection.lock().await;
         let terminal_runtime = self.state.terminal_runtime.lock().await;
         let browser_runtime = self.state.browser_runtime.lock().await;
@@ -791,6 +807,7 @@ impl RpcServer {
             .lock()
             .expect("subscription lock poisoned");
         let metrics = self.metrics_snapshot();
+        let artifact_stats = self.collect_artifact_stats();
         Ok(json!({
             "sessions": projection.sessions.len(),
             "browser_sessions": projection.browser_sessions.len(),
@@ -837,6 +854,8 @@ impl RpcServer {
             "terminal_history_bytes": terminal_runtime.values().map(|session| session.history_bytes).sum::<usize>(),
             "browser_history_events": browser_runtime.values().map(|session| session.history.len()).sum::<usize>(),
             "browser_history_bytes": browser_runtime.values().map(|session| session.history_bytes).sum::<usize>(),
+            "artifact_files": artifact_stats.files,
+            "artifact_bytes": artifact_stats.bytes,
             "terminal_runtime_backend": selected_terminal_runtime_name(&self.config),
             "active_requests": self.active_request_count(),
             "shutting_down": self.is_shutting_down(),
@@ -846,8 +865,10 @@ impl RpcServer {
     }
 
     async fn system_metrics(&self, params: Option<Value>) -> Result<Value, ServerError> {
-        self.require_active_session(params.as_ref()).await?;
+        self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
+            .await?;
         let mut metrics = self.metrics_snapshot();
+        let artifact_stats = self.collect_artifact_stats();
         metrics.gauges.insert(
             "rpc.active_requests".to_string(),
             self.active_request_count() as u64,
@@ -912,11 +933,18 @@ impl RpcServer {
             "runtime.agent.tasks".to_string(),
             self.state.agent_tasks.lock().await.len() as u64,
         );
+        metrics
+            .gauges
+            .insert("runtime.artifacts.files".to_string(), artifact_stats.files);
+        metrics
+            .gauges
+            .insert("runtime.artifacts.bytes".to_string(), artifact_stats.bytes);
         serde_json::to_value(metrics).map_err(|_| ServerError::Internal)
     }
 
     async fn system_logs(&self, params: Option<Value>) -> Result<Value, ServerError> {
-        self.require_active_session(params.as_ref()).await?;
+        self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
+            .await?;
         serde_json::to_value(self.telemetry_snapshot()).map_err(|_| ServerError::Internal)
     }
 
@@ -929,13 +957,16 @@ impl RpcServer {
         let now = now_unix_ms();
         let ttl = self.config.session_ttl_ms;
         let token = random_token()?;
+        let scopes = extract_requested_scopes(params.as_ref(), &self.config)?;
         let result = json!({
             "token": token,
+            "scopes": scopes,
             "issued_at_ms": now,
             "expires_at_ms": now + ttl
         });
         let payload = json!({
             "token": token,
+            "scopes": result["scopes"],
             "issued_at_ms": now,
             "expires_at_ms": now + ttl,
             "last_seen_ms": now,
@@ -967,13 +998,23 @@ impl RpcServer {
         if !session.is_active(now) {
             return Err(ServerError::Unauthorized);
         }
+        let scopes = if let Some(requested) = extract_optional_requested_scopes(params.as_ref())? {
+            if !requested.iter().all(|scope| session.scopes.contains(scope)) {
+                return Err(ServerError::Unauthorized);
+            }
+            requested
+        } else {
+            session.scopes.clone()
+        };
 
         let result = json!({
             "token": token,
+            "scopes": scopes,
             "expires_at_ms": now + ttl
         });
         let payload = json!({
             "token": token,
+            "scopes": result["scopes"],
             "expires_at_ms": now + ttl,
             "last_seen_ms": now,
             "result": result
@@ -1022,15 +1063,9 @@ impl RpcServer {
         params: Option<Value>,
     ) -> Result<Value, ServerError> {
         let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
-        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
-        let now = now_unix_ms();
-        let session = self
-            .find_session(&token)
-            .await
-            .ok_or(ServerError::Unauthorized)?;
-        if !session.is_active(now) {
-            return Err(ServerError::Unauthorized);
-        }
+        let _session = self
+            .require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
 
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
@@ -1087,6 +1122,14 @@ impl RpcServer {
         audit: &BrowserAuditContext,
     ) -> Result<(), ServerError> {
         if method == "browser.raw.command" {
+            if !self.config.browser_allow_raw_commands {
+                self.state
+                    .metrics
+                    .lock()
+                    .expect("metrics lock poisoned")
+                    .incr_counter("policy.browser.raw.rejected", 1);
+                return Err(ServerError::Unauthorized);
+            }
             let allow_raw = params
                 .get("allow_raw")
                 .and_then(Value::as_bool)
@@ -1104,6 +1147,46 @@ impl RpcServer {
             if !limiter.allow() {
                 return Err(ServerError::RateLimited);
             }
+        }
+        if method == "browser.upload" {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                if !is_path_allowed(Path::new(path), &self.config.browser_allowed_upload_roots) {
+                    self.state
+                        .metrics
+                        .lock()
+                        .expect("metrics lock poisoned")
+                        .incr_counter("policy.browser.upload.rejected", 1);
+                    return Err(ServerError::RateLimited);
+                }
+            }
+        }
+        if method == "browser.download"
+            && !self.config.browser_allowed_download_roots.is_empty()
+            && !is_path_allowed(
+                &self.artifact_root_path(),
+                &self.config.browser_allowed_download_roots,
+            )
+        {
+            self.state
+                .metrics
+                .lock()
+                .expect("metrics lock poisoned")
+                .incr_counter("policy.browser.download.rejected", 1);
+            return Err(ServerError::RateLimited);
+        }
+        if matches!(method, "browser.trace.start" | "browser.trace.stop")
+            && !self.config.browser_allowed_trace_roots.is_empty()
+            && !is_path_allowed(
+                &self.artifact_root_path(),
+                &self.config.browser_allowed_trace_roots,
+            )
+        {
+            self.state
+                .metrics
+                .lock()
+                .expect("metrics lock poisoned")
+                .incr_counter("policy.browser.trace.rejected", 1);
+            return Err(ServerError::RateLimited);
         }
 
         if method == "browser.screenshot" {
@@ -1163,15 +1246,9 @@ impl RpcServer {
         params: Option<Value>,
     ) -> Result<Value, ServerError> {
         let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
-        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
-        let now = now_unix_ms();
-        let session = self
-            .find_session(&token)
-            .await
-            .ok_or(ServerError::Unauthorized)?;
-        if !session.is_active(now) {
-            return Err(ServerError::Unauthorized);
-        }
+        let _session = self
+            .require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
 
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
@@ -1197,15 +1274,9 @@ impl RpcServer {
         params: Option<Value>,
     ) -> Result<Value, ServerError> {
         let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
-        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
-        let now = now_unix_ms();
-        let session = self
-            .find_session(&token)
-            .await
-            .ok_or(ServerError::Unauthorized)?;
-        if !session.is_active(now) {
-            return Err(ServerError::Unauthorized);
-        }
+        let _session = self
+            .require_active_session_scope(params.as_ref(), SessionScope::Agent)
+            .await?;
 
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
@@ -1246,6 +1317,38 @@ impl RpcServer {
         audit: AgentAuditContext,
         params: &Value,
     ) -> Result<Value, ServerError> {
+        {
+            let workers = self.state.agent_workers.lock().await;
+            if workers.values().filter(|worker| !worker.closed).count()
+                >= self.config.agent_max_workers
+            {
+                return Err(ServerError::RateLimited);
+            }
+        }
+        let cwd = params.get("cwd").and_then(Value::as_str).unwrap_or(".");
+        if !self.config.agent_allowed_workspace_roots.is_empty()
+            && !self
+                .config
+                .agent_allowed_workspace_roots
+                .iter()
+                .any(|root| cwd.starts_with(root))
+        {
+            return Err(ServerError::RateLimited);
+        }
+        if !self.config.agent_allowed_programs.is_empty()
+            && params
+                .get("program")
+                .and_then(Value::as_str)
+                .is_some_and(|program| {
+                    !self
+                        .config
+                        .agent_allowed_programs
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(program))
+                })
+        {
+            return Err(ServerError::RateLimited);
+        }
         let worker_id = format!(
             "aw-{}",
             random_token()?.chars().take(12).collect::<String>()
@@ -1356,7 +1459,12 @@ impl RpcServer {
     }
 
     async fn agent_worker_get(&self, audit: AgentAuditContext) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let workers = self.state.agent_workers.lock().await;
         let worker = workers.get(&worker_id).ok_or(ServerError::NotFound)?;
         let task_snapshot = if let Some(task_id) = &worker.current_task_id {
@@ -1376,7 +1484,8 @@ impl RpcServer {
             "current_task": task_snapshot.map(|task| json!({
                 "agent_task_id": worker.current_task_id,
                 "status": task.status,
-                "prompt": task.prompt,
+                "prompt": redact_text(&task.prompt, 64),
+                "prompt_preview": redact_text(&task.prompt, 64),
                 "last_output_sequence": task.last_output_sequence,
                 "failure_reason": task.failure_reason
             }))
@@ -1388,7 +1497,12 @@ impl RpcServer {
         command_id: String,
         audit: AgentAuditContext,
     ) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let (terminal_session_id, current_task_id) = {
             let mut workers = self.state.agent_workers.lock().await;
             let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
@@ -1434,13 +1548,28 @@ impl RpcServer {
         audit: AgentAuditContext,
         params: &Value,
     ) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let prompt = params
             .get("prompt")
             .or_else(|| params.get("input"))
             .and_then(Value::as_str)
             .ok_or(ServerError::InvalidRequest)?
             .to_string();
+        {
+            let tasks = self.state.agent_tasks.lock().await;
+            let task_count = tasks
+                .values()
+                .filter(|task| task.agent_worker_id == worker_id && task.status == "running")
+                .count();
+            if task_count >= self.config.agent_max_tasks_per_worker {
+                return Err(ServerError::RateLimited);
+            }
+        }
         let (terminal_session_id, browser_session_id) = {
             let mut workers = self.state.agent_workers.lock().await;
             let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
@@ -1540,7 +1669,10 @@ impl RpcServer {
         audit: AgentAuditContext,
         params: &Value,
     ) -> Result<Value, ServerError> {
-        let task_id = audit.agent_task_id.ok_or(ServerError::InvalidRequest)?;
+        let task_id = audit
+            .agent_task_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
         let reason = params
             .get("reason")
             .and_then(Value::as_str)
@@ -1561,6 +1693,8 @@ impl RpcServer {
                 task.terminal_session_id.clone(),
             )
         };
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         self.try_interrupt_terminal_session(&terminal_session_id)
             .await?;
         {
@@ -1614,7 +1748,8 @@ impl RpcServer {
                     "agent_task_id": task_id,
                     "agent_worker_id": task.agent_worker_id,
                     "status": task.status,
-                    "prompt": task.prompt,
+                    "prompt": redact_text(&task.prompt, 64),
+                    "prompt_preview": redact_text(&task.prompt, 64),
                     "terminal_session_id": task.terminal_session_id,
                     "browser_session_id": task.browser_session_id,
                     "last_output_sequence": task.last_output_sequence,
@@ -1626,14 +1761,28 @@ impl RpcServer {
     }
 
     async fn agent_task_get(&self, audit: AgentAuditContext) -> Result<Value, ServerError> {
-        let task_id = audit.agent_task_id.ok_or(ServerError::InvalidRequest)?;
+        let task_id = audit
+            .agent_task_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        let worker_id = {
+            let tasks = self.state.agent_tasks.lock().await;
+            tasks
+                .get(&task_id)
+                .ok_or(ServerError::NotFound)?
+                .agent_worker_id
+                .clone()
+        };
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let tasks = self.state.agent_tasks.lock().await;
         let task = tasks.get(&task_id).ok_or(ServerError::NotFound)?;
         Ok(json!({
             "agent_task_id": task_id,
             "agent_worker_id": task.agent_worker_id,
             "status": task.status,
-            "prompt": task.prompt,
+            "prompt": redact_text(&task.prompt, 64),
+            "prompt_preview": redact_text(&task.prompt, 64),
             "terminal_session_id": task.terminal_session_id,
             "browser_session_id": task.browser_session_id,
             "last_output_sequence": self.last_terminal_sequence(&task.terminal_session_id).await,
@@ -1647,7 +1796,12 @@ impl RpcServer {
         audit: AgentAuditContext,
         params: &Value,
     ) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let terminal_session_id = params
             .get("terminal_session_id")
             .and_then(Value::as_str)
@@ -1691,7 +1845,12 @@ impl RpcServer {
         command_id: String,
         audit: AgentAuditContext,
     ) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let terminal_session_id = {
             let mut workers = self.state.agent_workers.lock().await;
             let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
@@ -1730,7 +1889,12 @@ impl RpcServer {
         audit: AgentAuditContext,
         params: &Value,
     ) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         let browser_session_id = params
             .get("browser_session_id")
             .and_then(Value::as_str)
@@ -1774,7 +1938,12 @@ impl RpcServer {
         command_id: String,
         audit: AgentAuditContext,
     ) -> Result<Value, ServerError> {
-        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let worker_id = audit
+            .agent_worker_id
+            .clone()
+            .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_agent_worker_matches_audit(&worker_id, &audit)
+            .await?;
         {
             let mut workers = self.state.agent_workers.lock().await;
             let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
@@ -1942,7 +2111,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let terminal_session_id = audit
             .terminal_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_terminal_matches_audit(&terminal_session_id, &audit)
+            .await?;
         let input = params
             .get("input")
             .and_then(Value::as_str)
@@ -1999,7 +2171,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let terminal_session_id = audit
             .terminal_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_terminal_matches_audit(&terminal_session_id, &audit)
+            .await?;
         let cols = params
             .get("cols")
             .and_then(Value::as_u64)
@@ -2068,7 +2243,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let terminal_session_id = audit
             .terminal_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_terminal_matches_audit(&terminal_session_id, &audit)
+            .await?;
         let (pid, kill_tx, already_stopped) = {
             let mut runtime = self.state.terminal_runtime.lock().await;
             let session = runtime
@@ -2124,7 +2302,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let terminal_session_id = audit
             .terminal_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_terminal_matches_audit(&terminal_session_id, &audit)
+            .await?;
         let subscriber_id = self.register_subscriber(
             &self.state.terminal_subscriptions,
             &terminal_session_id,
@@ -2164,7 +2345,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let terminal_session_id = audit
             .terminal_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_terminal_matches_audit(&terminal_session_id, &audit)
+            .await?;
         let from_sequence = params
             .get("from_sequence")
             .and_then(Value::as_u64)
@@ -2300,7 +2484,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         {
             let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
@@ -2343,7 +2530,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         {
             let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
@@ -2386,7 +2576,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let process = {
             let mut runtime = self.state.browser_runtime.lock().await;
             let session = runtime
@@ -2408,6 +2601,7 @@ impl RpcServer {
                 let _ = child.wait();
             }
             let _ = fs::remove_dir_all(&process.user_data_dir);
+            let _ = fs::remove_dir_all(&process.artifact_dir);
         }
         self.cleanup_browser_subscribers(&browser_session_id);
         self.publish_browser_event(
@@ -2443,7 +2637,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let browser_tab_id = format!(
             "tab-{}",
             random_token()?.chars().take(10).collect::<String>()
@@ -2461,6 +2658,11 @@ impl RpcServer {
                 .ok_or(ServerError::NotFound)?;
             if session.closed {
                 return Err(ServerError::Conflict);
+            }
+            if session.tabs.values().filter(|tab| !tab.closed).count()
+                >= self.config.browser_max_tabs_per_session
+            {
+                return Err(ServerError::RateLimited);
             }
             target_info = if let Some(process) = &session.process {
                 let created =
@@ -2545,7 +2747,10 @@ impl RpcServer {
     async fn browser_tab_list(&self, audit: BrowserAuditContext) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let mut runtime = self.state.browser_runtime.lock().await;
         let session = runtime
             .get_mut(&browser_session_id)
@@ -2590,7 +2795,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
         {
             let mut runtime = self.state.browser_runtime.lock().await;
@@ -2663,7 +2871,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
         {
             let mut runtime = self.state.browser_runtime.lock().await;
@@ -2726,7 +2937,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
         let requested_url = params
             .get("url")
@@ -2858,6 +3072,7 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
         let mut extra = json!({});
@@ -2965,6 +3180,7 @@ impl RpcServer {
                             "png",
                             &bytes,
                         )?;
+                        self.enforce_artifact_retention(Some(process.artifact_dir.as_path()))?;
                         tab.last_artifact_path = Some(path.clone());
                         extra = json!({
                             "artifact_path": path,
@@ -3040,6 +3256,7 @@ impl RpcServer {
                             "json",
                             &bytes,
                         )?;
+                        self.enforce_artifact_retention(Some(process.artifact_dir.as_path()))?;
                         tab.last_artifact_path = Some(path.clone());
                         extra = json!({"artifact_path": path, "artifact_bytes": bytes.len()});
                     }
@@ -3119,6 +3336,7 @@ impl RpcServer {
                                 &bytes,
                             )?
                         };
+                        self.enforce_artifact_retention(Some(process.artifact_dir.as_path()))?;
                         tab.last_artifact_path = Some(path.clone());
                         extra = json!({"artifact_path": path});
                     }
@@ -3200,6 +3418,8 @@ impl RpcServer {
             .browser_session_id
             .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let subscriber_id = self.register_subscriber(
             &self.state.browser_subscriptions,
             &browser_session_id,
@@ -3242,7 +3462,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let from_sequence = params
             .get("from_sequence")
             .and_then(Value::as_u64)
@@ -3290,7 +3513,10 @@ impl RpcServer {
     ) -> Result<Value, ServerError> {
         let browser_session_id = audit
             .browser_session_id
+            .clone()
             .ok_or(ServerError::InvalidRequest)?;
+        self.ensure_browser_matches_audit(&browser_session_id, &audit)
+            .await?;
         let browser_tab_id = audit.tab_id.ok_or(ServerError::InvalidRequest)?;
         let command = params
             .get("raw_command")
@@ -3597,6 +3823,22 @@ impl RpcServer {
         {
             return Err(ServerError::RateLimited);
         }
+        if !self.config.env_allowlist.is_empty()
+            && launch.env.keys().any(|key| {
+                !self
+                    .config
+                    .env_allowlist
+                    .iter()
+                    .any(|allowed| allowed == key)
+            })
+        {
+            self.state
+                .metrics
+                .lock()
+                .expect("metrics lock poisoned")
+                .incr_counter("policy.terminal.env.rejected", 1);
+            return Err(ServerError::RateLimited);
+        }
         if !self.config.terminal_allowed_programs.is_empty()
             && !self
                 .config
@@ -3604,6 +3846,11 @@ impl RpcServer {
                 .iter()
                 .any(|program| program.eq_ignore_ascii_case(&launch.program))
         {
+            self.state
+                .metrics
+                .lock()
+                .expect("metrics lock poisoned")
+                .incr_counter("policy.terminal.program.rejected", 1);
             return Err(ServerError::RateLimited);
         }
         if !self.config.terminal_allowed_cwd_roots.is_empty()
@@ -3613,6 +3860,11 @@ impl RpcServer {
                 .iter()
                 .any(|root| launch.cwd.starts_with(root))
         {
+            self.state
+                .metrics
+                .lock()
+                .expect("metrics lock poisoned")
+                .incr_counter("policy.terminal.cwd.rejected", 1);
             return Err(ServerError::RateLimited);
         }
         let runtime = self.state.terminal_runtime.lock().await;
@@ -3638,12 +3890,58 @@ impl RpcServer {
         }
     }
 
+    async fn ensure_terminal_matches_audit(
+        &self,
+        terminal_session_id: &str,
+        audit: &TerminalAuditContext,
+    ) -> Result<(), ServerError> {
+        let runtime = self.state.terminal_runtime.lock().await;
+        let session = runtime
+            .get(terminal_session_id)
+            .ok_or(ServerError::NotFound)?;
+        if session.workspace_id == audit.workspace_id && session.surface_id == audit.surface_id {
+            Ok(())
+        } else {
+            Err(ServerError::Unauthorized)
+        }
+    }
+
     async fn ensure_browser_exists(&self, browser_session_id: &str) -> Result<(), ServerError> {
         let runtime = self.state.browser_runtime.lock().await;
         if runtime.contains_key(browser_session_id) {
             Ok(())
         } else {
             Err(ServerError::NotFound)
+        }
+    }
+
+    async fn ensure_browser_matches_audit(
+        &self,
+        browser_session_id: &str,
+        audit: &BrowserAuditContext,
+    ) -> Result<(), ServerError> {
+        let runtime = self.state.browser_runtime.lock().await;
+        let session = runtime
+            .get(browser_session_id)
+            .ok_or(ServerError::NotFound)?;
+        if session.workspace_id == audit.workspace_id && session.surface_id == audit.surface_id {
+            Ok(())
+        } else {
+            Err(ServerError::Unauthorized)
+        }
+    }
+
+    async fn ensure_agent_worker_matches_audit(
+        &self,
+        worker_id: &str,
+        audit: &AgentAuditContext,
+    ) -> Result<(), ServerError> {
+        let workers = self.state.agent_workers.lock().await;
+        let worker = workers.get(worker_id).ok_or(ServerError::NotFound)?;
+        if worker.workspace_id == audit.workspace_id && worker.surface_id == audit.surface_id {
+            Ok(())
+        } else {
+            Err(ServerError::Unauthorized)
         }
     }
 
@@ -3729,6 +4027,26 @@ impl RpcServer {
         Ok(())
     }
 
+    fn artifact_root_path(&self) -> PathBuf {
+        PathBuf::from(&self.config.event_dir).join("browser-artifacts")
+    }
+
+    fn collect_artifact_stats(&self) -> ArtifactStats {
+        collect_artifact_stats(&self.artifact_root_path())
+    }
+
+    fn enforce_artifact_retention(&self, session_dir: Option<&Path>) -> Result<(), ServerError> {
+        enforce_artifact_retention(
+            &self.artifact_root_path(),
+            session_dir,
+            self.config.artifact_ttl_ms,
+            self.config.artifact_max_files,
+            self.config.artifact_max_total_bytes,
+            self.config.artifact_max_files_per_session,
+        )
+        .map_err(|_| ServerError::Internal)
+    }
+
     async fn persist_and_apply(&self, event: EventRecord) -> Result<Value, ServerError> {
         let mut projection = self.state.projection.lock().await;
         if let Some(existing) = projection.command_results.get(&event.command_id) {
@@ -3802,6 +4120,21 @@ impl RpcServer {
         status: &str,
         fields: BTreeMap<String, Value>,
     ) {
+        let redacted_fields = fields
+            .into_iter()
+            .map(|(key, value)| {
+                let lowered = key.to_ascii_lowercase();
+                if lowered.contains("token")
+                    || lowered.contains("env")
+                    || lowered.contains("prompt")
+                    || lowered.contains("raw")
+                {
+                    (key, redact_value(&value))
+                } else {
+                    (key, value)
+                }
+            })
+            .collect();
         self.state
             .telemetry
             .lock()
@@ -3819,7 +4152,7 @@ impl RpcServer {
                 method,
                 duration_ms,
                 status: status.to_string(),
-                fields,
+                fields: redacted_fields,
             });
     }
 
@@ -3877,6 +4210,19 @@ impl RpcServer {
             return Err(ServerError::Unauthorized);
         }
         Ok(session)
+    }
+
+    async fn require_active_session_scope(
+        &self,
+        params: Option<&Value>,
+        scope: SessionScope,
+    ) -> Result<SessionRecord, ServerError> {
+        let session = self.require_active_session(params).await?;
+        if session.has_scope(scope) {
+            Ok(session)
+        } else {
+            Err(ServerError::Unauthorized)
+        }
     }
 
     pub fn begin_shutdown(&self) {
@@ -4153,6 +4499,94 @@ fn extract_token(params: Option<&Value>) -> Option<String> {
                 .ok()
                 .map(|t| t.as_str().to_string())
         })
+}
+
+fn extract_optional_requested_scopes(
+    params: Option<&Value>,
+) -> Result<Option<Vec<String>>, ServerError> {
+    let Some(object) = params.and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(scopes) = object.get("scopes") else {
+        return Ok(None);
+    };
+    let values = scopes.as_array().ok_or(ServerError::InvalidRequest)?;
+    let parsed = values
+        .iter()
+        .map(|value| match value.as_str() {
+            Some("diagnostics") => Ok("diagnostics".to_string()),
+            Some("runtime") => Ok("runtime".to_string()),
+            Some("agent") => Ok("agent".to_string()),
+            _ => Err(ServerError::InvalidRequest),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.is_empty() {
+        return Err(ServerError::InvalidRequest);
+    }
+    Ok(Some(parsed))
+}
+
+fn extract_requested_scopes(
+    params: Option<&Value>,
+    config: &BackendConfig,
+) -> Result<Vec<String>, ServerError> {
+    let defaults = config
+        .default_session_scopes
+        .iter()
+        .map(|scope| scope.as_str().to_string())
+        .collect::<Vec<_>>();
+    let Some(requested) = extract_optional_requested_scopes(params)? else {
+        return Ok(defaults);
+    };
+    if requested
+        .iter()
+        .all(|scope| defaults.iter().any(|default| default == scope))
+    {
+        Ok(requested)
+    } else {
+        Err(ServerError::Unauthorized)
+    }
+}
+
+fn is_path_allowed(candidate: &Path, allowed_roots: &[String]) -> bool {
+    if allowed_roots.is_empty() {
+        return true;
+    }
+    allowed_roots.iter().any(|root| {
+        let root_path = Path::new(root);
+        candidate.starts_with(root_path)
+    })
+}
+
+fn redact_text(value: &str, limit: usize) -> String {
+    let mut redacted = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        redacted.push_str("...");
+    }
+    redacted
+}
+
+fn redact_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_text(text, 64)),
+        Value::Array(values) => Value::Array(values.iter().map(redact_value).collect()),
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in map {
+                let lowered = key.to_ascii_lowercase();
+                if lowered.contains("token")
+                    || lowered.contains("secret")
+                    || lowered.contains("password")
+                {
+                    redacted.insert(key.clone(), Value::String("[redacted]".to_string()));
+                } else {
+                    redacted.insert(key.clone(), redact_value(value));
+                }
+            }
+            Value::Object(redacted)
+        }
+        other => other.clone(),
+    }
 }
 
 fn extract_command_id(params: Option<&Value>) -> Result<String, ServerError> {
@@ -5471,6 +5905,118 @@ fn write_browser_artifact(
     Ok(path.to_string_lossy().to_string())
 }
 
+fn collect_artifact_stats(root: &Path) -> ArtifactStats {
+    let mut stats = ArtifactStats::default();
+    collect_artifact_stats_into(root, &mut stats);
+    stats
+}
+
+fn collect_artifact_stats_into(path: &Path, stats: &mut ArtifactStats) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_artifact_stats_into(&path, stats);
+        } else if let Ok(metadata) = entry.metadata() {
+            stats.files = stats.files.saturating_add(1);
+            stats.bytes = stats.bytes.saturating_add(metadata.len());
+        }
+    }
+}
+
+fn enforce_artifact_retention(
+    root: &Path,
+    session_dir: Option<&Path>,
+    ttl_ms: u64,
+    max_files: usize,
+    max_total_bytes: u64,
+    max_files_per_session: usize,
+) -> std::io::Result<()> {
+    fs::create_dir_all(root)?;
+    let now = now_unix_ms();
+    let ttl_cutoff = now.saturating_sub(ttl_ms);
+    let mut all_files = list_artifacts(root)?;
+    let mut session_files = if let Some(session_dir) = session_dir {
+        list_artifacts(session_dir)?
+    } else {
+        Vec::new()
+    };
+
+    for file in all_files
+        .iter()
+        .filter(|file| file.modified_at_ms < ttl_cutoff)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let _ = fs::remove_file(&file.path);
+    }
+
+    all_files = list_artifacts(root)?;
+    if let Some(session_dir) = session_dir {
+        session_files = list_artifacts(session_dir)?;
+    }
+    all_files.sort_by_key(|file| file.modified_at_ms);
+    session_files.sort_by_key(|file| file.modified_at_ms);
+
+    while session_files.len() > max_files_per_session {
+        if let Some(file) = session_files.first() {
+            let _ = fs::remove_file(&file.path);
+        }
+        session_files = list_artifacts(session_dir.expect("session dir"))?;
+        session_files.sort_by_key(|file| file.modified_at_ms);
+    }
+
+    while all_files.len() > max_files
+        || all_files.iter().map(|file| file.bytes).sum::<u64>() > max_total_bytes
+    {
+        if let Some(file) = all_files.first() {
+            let _ = fs::remove_file(&file.path);
+        } else {
+            break;
+        }
+        all_files = list_artifacts(root)?;
+        all_files.sort_by_key(|file| file.modified_at_ms);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactFile {
+    path: PathBuf,
+    modified_at_ms: u64,
+    bytes: u64,
+}
+
+fn list_artifacts(root: &Path) -> std::io::Result<Vec<ArtifactFile>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(list_artifacts(&path)?);
+        } else {
+            let metadata = entry.metadata()?;
+            let modified_at_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            files.push(ArtifactFile {
+                path,
+                modified_at_ms,
+                bytes: metadata.len(),
+            });
+        }
+    }
+    Ok(files)
+}
+
 fn extract_agent_audit(params: &Value, method: &str) -> Result<AgentAuditContext, ServerError> {
     let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
     let workspace_id = object
@@ -6520,6 +7066,85 @@ mod tests {
         let allowed: Value =
             serde_json::from_str(&server.handle_json_line("c", &raw_allowed).await).expect("json");
         assert!(allowed.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn session_scopes_gate_diagnostics_runtime_and_agent_methods() {
+        let server = RpcServer::new(test_config("session-scopes")).expect("server");
+
+        let create = server
+            .handle_json_line(
+                "c",
+                &json!({
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {
+                        "command_id":"cmd-scope-create",
+                        "scopes":["diagnostics"]
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let created: Value = serde_json::from_str(&create).expect("json");
+        let token = created["result"]["token"].as_str().expect("token");
+        assert_eq!(created["result"]["scopes"], json!(["diagnostics"]));
+
+        let diagnostics = server
+            .handle_json_line(
+                "c",
+                &json!({
+                    "id": 2,
+                    "method": "system.diagnostics",
+                    "params": {"command_id":"cmd-scope-diag","auth":{"token":token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let diagnostics: Value = serde_json::from_str(&diagnostics).expect("json");
+        assert!(diagnostics.get("result").is_some());
+
+        let browser = server
+            .handle_json_line(
+                "c",
+                &json!({
+                    "id": 3,
+                    "method": "browser.create",
+                    "params": {
+                        "command_id":"cmd-scope-browser",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let browser: Value = serde_json::from_str(&browser).expect("json");
+        assert_eq!(browser["error"]["code"], "UNAUTHORIZED");
+    }
+
+    #[test]
+    fn redaction_and_artifact_retention_helpers_work() {
+        let redacted = redact_value(&json!({
+            "token":"secret-token",
+            "prompt":"a very long prompt body that should not stay fully visible in logs",
+            "nested":{"password":"abc123"}
+        }));
+        assert_eq!(redacted["token"], "[redacted]");
+        assert!(redacted["prompt"].as_str().unwrap_or_default().len() <= 67);
+        assert_eq!(redacted["nested"]["password"], "[redacted]");
+
+        let root = std::env::temp_dir().join(format!("maxc-phase11-artifacts-{}", now_unix_ms()));
+        let session = root.join("session-a");
+        fs::create_dir_all(&session).expect("artifact dir");
+        fs::write(session.join("old.txt"), b"1234").expect("old");
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(session.join("new.txt"), b"5678").expect("new");
+        enforce_artifact_retention(&root, Some(&session), 1, 1, 8, 1).expect("retention");
+        let stats = collect_artifact_stats(&root);
+        assert!(stats.files <= 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

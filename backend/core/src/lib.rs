@@ -87,6 +87,23 @@ pub struct SessionMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionScope {
+    Diagnostics,
+    Runtime,
+    Agent,
+}
+
+impl SessionScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Diagnostics => "diagnostics",
+            Self::Runtime => "runtime",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfig {
     pub socket_path: String,
     pub request_timeout_ms: u64,
@@ -111,6 +128,11 @@ pub struct BackendConfig {
     pub browser_download_max_bytes: usize,
     pub browser_subscription_limit: usize,
     pub browser_raw_rate_limit_per_sec: u32,
+    pub browser_allow_raw_commands: bool,
+    pub browser_allowed_download_roots: Vec<String>,
+    pub browser_allowed_upload_roots: Vec<String>,
+    pub browser_allowed_trace_roots: Vec<String>,
+    pub browser_max_tabs_per_session: usize,
     pub terminal_runtime: String,
     pub terminal_max_sessions: usize,
     pub terminal_max_sessions_per_workspace: usize,
@@ -120,6 +142,16 @@ pub struct BackendConfig {
     pub terminal_max_env_bytes: usize,
     pub terminal_allowed_cwd_roots: Vec<String>,
     pub terminal_allowed_programs: Vec<String>,
+    pub env_allowlist: Vec<String>,
+    pub agent_allowed_workspace_roots: Vec<String>,
+    pub agent_allowed_programs: Vec<String>,
+    pub agent_max_workers: usize,
+    pub agent_max_tasks_per_worker: usize,
+    pub artifact_max_files: usize,
+    pub artifact_max_total_bytes: u64,
+    pub artifact_ttl_ms: u64,
+    pub artifact_max_files_per_session: usize,
+    pub default_session_scopes: Vec<SessionScope>,
     pub shutdown_drain_timeout_ms: u64,
     pub overload_reject_threshold: usize,
     pub breaker_failure_threshold: u32,
@@ -159,6 +191,11 @@ impl Default for BackendConfig {
             browser_download_max_bytes: 52_428_800,
             browser_subscription_limit: 32,
             browser_raw_rate_limit_per_sec: 10,
+            browser_allow_raw_commands: true,
+            browser_allowed_download_roots: Vec::new(),
+            browser_allowed_upload_roots: Vec::new(),
+            browser_allowed_trace_roots: Vec::new(),
+            browser_max_tabs_per_session: 16,
             terminal_runtime: if cfg!(windows) {
                 "conpty".to_string()
             } else {
@@ -172,6 +209,20 @@ impl Default for BackendConfig {
             terminal_max_env_bytes: 8_192,
             terminal_allowed_cwd_roots: Vec::new(),
             terminal_allowed_programs: Vec::new(),
+            env_allowlist: Vec::new(),
+            agent_allowed_workspace_roots: Vec::new(),
+            agent_allowed_programs: Vec::new(),
+            agent_max_workers: 8,
+            agent_max_tasks_per_worker: 8,
+            artifact_max_files: 256,
+            artifact_max_total_bytes: 268_435_456,
+            artifact_ttl_ms: 86_400_000,
+            artifact_max_files_per_session: 64,
+            default_session_scopes: vec![
+                SessionScope::Diagnostics,
+                SessionScope::Runtime,
+                SessionScope::Agent,
+            ],
             shutdown_drain_timeout_ms: 3_000,
             overload_reject_threshold: 1_024,
             breaker_failure_threshold: 5,
@@ -366,6 +417,39 @@ impl BackendConfig {
                         value: value.clone(),
                     })?;
         }
+        if let Some(value) = get("MAXC_BROWSER_ALLOW_RAW_COMMANDS") {
+            cfg.browser_allow_raw_commands = matches!(value.as_str(), "1" | "true" | "TRUE");
+        }
+        if let Some(value) = get("MAXC_BROWSER_ALLOWED_DOWNLOAD_ROOTS") {
+            cfg.browser_allowed_download_roots = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_BROWSER_ALLOWED_UPLOAD_ROOTS") {
+            cfg.browser_allowed_upload_roots = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_BROWSER_ALLOWED_TRACE_ROOTS") {
+            cfg.browser_allowed_trace_roots = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_BROWSER_MAX_TABS_PER_SESSION") {
+            cfg.browser_max_tabs_per_session =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_BROWSER_MAX_TABS_PER_SESSION",
+                        value: value.clone(),
+                    })?;
+        }
         if let Some(value) = get("MAXC_TERMINAL_RUNTIME") {
             cfg.terminal_runtime = value;
         }
@@ -436,6 +520,95 @@ impl BackendConfig {
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| v.trim().to_string())
                 .collect();
+        }
+        if let Some(value) = get("MAXC_ENV_ALLOWLIST") {
+            cfg.env_allowlist = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_AGENT_ALLOWED_WORKSPACE_ROOTS") {
+            cfg.agent_allowed_workspace_roots = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_AGENT_ALLOWED_PROGRAMS") {
+            cfg.agent_allowed_programs = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim().to_string())
+                .collect();
+        }
+        if let Some(value) = get("MAXC_AGENT_MAX_WORKERS") {
+            cfg.agent_max_workers =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_AGENT_MAX_WORKERS",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_AGENT_MAX_TASKS_PER_WORKER") {
+            cfg.agent_max_tasks_per_worker =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_AGENT_MAX_TASKS_PER_WORKER",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_ARTIFACT_MAX_FILES") {
+            cfg.artifact_max_files =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_ARTIFACT_MAX_FILES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_ARTIFACT_MAX_TOTAL_BYTES") {
+            cfg.artifact_max_total_bytes =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_ARTIFACT_MAX_TOTAL_BYTES",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_ARTIFACT_TTL_MS") {
+            cfg.artifact_ttl_ms = value
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    key: "MAXC_ARTIFACT_TTL_MS",
+                    value: value.clone(),
+                })?;
+        }
+        if let Some(value) = get("MAXC_ARTIFACT_MAX_FILES_PER_SESSION") {
+            cfg.artifact_max_files_per_session =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_ARTIFACT_MAX_FILES_PER_SESSION",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_DEFAULT_SESSION_SCOPES") {
+            cfg.default_session_scopes = value
+                .split(';')
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| match v.trim() {
+                    "diagnostics" => Ok(SessionScope::Diagnostics),
+                    "runtime" => Ok(SessionScope::Runtime),
+                    "agent" => Ok(SessionScope::Agent),
+                    other => Err(ConfigError::InvalidValue {
+                        key: "MAXC_DEFAULT_SESSION_SCOPES",
+                        value: other.to_string(),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
         }
         if let Some(value) = get("MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS") {
             cfg.shutdown_drain_timeout_ms =
@@ -609,6 +782,12 @@ impl BackendConfig {
                 value: self.browser_subscription_limit.to_string(),
             });
         }
+        if self.browser_max_tabs_per_session == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_BROWSER_MAX_TABS_PER_SESSION",
+                value: self.browser_max_tabs_per_session.to_string(),
+            });
+        }
         if self.browser_raw_rate_limit_per_sec == 0 {
             return Err(ConfigError::InvalidValue {
                 key: "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC",
@@ -655,6 +834,48 @@ impl BackendConfig {
             return Err(ConfigError::InvalidValue {
                 key: "MAXC_TERMINAL_MAX_ENV_BYTES",
                 value: self.terminal_max_env_bytes.to_string(),
+            });
+        }
+        if self.agent_max_workers == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_AGENT_MAX_WORKERS",
+                value: self.agent_max_workers.to_string(),
+            });
+        }
+        if self.agent_max_tasks_per_worker == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_AGENT_MAX_TASKS_PER_WORKER",
+                value: self.agent_max_tasks_per_worker.to_string(),
+            });
+        }
+        if self.artifact_max_files == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_ARTIFACT_MAX_FILES",
+                value: self.artifact_max_files.to_string(),
+            });
+        }
+        if self.artifact_max_total_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_ARTIFACT_MAX_TOTAL_BYTES",
+                value: self.artifact_max_total_bytes.to_string(),
+            });
+        }
+        if self.artifact_ttl_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_ARTIFACT_TTL_MS",
+                value: self.artifact_ttl_ms.to_string(),
+            });
+        }
+        if self.artifact_max_files_per_session == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_ARTIFACT_MAX_FILES_PER_SESSION",
+                value: self.artifact_max_files_per_session.to_string(),
+            });
+        }
+        if self.default_session_scopes.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_DEFAULT_SESSION_SCOPES",
+                value: "".to_string(),
             });
         }
         if self.shutdown_drain_timeout_ms == 0 {
@@ -763,6 +984,8 @@ mod tests {
         assert_eq!(cfg.browser_download_max_bytes, 52_428_800);
         assert_eq!(cfg.browser_subscription_limit, 32);
         assert_eq!(cfg.browser_raw_rate_limit_per_sec, 10);
+        assert!(cfg.browser_allow_raw_commands);
+        assert_eq!(cfg.browser_max_tabs_per_session, 16);
         assert_eq!(
             cfg.terminal_runtime,
             if cfg!(windows) {
@@ -779,6 +1002,23 @@ mod tests {
         assert_eq!(cfg.terminal_max_env_bytes, 8_192);
         assert!(cfg.terminal_allowed_cwd_roots.is_empty());
         assert!(cfg.terminal_allowed_programs.is_empty());
+        assert!(cfg.env_allowlist.is_empty());
+        assert!(cfg.agent_allowed_workspace_roots.is_empty());
+        assert!(cfg.agent_allowed_programs.is_empty());
+        assert_eq!(cfg.agent_max_workers, 8);
+        assert_eq!(cfg.agent_max_tasks_per_worker, 8);
+        assert_eq!(cfg.artifact_max_files, 256);
+        assert_eq!(cfg.artifact_max_total_bytes, 268_435_456);
+        assert_eq!(cfg.artifact_ttl_ms, 86_400_000);
+        assert_eq!(cfg.artifact_max_files_per_session, 64);
+        assert_eq!(
+            cfg.default_session_scopes,
+            vec![
+                SessionScope::Diagnostics,
+                SessionScope::Runtime,
+                SessionScope::Agent
+            ]
+        );
         assert_eq!(cfg.shutdown_drain_timeout_ms, 3_000);
         assert_eq!(cfg.overload_reject_threshold, 1_024);
         assert_eq!(cfg.breaker_failure_threshold, 5);
@@ -829,6 +1069,11 @@ mod tests {
             "MAXC_BROWSER_DOWNLOAD_MAX_BYTES" => Some("2048".to_string()),
             "MAXC_BROWSER_SUBSCRIPTION_LIMIT" => Some("9".to_string()),
             "MAXC_BROWSER_RAW_RATE_LIMIT_PER_SEC" => Some("3".to_string()),
+            "MAXC_BROWSER_ALLOW_RAW_COMMANDS" => Some("false".to_string()),
+            "MAXC_BROWSER_ALLOWED_DOWNLOAD_ROOTS" => Some("C:\\downloads".to_string()),
+            "MAXC_BROWSER_ALLOWED_UPLOAD_ROOTS" => Some("C:\\uploads".to_string()),
+            "MAXC_BROWSER_ALLOWED_TRACE_ROOTS" => Some("C:\\traces".to_string()),
+            "MAXC_BROWSER_MAX_TABS_PER_SESSION" => Some("6".to_string()),
             "MAXC_TERMINAL_RUNTIME" => Some("process-stdio".to_string()),
             "MAXC_TERMINAL_MAX_SESSIONS" => Some("13".to_string()),
             "MAXC_TERMINAL_MAX_SESSIONS_PER_WORKSPACE" => Some("5".to_string()),
@@ -838,6 +1083,16 @@ mod tests {
             "MAXC_TERMINAL_MAX_ENV_BYTES" => Some("222".to_string()),
             "MAXC_TERMINAL_ALLOWED_CWD_ROOTS" => Some("C:\\work;D:\\repos".to_string()),
             "MAXC_TERMINAL_ALLOWED_PROGRAMS" => Some("powershell.exe;cmd.exe".to_string()),
+            "MAXC_ENV_ALLOWLIST" => Some("PATH;HOME".to_string()),
+            "MAXC_AGENT_ALLOWED_WORKSPACE_ROOTS" => Some("C:\\workspaces".to_string()),
+            "MAXC_AGENT_ALLOWED_PROGRAMS" => Some("claude.exe;cargo.exe".to_string()),
+            "MAXC_AGENT_MAX_WORKERS" => Some("3".to_string()),
+            "MAXC_AGENT_MAX_TASKS_PER_WORKER" => Some("4".to_string()),
+            "MAXC_ARTIFACT_MAX_FILES" => Some("11".to_string()),
+            "MAXC_ARTIFACT_MAX_TOTAL_BYTES" => Some("9999".to_string()),
+            "MAXC_ARTIFACT_TTL_MS" => Some("5555".to_string()),
+            "MAXC_ARTIFACT_MAX_FILES_PER_SESSION" => Some("5".to_string()),
+            "MAXC_DEFAULT_SESSION_SCOPES" => Some("diagnostics;runtime".to_string()),
             "MAXC_SHUTDOWN_DRAIN_TIMEOUT_MS" => Some("4000".to_string()),
             "MAXC_OVERLOAD_REJECT_THRESHOLD" => Some("77".to_string()),
             "MAXC_BREAKER_FAILURE_THRESHOLD" => Some("8".to_string()),
@@ -873,6 +1128,20 @@ mod tests {
         assert_eq!(cfg.browser_download_max_bytes, 2048);
         assert_eq!(cfg.browser_subscription_limit, 9);
         assert_eq!(cfg.browser_raw_rate_limit_per_sec, 3);
+        assert!(!cfg.browser_allow_raw_commands);
+        assert_eq!(
+            cfg.browser_allowed_download_roots,
+            vec!["C:\\downloads".to_string()]
+        );
+        assert_eq!(
+            cfg.browser_allowed_upload_roots,
+            vec!["C:\\uploads".to_string()]
+        );
+        assert_eq!(
+            cfg.browser_allowed_trace_roots,
+            vec!["C:\\traces".to_string()]
+        );
+        assert_eq!(cfg.browser_max_tabs_per_session, 6);
         assert_eq!(cfg.terminal_runtime, "process-stdio");
         assert_eq!(cfg.terminal_max_sessions, 13);
         assert_eq!(cfg.terminal_max_sessions_per_workspace, 5);
@@ -887,6 +1156,28 @@ mod tests {
         assert_eq!(
             cfg.terminal_allowed_programs,
             vec!["powershell.exe".to_string(), "cmd.exe".to_string()]
+        );
+        assert_eq!(
+            cfg.env_allowlist,
+            vec!["PATH".to_string(), "HOME".to_string()]
+        );
+        assert_eq!(
+            cfg.agent_allowed_workspace_roots,
+            vec!["C:\\workspaces".to_string()]
+        );
+        assert_eq!(
+            cfg.agent_allowed_programs,
+            vec!["claude.exe".to_string(), "cargo.exe".to_string()]
+        );
+        assert_eq!(cfg.agent_max_workers, 3);
+        assert_eq!(cfg.agent_max_tasks_per_worker, 4);
+        assert_eq!(cfg.artifact_max_files, 11);
+        assert_eq!(cfg.artifact_max_total_bytes, 9999);
+        assert_eq!(cfg.artifact_ttl_ms, 5555);
+        assert_eq!(cfg.artifact_max_files_per_session, 5);
+        assert_eq!(
+            cfg.default_session_scopes,
+            vec![SessionScope::Diagnostics, SessionScope::Runtime]
         );
         assert_eq!(cfg.shutdown_drain_timeout_ms, 4000);
         assert_eq!(cfg.overload_reject_threshold, 77);

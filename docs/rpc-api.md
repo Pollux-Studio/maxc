@@ -40,6 +40,7 @@ Error responses:
 
 - `session.create` does not require auth.
 - Most non-session methods require `params.auth.token`.
+- Session responses now include `scopes`; `session.create` may optionally request a narrower `params.scopes` subset.
 - Every mutating command should include a unique `command_id`.
 - Reusing a previous `command_id` returns the stored prior result.
 - Frontends should also keep request `id` values unique per outstanding request.
@@ -69,6 +70,13 @@ Example:
 }
 ```
 
+Scope rules:
+
+- `system.health`: no scope required
+- `system.readiness`, `system.diagnostics`, `system.metrics`, `system.logs`: `diagnostics`
+- `terminal.*`, `browser.*`: `runtime`
+- `agent.*`: `agent`
+
 Successful `terminal.spawn` responses now include additive real-runtime metadata such as `pid`, `program`, `cwd`, `status`, and `runtime`.
 
 ## System Methods
@@ -81,7 +89,7 @@ Successful `terminal.spawn` responses now include additive real-runtime metadata
   - Returns `ready`, `accepting_requests`, `breaker_open`, `queue_saturated`, `store_available`, `browser_runtime_ready`, `terminal_runtime_ready`.
 - `system.diagnostics`
   - Requires auth.
-  - Returns session counts, runtime counts, subscription counts, breaker and shutdown state, and embedded metric snapshots.
+  - Returns session counts, runtime counts, subscription counts, artifact counts, breaker and shutdown state, and embedded metric snapshots.
 - `system.metrics`
   - Requires auth.
   - Returns counters, gauges, and latency summaries.
@@ -170,6 +178,8 @@ Browser runtime notes:
 - `browser.create`, `browser.tab.open`, navigation methods, `browser.evaluate`, and `browser.screenshot` now prefer a real Chromium-backed runtime and return additive fields such as `runtime`, `title`, `load_state`, `artifact_path`, and `artifact_bytes`.
 - When the backend cannot launch a browser in the current environment, browser sessions fall back to a synthetic runtime and continue to preserve the same RPC envelopes.
 - `browser.subscribe` events and `browser.history` entries include ordered `sequence`, `timestamp_ms`, `status`, and `runtime` fields for reconnect-safe redraw.
+- `browser.raw.command` still requires `params.allow_raw=true` and is additionally governed by `MAXC_BROWSER_ALLOW_RAW_COMMANDS`.
+- Upload, download, and trace paths are subject to configured allowlists and bounded artifact retention.
 
 ## Agent Methods
 
@@ -191,6 +201,7 @@ Agent runtime notes:
 - `agent.worker.create` provisions a dedicated terminal-backed worker and returns `agent_worker_id`, `status`, and `terminal_session_id`.
 - `agent.task.start` routes work to the worker terminal and returns `agent_task_id`, `status`, `terminal_session_id`, and the last known terminal output sequence.
 - Browser attachment is exclusive per browser session. A second `agent.attach.browser` against the same `browser_session_id` returns `CONFLICT`.
+- Agent task responses and diagnostics return redacted prompt previews rather than full prompt bodies.
 - `system.diagnostics` now exposes agent workers and tasks in addition to terminal and browser runtime state.
 
 Example:
@@ -214,11 +225,11 @@ Example:
 ## Error Codes
 
 - `INVALID_REQUEST`: malformed JSON, missing fields, bad IDs, or out-of-range request parameters.
-- `UNAUTHORIZED`: missing or invalid token.
+- `UNAUTHORIZED`: missing token, invalid token, expired token, revoked token, or insufficient session scope.
 - `NOT_FOUND`: unknown method or missing runtime object.
 - `CONFLICT`: invalid lifecycle transition or closed resource.
 - `TIMEOUT`: request timed out or response fault path was hit.
-- `RATE_LIMITED`: rate limit, overload limit, breaker-open state, or shutdown reject.
+- `RATE_LIMITED`: rate limit, overload limit, breaker-open state, shutdown reject, or policy/quota rejection.
 - `INTERNAL`: persistence or runtime failure.
 
 ## Proper Usage Rules
