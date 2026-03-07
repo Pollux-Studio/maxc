@@ -70,6 +70,7 @@ async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>
     let mut profile = String::from("ci");
     let mut mode = String::from("synthetic");
     let mut json_output = false;
+    let mut probe_real_browser_runtime = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -84,11 +85,42 @@ async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>
             "--json" => {
                 json_output = true;
             }
+            "--probe-real-browser-runtime" => {
+                probe_real_browser_runtime = true;
+            }
             _ => {}
         }
         idx += 1;
     }
+    if probe_real_browser_runtime {
+        return probe_real_browser_runtime_cli(json_output);
+    }
     execute_suite(&profile, &mode, json_output).await
+}
+
+fn probe_real_browser_runtime_cli(json_output: bool) -> Result<CliRun, Box<dyn std::error::Error>> {
+    let config = BackendConfig::default();
+    let target = probe_real_browser_target(&config);
+    let available = target.is_some();
+    let output = if json_output {
+        Some(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "available": available,
+                "config_value": target.as_ref().map(|target| target.config_value.clone()),
+                "executable": target.as_ref().map(|target| target.executable.clone())
+            }))?
+        ))
+    } else {
+        Some(match target {
+            Some(target) => format!(
+                "available=true config_value={} executable={}\n",
+                target.config_value, target.executable
+            ),
+            None => "available=false\n".to_string(),
+        })
+    };
+    Ok(CliRun { output, pass: true })
 }
 
 async fn execute_suite(
@@ -924,14 +956,17 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
 }
 
 fn pin_real_browser_target(config: &mut BackendConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(target) = browser_launch_targets(config)
-        .into_iter()
-        .find(browser_target_launchable)
-    {
+    if let Some(target) = probe_real_browser_target(config) {
         config.browser_executable_or_channel = target.config_value;
         return Ok(());
     }
     Err("real-runtime browser benchmarks require a launchable local Chromium, Edge, or WebView2 runtime".into())
+}
+
+fn probe_real_browser_target(config: &BackendConfig) -> Option<BrowserLaunchTarget> {
+    browser_launch_targets(config)
+        .into_iter()
+        .find(browser_target_launchable)
 }
 
 fn browser_target_launchable(target: &BrowserLaunchTarget) -> bool {
@@ -1113,6 +1148,16 @@ mod tests {
         assert!(output.contains("\"suite\": \"rpc_health\""));
         assert!(output.contains("\"mode\": \"synthetic\""));
         assert!(output.contains("\"results\""));
+
+        let probe = run_cli(vec![
+            "--probe-real-browser-runtime".to_string(),
+            "--json".to_string(),
+        ])
+        .await
+        .expect("probe");
+        assert!(probe.pass);
+        let probe_output = probe.output.expect("probe output");
+        assert!(probe_output.contains("\"available\""));
     }
 
     #[tokio::test]
@@ -1287,6 +1332,11 @@ mod tests {
         let targets = browser_launch_targets(&cfg);
         assert_eq!(
             targets.first().map(|target| target.config_value.as_str()),
+            Some("webview2")
+        );
+        let probed = probe_real_browser_target(&cfg);
+        assert_eq!(
+            probed.as_ref().map(|target| target.config_value.as_str()),
             Some("webview2")
         );
         let _ = fs::remove_dir_all(temp_dir);
