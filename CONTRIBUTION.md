@@ -174,6 +174,8 @@ You can contribute by:
 * clarifying architecture
 * improving comments in code
 
+Detailed implementation and contributor references are available in [docs/README.md](docs/README.md). When you change behavior, configuration, RPC methods, CLI commands, diagnostics, or operations, update the relevant page in `docs/` in the same change.
+
 # 🧑‍⚖ Code of Conduct
 
 Please be respectful and constructive when interacting with other contributors.
