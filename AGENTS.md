@@ -7,6 +7,7 @@ This repository is currently documentation-first. Top-level files:
 - `CONTRIBUTION.md`: contributor workflow, Rust setup, style, and testing basics.
 - `BRANCHING.md`: branch model and release flow.
 - `LICENSE`: licensing terms.
+- `docs/`: detailed backend documentation, usage, operations, testing, and development workflow.
 
 As implementation code is added, keep modules aligned with the architecture in `README.md` (`core/`, `terminal/`, `browser/`, `automation/`, `ui/`, `notifications/`, `cli/`, `config/`).
 
@@ -53,3 +54,5 @@ PR requirements:
 - Ensure build, format, lint, and tests pass.
 - Include a concise description, linked issue(s), and docs updates when behavior changes.
 - For UI/UX changes, include screenshots or short recordings when applicable.
+
+For detailed implemented backend behavior, CLI/RPC usage, operations, and contributor workflow, refer to `docs/README.md`.

@@ -403,6 +403,10 @@ Notifications and metadata
 * progress tracking
 * sidebar logs
 
+## 📚 Documentation
+
+For detailed backend implementation, RPC usage, CLI commands, operations, testing, and development workflow, see [docs/README.md](docs/README.md).
+
 ## 🤝 Contributing
 
 Contributions are welcome from the community.
