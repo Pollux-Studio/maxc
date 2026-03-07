@@ -38,6 +38,7 @@ struct BenchmarkResult {
 struct BrowserLaunchTarget {
     executable: String,
     config_value: String,
+    runtime: String,
 }
 
 fn is_webview2_executable_path(value: &str) -> bool {
@@ -94,29 +95,31 @@ async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>
         idx += 1;
     }
     if probe_real_browser_runtime {
-        return probe_real_browser_runtime_cli(json_output);
+        return probe_real_browser_runtime_cli(json_output).await;
     }
     execute_suite(&profile, &mode, json_output).await
 }
 
-fn probe_real_browser_runtime_cli(json_output: bool) -> Result<CliRun, Box<dyn std::error::Error>> {
-    let config = BackendConfig::default();
-    let target = probe_real_browser_target(&config);
-    let available = target.is_some();
+async fn probe_real_browser_runtime_cli(
+    json_output: bool,
+) -> Result<CliRun, Box<dyn std::error::Error>> {
+    let runtime = probe_real_browser_runtime(&BackendConfig::default()).await?;
+    let available = runtime.is_some();
     let output = if json_output {
         Some(format!(
             "{}\n",
             serde_json::to_string_pretty(&json!({
                 "available": available,
-                "config_value": target.as_ref().map(|target| target.config_value.clone()),
-                "executable": target.as_ref().map(|target| target.executable.clone())
+                "config_value": runtime.as_ref().map(|value| value.config_value.clone()),
+                "executable": runtime.as_ref().map(|value| value.executable.clone()),
+                "runtime": runtime.as_ref().map(|value| value.runtime.clone())
             }))?
         ))
     } else {
-        Some(match target {
-            Some(target) => format!(
-                "available=true config_value={} executable={}\n",
-                target.config_value, target.executable
+        Some(match runtime {
+            Some(runtime) => format!(
+                "available=true runtime={} config_value={} executable={}\n",
+                runtime.runtime, runtime.config_value, runtime.executable
             ),
             None => "available=false\n".to_string(),
         })
@@ -225,6 +228,12 @@ async fn run_profile(
             "browser_create_latency" | "browser_navigation_latency" | "browser_screenshot_latency"
         ) {
             pin_real_browser_target(&mut config)?;
+            if probe_real_browser_runtime(&config).await?.is_none() {
+                return Err(
+                    "real-runtime browser benchmarks require a backend-confirmed real Chromium, Edge, or WebView2 runtime"
+                        .into(),
+                );
+            }
         }
     }
     let server = RpcServer::new(config)?;
@@ -926,6 +935,7 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
                 vec![BrowserLaunchTarget {
                     executable,
                     config_value: "webview2".to_string(),
+                    runtime: "webview2".to_string(),
                 }]
             })
             .unwrap_or_default();
@@ -938,6 +948,7 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
         return vec![BrowserLaunchTarget {
             executable: configured.to_string(),
             config_value: "webview2".to_string(),
+            runtime: "webview2".to_string(),
         }];
     }
 
@@ -946,6 +957,7 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
         targets.push(BrowserLaunchTarget {
             config_value: executable.clone(),
             executable,
+            runtime: "chromium-cdp".to_string(),
         });
     }
     if let Some(executable) = resolve_webview2_executable() {
@@ -956,6 +968,7 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
             targets.push(BrowserLaunchTarget {
                 executable,
                 config_value: "webview2".to_string(),
+                runtime: "webview2".to_string(),
             });
         }
     }
@@ -974,6 +987,55 @@ fn probe_real_browser_target(config: &BackendConfig) -> Option<BrowserLaunchTarg
     browser_launch_targets(config)
         .into_iter()
         .find(browser_target_launchable)
+}
+
+async fn probe_real_browser_runtime(
+    config: &BackendConfig,
+) -> Result<Option<BrowserLaunchTarget>, Box<dyn std::error::Error>> {
+    let Some(target) = probe_real_browser_target(config) else {
+        return Ok(None);
+    };
+
+    let event_dir = temp_event_dir("real-browser-probe");
+    let mut probe_config = config.clone();
+    probe_config.event_dir = event_dir.to_string_lossy().to_string();
+    probe_config.browser_executable_or_channel = target.config_value.clone();
+
+    let result = async {
+        let server = RpcServer::new(probe_config)?;
+        let token = create_token(&server).await?;
+        let response = issue(
+            &server,
+            0,
+            json!({
+                "id": 1,
+                "method": "browser.create",
+                "params": {
+                    "command_id":"cmd-probe-browser-create",
+                    "workspace_id":"ws-probe",
+                    "surface_id":"sf-probe",
+                    "auth":{"token": token}
+                }
+            }),
+        )
+        .await?;
+        let runtime = response["result"]["runtime"]
+            .as_str()
+            .unwrap_or("browser-simulated");
+        if runtime == "browser-simulated" {
+            Ok(None)
+        } else {
+            Ok(Some(BrowserLaunchTarget {
+                executable: target.executable.clone(),
+                config_value: target.config_value.clone(),
+                runtime: runtime.to_string(),
+            }))
+        }
+    }
+    .await;
+
+    let _ = fs::remove_dir_all(event_dir);
+    result
 }
 
 fn browser_target_launchable(target: &BrowserLaunchTarget) -> bool {
