@@ -5824,9 +5824,10 @@ struct BrowserLaunchTarget {
 }
 
 fn is_webview2_executable_path(value: &str) -> bool {
-    Path::new(value)
-        .file_name()
-        .and_then(|name| name.to_str())
+    let normalized = value.replace('/', "\\");
+    normalized
+        .rsplit('\\')
+        .next()
         .map(|name| name.eq_ignore_ascii_case("msedgewebview2.exe"))
         .unwrap_or(false)
 }
@@ -5838,6 +5839,12 @@ fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerEr
     }
     if configured.eq_ignore_ascii_case("webview2") {
         return resolve_webview2_executable();
+    }
+    if !configured.is_empty()
+        && Path::new(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return Err(ServerError::Internal);
     }
     if !configured.is_empty() && Path::new(configured).exists() {
         return Ok(configured.to_string());
@@ -8261,8 +8268,9 @@ mod tests {
 
     #[test]
     fn explicit_webview2_path_maps_to_webview2_runtime() {
-        let temp_executable =
-            std::env::temp_dir().join(format!("msedgewebview2-{}.exe", now_unix_ms()));
+        let temp_dir = std::env::temp_dir().join(format!("maxc-webview2-{}", now_unix_ms()));
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let temp_executable = temp_dir.join("msedgewebview2.exe");
         fs::write(&temp_executable, b"stub").expect("stub executable");
         let config = BackendConfig {
             browser_executable_or_channel: temp_executable.to_string_lossy().to_string(),
@@ -8273,7 +8281,7 @@ mod tests {
             targets.first().map(|target| target.runtime.as_str()),
             Some("webview2")
         );
-        let _ = fs::remove_file(temp_executable);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]

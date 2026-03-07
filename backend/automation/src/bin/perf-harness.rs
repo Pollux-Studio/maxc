@@ -41,9 +41,10 @@ struct BrowserLaunchTarget {
 }
 
 fn is_webview2_executable_path(value: &str) -> bool {
-    PathBuf::from(value)
-        .file_name()
-        .and_then(|name| name.to_str())
+    let normalized = value.replace('/', "\\");
+    normalized
+        .rsplit('\\')
+        .next()
         .map(|name| name.eq_ignore_ascii_case("msedgewebview2.exe"))
         .unwrap_or(false)
 }
@@ -844,6 +845,12 @@ fn resolve_browser_executable(config: &BackendConfig) -> Option<String> {
     }
     if configured.eq_ignore_ascii_case("webview2") {
         return resolve_webview2_executable();
+    }
+    if !configured.is_empty()
+        && PathBuf::from(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return None;
     }
     if !configured.is_empty() && PathBuf::from(configured).exists() {
         return Some(configured.to_string());
