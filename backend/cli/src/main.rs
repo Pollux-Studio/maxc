@@ -187,12 +187,16 @@ trait RpcTransport {
 }
 
 struct NamedPipeTransport {
+    #[cfg(windows)]
     pipe_name: String,
 }
 
 impl NamedPipeTransport {
     fn new(pipe_name: &str) -> Self {
+        #[cfg(not(windows))]
+        let _ = pipe_name;
         Self {
+            #[cfg(windows)]
             pipe_name: pipe_name.to_string(),
         }
     }
@@ -1397,6 +1401,7 @@ mod tests {
         assert!(second.starts_with("cli-demo-"));
         assert_ne!(first, second);
         assert_eq!(request("system.health", None).method, "system.health");
+        #[cfg(windows)]
         assert!(NamedPipeTransport::new("pipe-demo")
             .pipe_name
             .contains("pipe-demo"));
