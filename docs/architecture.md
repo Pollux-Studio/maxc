@@ -2,60 +2,66 @@
 
 ## High-Level Flow
 
-Client -> CLI or direct JSON-RPC -> `backend/automation` -> validation/auth/routing -> runtime state + event store -> telemetry/metrics -> JSON-RPC response.
+Client or `maxc-cli` -> JSON-RPC request -> `backend/automation` dispatch -> auth, scope, limit, and ownership checks -> runtime execution + event-store persistence -> telemetry/metrics snapshots -> JSON-RPC response.
 
 ## Crate Responsibilities
 
 ### `backend/automation`
 
-- Owns `RpcRequest`, `RpcSuccess`, `RpcErrorCode`, and `RpcServer`.
-- Handles method dispatch, auth checks, idempotency, timeouts, rate limits, overload control, breaker logic, shutdown draining, and diagnostics.
-- Tracks in-memory runtime state for terminal and browser sessions.
-- Exposes perf harness and compatibility tests.
+- Owns `RpcServer`, request validation, method dispatch, and runtime state.
+- Enforces auth scopes, rate limits, overload rejection, breaker behavior, shutdown drain, and fault injection.
+- Runs terminal, browser, and agent workflows.
+- Maintains subscription buffers, history buffers, telemetry snapshots, and perf harness logic.
 
 ### `backend/core`
 
 - Defines typed IDs and `BackendConfig`.
-- Converts environment variables into validated runtime configuration.
+- Parses environment variables into validated runtime configuration.
 
 ### `backend/storage`
 
-- Stores append-only events with checksums and index files.
-- Reconstructs projections for sessions, browser state, and command results.
-- Supports snapshots, replay, and compaction.
+- Implements the append-only event store, snapshots, replay, and command-result idempotency.
+- Restores durable projections for sessions, browser state, terminal state, and agent state.
 
 ### `backend/telemetry`
 
-- Defines structured log records, span records, latency snapshots, metrics snapshots, and an in-memory collector.
+- Defines structured logs, spans, counters, gauges, and latency snapshots.
+- Stores telemetry in-memory for diagnostics RPCs.
 
 ### `backend/cli`
 
-- Parses local commands.
-- Builds JSON-RPC requests.
-- Talks to the local named-pipe server on Windows.
-- Has in-process smoke tests against `RpcServer`.
+- Parses local commands and turns them into JSON-RPC requests.
+- Uses Windows named pipes as the transport.
+- Provides smoke coverage against in-process `RpcServer`.
 
 ## Request Lifecycle
 
-1. `handle_json_line` parses the raw JSON and allocates a correlation ID.
-2. The server records a start log entry.
-3. Size limits, shutdown state, breaker state, and overload limits are checked.
-4. The request is validated and dispatched.
-5. Authenticated methods validate `auth.token`.
-6. Mutating requests enforce idempotency through `command_id`.
-7. State changes are persisted to the event store and applied to the live projection.
-8. Metrics, spans, and completion/error logs are recorded.
+1. `handle_json_line` parses the raw request and allocates a correlation ID.
+2. The server records request-start telemetry.
+3. Payload size, shutdown state, breaker state, connection concurrency, and rate limits are checked.
+4. The method is dispatched to `session.*`, `system.*`, `terminal.*`, `browser.*`, or `agent.*`.
+5. Authenticated methods validate `auth.token` and required scope.
+6. Ownership and policy checks run before runtime work.
+7. Mutating methods use `command_id` for idempotent replay.
+8. Durable changes are appended to the event store and applied to the live projection.
+9. Runtime-specific buffers, logs, spans, and metrics are updated.
+10. A JSON-RPC result or error is returned.
 
-## Reliability and Recovery
+## Durable vs Live State
 
-- Event store replay reconstructs durable state after restart.
-- Shutdown flips the backend into reject-new-work mode, waits for in-flight requests, then clears runtime state.
-- Breaker state opens after repeated internal or timeout failures and blocks further work until cooldown expires.
-- Fault hooks are test-only and target dispatch, persistence, snapshot, and response paths.
+- Durable projection: sessions, browser session metadata, browser tab metadata, terminal metadata, agent workers, agent tasks, and stored command results.
+- Live runtime state: terminal process handles, browser process/page handles, live subscriber queues, breaker counters, in-memory metrics, and telemetry buffers.
+- Recovery reconstructs durable state only. Live runtime counts are rebuilt from current processes, not replayed blindly from the store.
 
-## Observability Flow
+## Runtime Event Model
 
-- Logs are structured and stored in an in-memory ring buffer.
-- Spans track request-level timing and attributes.
-- Metrics track counters, gauges, and latency distributions.
-- `system.metrics` and `system.logs` return snapshots of that in-memory state.
+- Terminal and browser subscriptions use bounded per-session queues.
+- Terminal and browser history APIs return bounded buffered events with `last_sequence` and `has_more`.
+- Agent status is not a separate subscription stream today; frontend should use worker/task reads plus terminal/browser streams.
+
+## Reliability Path
+
+- Breaker opens after repeated internal or timeout faults.
+- Shutdown flips the backend into reject-new-work mode and drains in-flight requests before clearing runtime state.
+- Artifact cleanup runs at startup and after browser artifact writes.
+- Readiness depends on actual runtime and storage dependencies, not only process liveness.

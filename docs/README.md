@@ -1,34 +1,34 @@
 # Documentation
 
-This directory is the source of truth for backend behavior, usage, operations, and development workflow.
+This directory is the backend documentation source of truth. It describes the shipped backend contract, runtime behavior, operations, and development workflow.
 
 ## Start Here
 
-- `backend-overview.md`: what the backend does today.
-- `architecture.md`: crate layout and request/data flow.
-- `rpc-api.md`: JSON-RPC methods, auth, examples, and errors.
-- `frontend-integration.md`: frontend-facing contract, screen flows, polling/subscription expectations, and UI mapping.
-- `cli.md`: CLI commands, flags, examples, and transport behavior.
-- `configuration.md`: environment variables, defaults, and tuning.
-- `operations.md`: health checks, diagnostics, shutdown, recovery, and perf guardrails.
-- `testing.md`: fmt, clippy, tests, coverage, and perf verification.
-- `development.md`: how to extend the backend safely.
+- `backend-overview.md`: backend capabilities and current runtime behavior.
+- `frontend-integration.md`: screen-level frontend contract, reconnect rules, and UI gating.
+- `rpc-api.md`: method-level JSON-RPC contract, scopes, IDs, and error behavior.
+- `operations.md`: readiness, diagnostics, shutdown, recovery, and release checks.
+- `configuration.md`: every `BackendConfig` environment variable and operational meaning.
+- `cli.md`: `maxc-cli` commands, flags, and example backend workflows.
+- `testing.md`: validation commands, perf harness modes, and release gate checks.
+- `architecture.md`: crate responsibilities and request/runtime/persistence flow.
+- `development.md`: how to extend backend behavior and keep docs aligned.
 
-## Quick Usage
+## Recommended Reading Order
 
-Create a session:
+1. Frontend teams: `frontend-integration.md` -> `rpc-api.md` -> `operations.md`
+2. Backend contributors: `backend-overview.md` -> `architecture.md` -> `development.md`
+3. Operators: `operations.md` -> `configuration.md` -> `testing.md`
 
-```bash
-cargo run -p maxc-cli -- session create
-```
-
-Check health:
+## Quick Backend Checks
 
 ```bash
 cargo run -p maxc-cli -- health --pretty
+cargo run -p maxc-cli -- session create
+cargo run -p maxc-cli -- readiness --token <token> --pretty
 ```
 
-Run the backend validation suite:
+## Validation Gate
 
 ```bash
 cargo fmt --check
@@ -37,10 +37,4 @@ cargo test --workspace --all-features --offline
 cargo llvm-cov --workspace --all-features --fail-under-lines 85
 ```
 
-## Frontend Implementation Note
-
-The backend docs are intended to be sufficient for frontend implementation. Start with:
-
-1. `frontend-integration.md` for screen behavior and data flow.
-2. `rpc-api.md` for exact request and error expectations.
-3. `operations.md` for readiness and diagnostics behavior.
+Use `docs/` pages instead of top-level files for detailed backend behavior. Top-level docs should stay summary-level and point here.

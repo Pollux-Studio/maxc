@@ -1,276 +1,275 @@
 # Frontend Integration
 
-This document is the frontend contract for the current backend. Use it with `rpc-api.md`. The goal is to let a frontend team implement screens, request flow, auth flow, and operator tooling without guessing backend behavior.
+This document is the screen-level contract for building a frontend against the backend. Use it together with `rpc-api.md`. The frontend should treat RPC responses, IDs, readiness, errors, and event history as the source of truth.
 
-## Current Backend Boundary
+## Backend Boundary
 
 - The backend exposes a local JSON-RPC service.
-- The backend provides real terminal execution and a real Chromium-backed browser runtime when the environment can launch a browser process.
-- Frontend work should treat the RPC interface, IDs, errors, readiness, and diagnostics behavior as the stable integration surface.
-- Frontend work can rely on real Windows ConPTY-backed terminal execution when `runtime` reports `conpty`, and on real browser execution when browser responses report `runtime: "chromium-cdp"`. The frontend should still treat rendering as driven by RPC events and returned state rather than hidden local state.
+- Terminal execution is real process execution.
+- Browser execution prefers a real Chromium-backed runtime and falls back to a synthetic runtime when the environment cannot launch a browser.
+- Agent workers are backend-managed terminal-backed workers with optional browser attachment.
+- Frontend should never rely on hidden local process or browser state. It should render from RPC responses, history APIs, and subscription events.
 
-## Core Frontend Flows
+## Required Frontend Startup Flow
 
-### 1. App startup
+1. Call `system.health` to confirm the backend process is reachable.
+2. Call `session.create`.
+3. Store the returned `token`, `scopes`, and expiry values.
+4. Call `system.readiness` before enabling any mutating action.
+5. Enable only the UI features allowed by both `scopes` and readiness.
 
-1. Check backend reachability with `system.health`.
-2. Create a session with `session.create`.
-3. Store the returned token and `scopes` in frontend runtime state.
-4. Call `system.readiness` before enabling terminal, browser, or diagnostics actions.
+### Action gates
 
-Disable mutating controls when:
-
-- `system.health` fails
+Disable mutating actions when any of these is true:
 - `system.readiness.ready` is `false`
-- `system.readiness.accepting_requests` is `false`
-- `system.readiness.breaker_open` is `true`
-- `system.readiness.queue_saturated` is `true`
-- `system.readiness.browser_runtime_ready` is `false` for browser actions
-- `system.readiness.terminal_runtime_ready` is `false` for terminal or agent actions
-- `system.readiness.artifact_root_ready` is `false` for browser screenshot/download/trace actions
-- `system.readiness.event_store_ready` is `false` for any mutating flow that must persist state
+- `accepting_requests` is `false`
+- `breaker_open` is `true`
+- `queue_saturated` is `true`
+- `terminal_runtime_ready` is `false` for terminal and agent actions
+- `browser_runtime_ready` is `false` for browser actions
+- `artifact_root_ready` is `false` for screenshot, download, and trace actions
+- `event_store_ready` is `false` for any workflow that must persist state
 
-### 2. Session lifecycle
+Also hide or disable features when the token lacks the required scope:
+- diagnostics pages need `diagnostics`
+- terminal and browser screens need `runtime`
+- agent screens need `agent`
 
-- `session.create` creates a token for authenticated methods.
-- `session.create` returns token `scopes`; the frontend should use them to hide actions the token cannot perform.
-- `session.refresh` replaces or extends session validity.
-- `session.revoke` invalidates the token.
-- On `UNAUTHORIZED`, the frontend should clear the stored token, create a new session, and retry only if the action is safe to retry.
+## Frontend State Model
 
-### 3. Terminal screen flow
+Keep this state at minimum:
 
-1. Call `terminal.spawn`.
-2. Render the returned `terminal_session_id` in the UI state for that workspace/surface.
-3. Send keystrokes or pasted text with `terminal.input`.
-4. Send viewport changes with `terminal.resize`.
-5. Use `terminal.subscribe` to keep the terminal panel updated.
-6. Use `terminal.history` after reconnects or redraws to recover buffered output from the last known sequence.
-7. Call `terminal.kill` when the user closes the surface or stops the terminal.
+### Global app state
+- current session `token`
+- current token `scopes`
+- session expiry time
+- latest `system.health`
+- latest `system.readiness`
+- last diagnostics refresh time
 
-Frontend state should track:
-
+### Terminal pane state
 - `workspace_id`
 - `surface_id`
 - `terminal_session_id`
-- current size in `cols` and `rows`
-- subscription status
-- last terminal event timestamp
-- last terminal event sequence
+- `subscriber_id`
+- `cols`
+- `rows`
+- last seen terminal `sequence`
+- last seen terminal `timestamp_ms`
+- current runtime `status`
+- current runtime `runtime`
+- degraded flag and last error
 
-### 4. Browser screen flow
-
-1. Call `browser.create`.
-2. Store `browser_session_id`.
-3. Open a tab with `browser.tab.open`.
-4. Store `tab_id` and focused tab state.
-5. Navigate with `browser.goto`, `browser.reload`, `browser.back`, and `browser.forward`.
-6. Use action methods such as `browser.click`, `browser.type`, `browser.key`, and `browser.wait`.
-7. Use `browser.subscribe` to update the browser panel state.
-8. Use `browser.history` after reconnects or detected sequence gaps to recover buffered browser events.
-9. Close tabs with `browser.tab.close` and sessions with `browser.close`.
-
-Frontend state should track:
-
+### Browser pane state
 - `workspace_id`
 - `surface_id`
 - `browser_session_id`
-- active `tab_id`
-- tab list
-- last known URL
-- loading state
-- subscription status
-- last browser event timestamp
-- last browser event sequence
+- focused `tab_id`
+- known tab list
+- `subscriber_id`
+- last seen browser `sequence`
+- last seen browser `timestamp_ms`
+- current browser `status`
+- current browser `runtime`
+- current `url`, `title`, and `load_state`
+- degraded flag and last error
 
-### 5. Agent screen flow
-
-1. Call `agent.worker.create` to provision a worker with its own terminal session.
-2. Store `agent_worker_id` and the returned `terminal_session_id`.
-3. Optionally attach a browser session with `agent.attach.browser`.
-4. Start work with `agent.task.start`.
-5. Use `agent.worker.get`, `agent.task.get`, `system.diagnostics`, and the terminal/browser subscriptions to render current worker state.
-6. Cancel work with `agent.task.cancel` or close the worker with `agent.worker.close`.
-
-Frontend state should track:
-
+### Agent pane state
+- `workspace_id`
+- `surface_id`
 - `agent_worker_id`
-- `agent_task_id`
-- assigned `terminal_session_id`
-- optional `browser_session_id`
+- optional `agent_task_id`
+- owned `terminal_session_id`
+- optional owned `browser_session_id`
 - worker `status`
 - task `status`
-- last terminal output sequence
+- last terminal output `sequence`
 - failure reason if present
 
-### 5. Diagnostics and operator views
+## Request Rules
 
-Use:
+### IDs
+- Generate a unique request `id` for every outstanding frontend request.
+- Generate a fresh `command_id` for every mutating user action.
+- Reuse a `command_id` only when intentionally retrying the exact same mutation.
+- Preserve all returned backend IDs exactly.
 
-- `system.health` for liveness
-- `system.readiness` for action gating
-- `system.diagnostics` for broad backend state
-- `system.metrics` for charts and counters
-- `system.logs` for recent structured events
+### Auth
+- Put the token in `params.auth.token` for every authenticated method.
+- If a token is refreshed, replace the stored token and scopes immediately.
 
-Recommended screen split:
+## Terminal Screen Contract
 
+### Create flow
+1. Call `terminal.spawn` with `workspace_id`, `surface_id`, `cols`, and `rows`.
+2. Store `terminal_session_id`, `pid`, `status`, `runtime`, `cols`, and `rows` from the result.
+3. Call `terminal.subscribe`.
+4. Store `subscriber_id`, initial queued `events`, `dropped_events`, and `last_sequence`.
+5. Render the initial terminal state from the returned event list.
+
+### Live interaction
+- Send user input through `terminal.input`.
+- Send viewport changes through `terminal.resize`.
+- Update pane state from subscription events and mutation responses.
+- `terminal.resize.applied` tells the UI whether the resize reached the runtime. Do not assume success from the request alone.
+
+### Reconnect and redraw
+1. Detect reconnect need when the subscription disconnects, the pane is restored, or the next event sequence is not exactly `last_sequence + 1`.
+2. Mark the pane degraded, but keep it visible.
+3. Call `terminal.history` with `from_sequence` set to the last seen sequence plus one.
+4. Append returned `events` in order.
+5. Update `last_sequence` from the history result.
+6. Re-run `terminal.subscribe` and continue streaming.
+
+### Close flow
+- Call `terminal.kill` when the user closes a terminal surface or explicitly stops it.
+- Treat `status` and `exit_code` from `terminal.history` or later events as the source of truth for termination state.
+
+## Browser Screen Contract
+
+### Create flow
+1. Call `browser.create`.
+2. Store `browser_session_id`, `runtime`, `status`, `attached`, and any returned runtime metadata.
+3. Call `browser.subscribe`.
+4. Store `subscriber_id`, initial `events`, `dropped_events`, and `last_sequence`.
+5. Open a first tab with `browser.tab.open`.
+6. Store `browser_tab_id`, `url`, `title`, `load_state`, and `status`.
+
+### Live interaction
+- Use `browser.goto`, `reload`, `back`, `forward` for navigation.
+- Use `browser.click`, `type`, `key`, and `wait` for automation.
+- Use `browser.evaluate`, `cookie.*`, `storage.*`, `network.intercept`, `upload`, `download`, `trace.*`, and `screenshot` as advanced actions.
+- Treat returned `runtime`, `status`, `url`, `title`, `load_state`, `artifact_path`, and `artifact_bytes` as authoritative.
+
+### Reconnect and redraw
+1. Detect reconnect need on subscription loss or sequence gap.
+2. Mark the browser pane degraded.
+3. Call `browser.history` with `from_sequence` set to the last seen sequence plus one.
+4. Append returned events in order.
+5. Update stored `last_sequence`.
+6. Re-run `browser.subscribe`.
+7. Use current pane state plus the recovered events to rebuild tab/UI state.
+
+### Runtime fallback handling
+- If browser responses report a synthetic runtime, the frontend should still work against the same method names and event shapes.
+- Gate browser features from `system.readiness.browser_runtime_ready`, not from assumptions about the local environment.
+
+## Agent Screen Contract
+
+### Create and run flow
+1. Call `agent.worker.create`.
+2. Store `agent_worker_id`, `terminal_session_id`, optional `browser_session_id`, and worker `status`.
+3. If the user wants browser access, call `agent.attach.browser` with the target `browser_session_id`.
+4. Start work with `agent.task.start`.
+5. Store `agent_task_id`, task `status`, `terminal_session_id`, optional `browser_session_id`, and `last_output_sequence`.
+6. Render task progress using `agent.worker.get`, `agent.task.get`, terminal output, browser state, and diagnostics.
+
+### Ownership rules
+- A worker owns one primary terminal session.
+- Browser attachment is exclusive by default. A second worker attempting to attach the same browser session receives `CONFLICT`.
+- Frontend must represent ownership conflicts as current-state problems, not generic failures.
+
+### Cancel and close
+- Use `agent.task.cancel` to stop the current task.
+- Use `agent.worker.close` to close the worker and terminate its primary terminal.
+- When a worker closes, clear stored worker/task state from the frontend surface after the backend confirms closure.
+
+## Diagnostics and Operator Views
+
+Recommended screens:
 - status bar: `system.health` + `system.readiness`
 - diagnostics page: `system.diagnostics`
 - metrics page: `system.metrics`
-- recent activity page: `system.logs`
+- logs page: `system.logs`
 
-## Request Contract
+Recommended polling:
+- `system.health`: every 5 to 10 seconds
+- `system.readiness`: every 5 seconds and after any surfaced backend error
+- `system.metrics`: every 5 to 15 seconds on metrics screens
+- `system.diagnostics`: every 10 to 30 seconds or on manual refresh
+- `system.logs`: every 3 to 5 seconds on an active logs page
 
-### Envelope
+## Error Handling Contract
 
-Every request should follow:
+### `INVALID_REQUEST`
+- Treat as a client bug or invalid user input.
+- Show a field-level or action-level validation message.
+- Do not auto-retry.
 
-```json
-{
-  "id": "req-ui-1",
-  "method": "system.readiness",
-  "params": {
-    "auth": {
-      "token": "<token>"
-    }
-  }
-}
-```
+### `UNAUTHORIZED`
+- Treat as missing, expired, revoked, or scope-insufficient session state.
+- Clear invalid session state.
+- Recreate or refresh the session before retrying.
+- Hide actions the current token cannot perform.
 
-Rules:
+### `NOT_FOUND`
+- Treat as stale frontend state.
+- Refresh the affected runtime object or parent view.
+- Do not repeatedly retry the same stale mutation.
 
-- `id` must be unique per outstanding request from the frontend.
-- Mutating methods should include a unique `command_id`.
-- Authenticated methods require `params.auth.token`.
-- Stable typed IDs should be preserved exactly as returned by the backend.
+### `CONFLICT`
+- Treat as a lifecycle or ownership conflict.
+- Refresh current runtime state.
+- Disable the impossible action until the state changes.
 
-### Command IDs
+### `TIMEOUT`
+- Treat as unknown mutation outcome.
+- Show retry affordance.
+- If the original action had a `command_id`, retry only by replaying the exact same logical action.
 
-Use a fresh `command_id` for each user action or automation action. Good patterns:
+### `RATE_LIMITED`
+- Treat as overload, breaker-open, shutdown reject, or policy/quota rejection.
+- Check readiness and diagnostics before retrying.
+- Back off and avoid automatic repeated retries.
 
-- `ui-terminal-spawn-<uuid>`
-- `ui-browser-goto-<uuid>`
-- `ui-session-refresh-<uuid>`
+### `INTERNAL`
+- Treat as backend failure.
+- Preserve `correlation_id` for debugging.
+- Offer diagnostics navigation.
 
-Do not reuse `command_id` across unrelated actions. Reuse only when intentionally retrying the exact same mutation and expecting idempotent replay.
+## Example Screen Flows
 
-### Error Handling Contract
+### Terminal pane
+1. `session.create`
+2. `system.readiness`
+3. `terminal.spawn`
+4. `terminal.subscribe`
+5. `terminal.input`
+6. `terminal.history` on reconnect
+7. `terminal.kill`
 
-Map backend errors to frontend behavior:
+### Browser pane
+1. `session.create`
+2. `system.readiness`
+3. `browser.create`
+4. `browser.subscribe`
+5. `browser.tab.open`
+6. `browser.goto`
+7. `browser.history` on reconnect
+8. `browser.close`
 
-- `INVALID_REQUEST`: validation problem; show actionable input error.
-- `UNAUTHORIZED`: session missing or expired; clear token and re-authenticate.
-- `NOT_FOUND`: stale UI state; refresh the affected runtime object.
-- `CONFLICT`: invalid lifecycle action or exclusive resource ownership; refresh object state and disable impossible action.
-- `TIMEOUT`: show retry affordance; do not assume mutation succeeded unless command replay confirms it.
-- `RATE_LIMITED`: backend overloaded, breaker open, shutting down, or blocked by configured policy/quota; disable repeated retries and surface backend state.
-- `INTERNAL`: backend fault; show diagnostics link and preserve correlation data if present.
+### Agent pane
+1. `session.create`
+2. `system.readiness`
+3. `agent.worker.create`
+4. optional `agent.attach.browser`
+5. `agent.task.start`
+6. `agent.task.get` or `agent.worker.get` during execution
+7. `agent.task.cancel` or `agent.worker.close`
 
-### Polling and Subscriptions
+### Diagnostics page
+1. `session.create` with diagnostics scope or default scopes
+2. `system.readiness`
+3. `system.diagnostics`
+4. `system.metrics`
+5. `system.logs`
 
-Use this model:
+## Frontend Rules That Must Hold
 
-- `system.health`: poll every 5-10 seconds
-- `system.readiness`: poll every 5 seconds and after every surfaced backend error
-- `system.metrics`: poll every 5-15 seconds on diagnostics screens
-- `system.diagnostics`: poll every 10-30 seconds or refresh on demand
-- `system.logs`: poll every 3-5 seconds on an active logs screen
-- `terminal.subscribe` and `browser.subscribe`: keep active while the matching panel is visible
-- `terminal.history`: call on reconnect, restore, or detected sequence gap
-- `browser.history`: call on reconnect, restore, or detected sequence gap
-
-If a subscription fails:
-
-1. keep the surface visible
-2. mark it degraded
-3. offer reconnect
-4. call `terminal.history` from the last known sequence for redraw
-5. call `browser.history` from the last known sequence for browser redraw if needed
-6. continue limited polling from diagnostics if available
-
-## UI State Mapping
-
-### Terminal panel
-
-Display at minimum:
-
-- session identifier
-- connection state
-- current dimensions
-- last activity time
-- latest event/error badge
-
-Actions:
-
-- spawn
-- send input
-- resize
-- reconnect subscription
-- kill
-
-### Browser panel
-
-Display at minimum:
-
-- browser session identifier
-- active tab identifier
-- tab list
-- URL
-- loading/idle state
-- latest event/error badge
-
-Actions:
-
-- create browser
-- open/focus/close tab
-- goto/back/forward/reload
-- click/type/key/wait
-- screenshot and evaluate if exposed in the UI
-- reconnect subscription
-- close browser
-
-### Diagnostics UI
-
-Display at minimum:
-
-- health status
-- readiness status
-- breaker state
-- shutdown state
-- queue saturation
-- active request count
-- session/runtime/subscription counts
-- recent logs
-- key counters and latency summaries
-
-## Frontend Safety Rules
-
-- Never treat `system.health` as permission to enable all actions.
-- Always gate user actions with `system.readiness` for authenticated workload.
-- Preserve and reuse backend IDs exactly.
-- Keep correlation IDs from errors visible in developer tools or debug panels.
-- Avoid automatic infinite retries on `RATE_LIMITED`, `TIMEOUT`, or `INTERNAL`.
-- Treat `UNAUTHORIZED` as a session-state transition, not as a generic transient network error.
-
-## Minimum Frontend Implementation Checklist
-
-- create and store a session token
-- call readiness before enabling mutating actions
-- support terminal lifecycle methods
-- support browser lifecycle, tab, and navigation methods
-- support browser history recovery
-- support agent worker/task lifecycle and ownership state
-- expose diagnostics, metrics, and logs views
-- handle every documented error code
-- generate unique `id` and `command_id` values
-- show degraded state for breaker-open, queue saturation, and shutdown
-- show degraded state when readiness reports missing runtime or storage dependencies
-
-## Known Backend Limits
-
-- Terminal sessions now run real local processes and stream real output through `terminal.subscribe`.
-- Browser sessions prefer the real Chromium-backed runtime and fall back to a synthetic session only when the backend cannot launch a browser in the current environment.
-- Frontend should read `system.readiness` instead of inferring runtime availability from optimistic UI state. Browser, artifact, and storage dependency failures are surfaced explicitly there.
-- Non-Windows named-pipe transport is not implemented in the CLI.
-- The frontend should build against the RPC contract, not hidden assumptions about process or browser embedding internals.
+- Never gate features from `system.health` alone.
+- Always preserve backend IDs exactly.
+- Always track last seen `sequence` for terminal and browser panes.
+- Always use history APIs for reconnect or sequence gaps.
+- Never assume a browser attachment is shareable across workers.
+- Never treat `RATE_LIMITED` as a generic transient network error.
+- Build against the backend contract, not assumptions about local process embedding or browser rendering internals.

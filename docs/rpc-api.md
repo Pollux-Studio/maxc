@@ -1,6 +1,10 @@
 # RPC API
 
-All requests use JSON-RPC-style envelopes:
+All backend requests use a JSON-RPC-style envelope.
+
+## Envelope
+
+Request:
 
 ```json
 {
@@ -10,7 +14,7 @@ All requests use JSON-RPC-style envelopes:
 }
 ```
 
-Success responses:
+Success response:
 
 ```json
 {
@@ -21,7 +25,7 @@ Success responses:
 }
 ```
 
-Error responses:
+Error response:
 
 ```json
 {
@@ -36,124 +40,309 @@ Error responses:
 }
 ```
 
-## Auth and Idempotency
+## Common Rules
 
-- `session.create` does not require auth.
-- Most non-session methods require `params.auth.token`.
-- Session responses now include `scopes`; `session.create` may optionally request a narrower `params.scopes` subset.
-- Every mutating command should include a unique `command_id`.
-- Reusing a previous `command_id` returns the stored prior result.
-- Frontends should also keep request `id` values unique per outstanding request.
+- `id` must be unique per outstanding client request.
+- Every mutating method should include a unique `command_id`.
+- Reusing the same `command_id` for the same logical mutation returns the stored prior result.
+- Preserve all backend IDs exactly as returned.
+- `workspace_id` and `surface_id` are required on runtime methods.
 
-## Request Rules
+## Auth and Scopes
 
-- Preserve backend IDs exactly as returned.
-- Include `workspace_id` and `surface_id` on terminal and browser runtime calls.
-- Treat `command_id` as required for all mutating frontend actions, even if a local tool could omit it.
-- Use `system.readiness` to gate UI actions instead of relying on `system.health`.
+- `session.create`: no auth required
+- `session.refresh`, `session.revoke`: require `auth.token`
+- `system.health`: no auth required
+- `system.readiness`, `system.diagnostics`, `system.metrics`, `system.logs`: require `diagnostics` scope
+- `terminal.*`, `browser.*`: require `runtime` scope
+- `agent.*`: require `agent` scope
+
+`session.create` may request a narrower scope set through `params.scopes`. `session.refresh` may narrow to a subset of the current token scopes.
 
 ## Session Methods
 
-- `session.create`
-- `session.refresh`
-- `session.revoke`
+### `session.create`
 
-Example:
+Required params:
+- `command_id`
 
-```json
-{
-  "id": 1,
-  "method": "session.create",
-  "params": {
-    "command_id": "cmd-session-1"
-  }
-}
-```
+Optional params:
+- `scopes`: subset of configured default scopes
 
-Scope rules:
+Returns:
+- `token`
+- `scopes`
+- `issued_at_ms`
+- `expires_at_ms`
 
-- `system.health`: no scope required
-- `system.readiness`, `system.diagnostics`, `system.metrics`, `system.logs`: `diagnostics`
-- `terminal.*`, `browser.*`: `runtime`
-- `agent.*`: `agent`
+### `session.refresh`
 
-Successful `terminal.spawn` responses now include additive real-runtime metadata such as `pid`, `program`, `cwd`, `status`, and `runtime`.
+Required params:
+- `command_id`
+- `auth.token`
+
+Optional params:
+- `scopes`: subset of the existing token scopes
+
+Returns:
+- `token`
+- `scopes`
+- `expires_at_ms`
+
+### `session.revoke`
+
+Required params:
+- `command_id`
+- `auth.token`
+
+Returns:
+- `revoked`
 
 ## System Methods
 
-- `system.health`
-  - No auth required.
-  - Returns `ok`, `version`, `shutting_down`, `breaker_open`, `active_requests`, `uptime_ms`.
-- `system.readiness`
-  - Requires auth.
-  - Returns `ready`, `accepting_requests`, `breaker_open`, `queue_saturated`, `store_available`, `browser_runtime_ready`, `terminal_runtime_ready`.
-- `system.diagnostics`
-  - Requires auth.
-  - Returns session counts, runtime counts, subscription counts, artifact counts, breaker and shutdown state, and embedded metric snapshots.
-- `system.metrics`
-  - Requires auth.
-  - Returns counters, gauges, and latency summaries.
-- `system.logs`
-  - Requires auth.
-  - Returns recent structured logs and spans.
+### `system.health`
+
+No auth required.
+
+Returns:
+- `ok`
+- `version`
+- `shutting_down`
+- `breaker_open`
+- `active_requests`
+- `uptime_ms`
+
+### `system.readiness`
+
+Requires `diagnostics` scope.
+
+Returns:
+- `ready`
+- `accepting_requests`
+- `breaker_open`
+- `queue_saturated`
+- `store_available`
+- `browser_runtime_ready`
+- `terminal_runtime_ready`
+- `artifact_root_ready`
+- `event_store_ready`
+
+Use this as the action gate for frontend and automation work.
+
+### `system.diagnostics`
+
+Requires `diagnostics` scope.
+
+Returns aggregated backend state, including:
+- session counts
+- browser session and tab counts
+- terminal, browser, and agent live runtime counts
+- runtime backend names
+- browser runtime snapshots
+- agent worker and task snapshots
+- subscription counts
+- terminal and browser history buffer usage
+- artifact counts and bytes
+- dependency readiness flags
+- `active_requests`, `shutting_down`, `breaker_open`
+- embedded metrics snapshot
+
+### `system.metrics`
+
+Requires `diagnostics` scope.
+
+Returns a telemetry snapshot with:
+- `counters`
+- `gauges`
+- `latencies`
+
+Important gauges include:
+- `rpc.active_requests`
+- `runtime.terminal.sessions`
+- `runtime.browser.sessions`
+- `runtime.agent.workers`
+- `runtime.agent.tasks`
+- `runtime.browser.ready`
+- `runtime.terminal.ready`
+- `runtime.artifacts.ready`
+- `storage.event_dir.ready`
+- artifact file and byte counts
+
+### `system.logs`
+
+Requires `diagnostics` scope.
+
+Returns the in-memory telemetry snapshot with structured `logs` and `spans`.
 
 ## Terminal Methods
 
-- `terminal.spawn`
-- `terminal.input`
-- `terminal.resize`
-- `terminal.history`
-- `terminal.kill`
-- `terminal.subscribe`
+### `terminal.spawn`
 
-Terminal runtime notes:
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `auth.token`
 
-- `terminal.spawn` responses include additive metadata such as `pid`, `program`, `cwd`, `status`, and `runtime`.
-- `terminal.subscribe` events include additive metadata such as `sequence`, `timestamp_ms`, `status`, and `runtime`.
-- `terminal.history` returns buffered terminal events for reconnect and redraw flows.
+Optional params:
+- `shell`
+- `program`
+- `args`
+- `cwd`
+- `env`
+- `cols`
+- `rows`
 
-Example:
+Returns additive runtime metadata such as:
+- `terminal_session_id`
+- `pid`
+- `program`
+- `cwd`
+- `status`
+- `runtime`
+- `cols`
+- `rows`
 
-```json
-{
-  "id": 2,
-  "method": "terminal.spawn",
-  "params": {
-    "command_id": "cmd-term-1",
-    "workspace_id": "ws-1",
-    "surface_id": "sf-1",
-    "cols": 120,
-    "rows": 30,
-    "auth": { "token": "<session-token>" }
-  }
-}
-```
+### `terminal.input`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `terminal_session_id`
+- `auth.token`
+- `input`
+
+Returns:
+- `accepted`
+- `bytes`
+- `terminal_session_id`
+- `status`
+
+### `terminal.resize`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `terminal_session_id`
+- `auth.token`
+- `cols`
+- `rows`
+
+Returns:
+- `terminal_session_id`
+- `cols`
+- `rows`
+- `applied`
+- `status`
+
+### `terminal.history`
+
+Required params:
+- `workspace_id`
+- `surface_id`
+- `terminal_session_id`
+- `auth.token`
+
+Optional params:
+- `command_id`
+- `from_sequence`
+- `max_events`
+
+Returns:
+- `terminal_session_id`
+- `runtime`
+- `status`
+- `pid`
+- `cols`
+- `rows`
+- `last_sequence`
+- `events`
+- `has_more`
+- `exit_code`
+
+### `terminal.subscribe`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `terminal_session_id`
+- `auth.token`
+
+Returns:
+- `subscribed`
+- `terminal_session_id`
+- `subscriber_id`
+- `events`
+- `dropped_events`
+- `last_sequence`
+
+Terminal events are ordered and include additive fields such as:
+- `type`
+- `sequence`
+- `timestamp_ms`
+- `status`
+- `runtime`
+
+### `terminal.kill`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `terminal_session_id`
+- `auth.token`
+
+Returns:
+- `killed`
+- `terminal_session_id`
+- `status`
 
 ## Browser Methods
 
-Lifecycle:
+### Lifecycle
 
 - `browser.create`
 - `browser.attach`
 - `browser.detach`
 - `browser.close`
 
-Tabs:
+`browser.create` requires `command_id`, `workspace_id`, `surface_id`, and `auth.token`.
+
+Typical create result fields:
+- `browser_session_id`
+- `runtime`
+- `status`
+- `attached`
+- `closed`
+- `executable`
+
+### Tabs
 
 - `browser.tab.open`
 - `browser.tab.list`
 - `browser.tab.focus`
 - `browser.tab.close`
 
-Navigation:
+`browser.tab.open` requires `browser_session_id`, `workspace_id`, `surface_id`, `auth.token`, and optional `url`.
+
+Typical tab result fields:
+- `browser_tab_id`
+- `browser_session_id`
+- `url`
+- `title`
+- `load_state`
+- `status`
+- `runtime`
+
+### Navigation and automation
 
 - `browser.goto`
 - `browser.reload`
 - `browser.back`
 - `browser.forward`
-
-Automation:
-
 - `browser.click`
 - `browser.type`
 - `browser.key`
@@ -169,74 +358,190 @@ Automation:
 - `browser.download`
 - `browser.trace.start`
 - `browser.trace.stop`
-- `browser.history`
-- `browser.subscribe`
 - `browser.raw.command`
 
-Browser runtime notes:
+Most browser mutation methods require:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `browser_session_id`
+- `auth.token`
 
-- `browser.create`, `browser.tab.open`, navigation methods, `browser.evaluate`, and `browser.screenshot` now prefer a real Chromium-backed runtime and return additive fields such as `runtime`, `title`, `load_state`, `artifact_path`, and `artifact_bytes`.
-- When the backend cannot launch a browser in the current environment, browser sessions fall back to a synthetic runtime and continue to preserve the same RPC envelopes.
-- `browser.subscribe` events and `browser.history` entries include ordered `sequence`, `timestamp_ms`, `status`, and `runtime` fields for reconnect-safe redraw.
-- `browser.raw.command` still requires `params.allow_raw=true` and is additionally governed by `MAXC_BROWSER_ALLOW_RAW_COMMANDS`.
-- Upload, download, and trace paths are subject to configured allowlists and bounded artifact retention.
+Tab-targeted methods also require `tab_id`.
+
+Additive result fields vary by method and can include:
+- `runtime`
+- `status`
+- `url`
+- `title`
+- `load_state`
+- `artifact_path`
+- `artifact_bytes`
+- `attached`
+- `closed`
+
+`browser.raw.command` additionally requires `allow_raw: true` and is still governed by backend policy.
+
+### `browser.history`
+
+Required params:
+- `workspace_id`
+- `surface_id`
+- `browser_session_id`
+- `auth.token`
+
+Optional params:
+- `command_id`
+- `from_sequence`
+- `max_events`
+
+Returns:
+- `browser_session_id`
+- `runtime`
+- `status`
+- `last_sequence`
+- `events`
+- `has_more`
+- `attached`
+- `closed`
+
+### `browser.subscribe`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `browser_session_id`
+- `auth.token`
+
+Returns:
+- `subscribed`
+- `browser_session_id`
+- `subscriber_id`
+- `events`
+- `dropped_events`
+- `last_sequence`
+
+Browser events are ordered and include additive fields such as:
+- `type`
+- `sequence`
+- `timestamp_ms`
+- `status`
+- `runtime`
+- `url`
+- `title`
+- `load_state`
 
 ## Agent Methods
 
-- `agent.worker.create`
-- `agent.worker.list`
-- `agent.worker.get`
-- `agent.worker.close`
-- `agent.task.start`
-- `agent.task.list`
-- `agent.task.get`
-- `agent.task.cancel`
+### `agent.worker.create`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `auth.token`
+
+Optional params are passed through terminal spawn policy, such as `shell`, `program`, `args`, `cwd`, `env`, and optional `browser_session_id`.
+
+Returns:
+- `agent_worker_id`
+- `workspace_id`
+- `surface_id`
+- `status`
+- `terminal_session_id`
+- `browser_session_id`
+
+### `agent.worker.list` and `agent.worker.get`
+
+Require:
+- `workspace_id`
+- `surface_id`
+- `auth.token`
+
+`agent.worker.get` also requires `agent_worker_id`.
+
+Worker payloads include:
+- `agent_worker_id`
+- `status`
+- `terminal_session_id`
+- `browser_session_id`
+- `current_task_id`
+- `closed`
+
+### `agent.task.start`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `agent_worker_id`
+- `auth.token`
+- `prompt` or `input`
+
+Returns:
+- `agent_task_id`
+- `agent_worker_id`
+- `status`
+- `terminal_session_id`
+- `browser_session_id`
+- `last_output_sequence`
+- redacted `prompt_preview`
+
+### `agent.task.list` and `agent.task.get`
+
+Require:
+- `workspace_id`
+- `surface_id`
+- `auth.token`
+
+`agent.task.get` requires `agent_task_id` and may include `agent_worker_id`.
+
+Task payloads include:
+- `agent_task_id`
+- `agent_worker_id`
+- `status`
+- `terminal_session_id`
+- `browser_session_id`
+- `last_output_sequence`
+- `failure_reason`
+- redacted `prompt` and `prompt_preview`
+
+### `agent.task.cancel`
+
+Required params:
+- `command_id`
+- `workspace_id`
+- `surface_id`
+- `agent_task_id`
+- `auth.token`
+
+Optional params:
+- `reason`
+
+### Attach and detach
+
 - `agent.attach.terminal`
 - `agent.detach.terminal`
 - `agent.attach.browser`
 - `agent.detach.browser`
 
-Agent runtime notes:
-
-- `agent.worker.create` provisions a dedicated terminal-backed worker and returns `agent_worker_id`, `status`, and `terminal_session_id`.
-- `agent.task.start` routes work to the worker terminal and returns `agent_task_id`, `status`, `terminal_session_id`, and the last known terminal output sequence.
-- Browser attachment is exclusive per browser session. A second `agent.attach.browser` against the same `browser_session_id` returns `CONFLICT`.
-- Agent task responses and diagnostics return redacted prompt previews rather than full prompt bodies.
-- `system.diagnostics` now exposes agent workers and tasks in addition to terminal and browser runtime state.
-
-Example:
-
-```json
-{
-  "id": 3,
-  "method": "browser.goto",
-  "params": {
-    "command_id": "cmd-browser-goto-1",
-    "workspace_id": "ws-1",
-    "surface_id": "sf-1",
-    "browser_session_id": "bs-123",
-    "tab_id": "tab-123",
-    "url": "https://example.com",
-    "auth": { "token": "<session-token>" }
-  }
-}
-```
+These methods require the matching worker ID plus the delegated resource ID when attaching. Browser attachment is exclusive and returns `CONFLICT` when already owned by another worker.
 
 ## Error Codes
 
-- `INVALID_REQUEST`: malformed JSON, missing fields, bad IDs, or out-of-range request parameters.
-- `UNAUTHORIZED`: missing token, invalid token, expired token, revoked token, or insufficient session scope.
-- `NOT_FOUND`: unknown method or missing runtime object.
-- `CONFLICT`: invalid lifecycle transition or closed resource.
-- `TIMEOUT`: request timed out or response fault path was hit.
-- `RATE_LIMITED`: rate limit, overload limit, breaker-open state, shutdown reject, or policy/quota rejection.
-- `INTERNAL`: persistence or runtime failure.
+- `INVALID_REQUEST`: malformed JSON, missing required fields, unsupported values, or invalid identifiers
+- `UNAUTHORIZED`: missing token, invalid token, expired token, revoked token, or missing required scope
+- `NOT_FOUND`: unknown method or missing runtime object
+- `CONFLICT`: invalid lifecycle transition, closed resource, or exclusive ownership conflict
+- `TIMEOUT`: request timeout or dropped-response fault path
+- `RATE_LIMITED`: rate limit, overload, breaker-open state, shutdown reject, or configured quota/policy rejection
+- `INTERNAL`: persistence or runtime failure
 
-## Proper Usage Rules
+## Client Usage Rules
 
-- Always generate a fresh `command_id` per request.
-- Use `system.readiness` before automated batches.
-- Do not treat `system.health` as permission to start mutating work if `system.readiness.ready` is false.
-- Expect authenticated diagnostics methods to fail with `UNAUTHORIZED` if the session is expired or revoked.
-- On `RATE_LIMITED`, check readiness and breaker state before retrying.
-- On `NOT_FOUND` or `CONFLICT`, refresh the affected frontend runtime state instead of blindly retrying.
+- Call `system.readiness` before mutating automated work.
+- Treat `system.health` as liveness only.
+- Do not retry `CONFLICT` and `NOT_FOUND` blindly; refresh state first.
+- Do not retry `RATE_LIMITED` aggressively; inspect readiness and diagnostics.
+- Use history APIs after reconnect or sequence gaps instead of assuming subscriptions are lossless.
