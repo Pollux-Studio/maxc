@@ -6511,9 +6511,9 @@ mod tests {
 
     fn test_terminal_echo_command(marker: &str) -> String {
         if cfg!(windows) {
-            format!("echo {marker}")
+            format!("echo {marker}\r\n")
         } else {
-            format!("printf '{marker}\\n'")
+            format!("printf '{marker}\\n'\n")
         }
     }
 
