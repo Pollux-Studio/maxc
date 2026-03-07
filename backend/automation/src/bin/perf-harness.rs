@@ -33,10 +33,26 @@ struct BenchmarkResult {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    let output = run_cli(std::env::args().skip(1).collect()).await?;
+    if let Some(text) = output.output {
+        print!("{text}");
+    }
+    if output.pass {
+        Ok(())
+    } else {
+        Err("performance thresholds failed".into())
+    }
+}
+
+struct CliRun {
+    output: Option<String>,
+    pass: bool,
+}
+
+async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>> {
     let mut profile = String::from("ci");
     let mut json_output = false;
-    let mut idx = 1;
+    let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
             "--profile" if idx + 1 < args.len() => {
@@ -50,7 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         idx += 1;
     }
+    execute_suite(&profile, json_output).await
+}
 
+async fn execute_suite(
+    profile: &str,
+    json_output: bool,
+) -> Result<CliRun, Box<dyn std::error::Error>> {
     let profiles = load_profile_configs()?;
     let thresholds = load_thresholds()?;
     let names = if profile == "ci" {
@@ -63,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "restart_recovery",
         ]
     } else {
-        vec![profile.as_str()]
+        vec![profile]
     };
 
     let mut results = Vec::new();
@@ -78,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let ok = results.iter().all(|result| result.pass);
-    if json_output {
+    let output = if json_output {
         let payload = json!({
             "suite": profile,
             "pass": ok,
@@ -94,26 +116,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             }).collect::<Vec<_>>()
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        Some(format!("{}\n", serde_json::to_string_pretty(&payload)?))
     } else {
+        let mut text = String::new();
         for result in &results {
-            println!(
-                "{}: p50={:.2}ms p95={:.2}ms max={:.2}ms throughput={:.2}/s pass={}",
+            text.push_str(&format!(
+                "{}: p50={:.2}ms p95={:.2}ms max={:.2}ms throughput={:.2}/s pass={}\n",
                 result.profile,
                 result.p50_ms,
                 result.p95_ms,
                 result.max_ms,
                 result.throughput_ops_per_sec,
                 result.pass
-            );
+            ));
         }
-    }
+        Some(text)
+    };
 
-    if ok {
-        Ok(())
-    } else {
-        Err("performance thresholds failed".into())
-    }
+    Ok(CliRun { output, pass: ok })
 }
 
 async fn run_profile(
@@ -131,7 +151,10 @@ async fn run_profile(
     if name == "terminal_interactive" {
         config.terminal_runtime = "process-stdio".to_string();
     }
-    if matches!(name, "browser_navigation" | "browser_fanout" | "restart_recovery") {
+    if matches!(
+        name,
+        "browser_navigation" | "browser_fanout" | "restart_recovery"
+    ) {
         config.browser_executable_or_channel = "__synthetic__".to_string();
     }
     let server = RpcServer::new(config)?;
@@ -612,6 +635,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_helpers_render_text_and_json_output() {
+        let compact = run_cli(vec!["--profile".to_string(), "rpc_health".to_string()])
+            .await
+            .expect("compact");
+        assert!(compact.pass);
+        assert!(compact
+            .output
+            .as_deref()
+            .expect("output")
+            .contains("rpc_health:"));
+
+        let json_result = execute_suite("rpc_health", true).await.expect("json");
+        assert!(json_result.pass);
+        let output = json_result.output.expect("json output");
+        assert!(output.contains("\"suite\": \"rpc_health\""));
+        assert!(output.contains("\"results\""));
+    }
+
+    #[tokio::test]
     async fn run_rpc_health_profile() {
         let result = run_profile(
             "rpc_health",
@@ -746,6 +788,9 @@ mod tests {
         )
         .await;
         assert!(unknown.is_err());
+
+        let failing = execute_suite("does-not-exist", false).await;
+        assert!(failing.is_err());
 
         let _ = fs::remove_dir_all(event_dir);
     }

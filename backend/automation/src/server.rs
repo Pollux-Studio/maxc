@@ -106,6 +106,8 @@ struct ServerState {
     raw_limiters: Mutex<HashMap<String, RateLimiter>>,
     terminal_runtime: Mutex<HashMap<String, TerminalSessionRuntime>>,
     browser_runtime: Mutex<HashMap<String, BrowserSessionRuntime>>,
+    agent_workers: Mutex<HashMap<String, AgentWorkerRuntime>>,
+    agent_tasks: Mutex<HashMap<String, AgentTaskRuntime>>,
     terminal_subscriptions: StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
     browser_subscriptions: StdMutex<HashMap<String, HashMap<String, SubscriptionState>>>,
     scheduler: StdMutex<SchedulerState>,
@@ -224,8 +226,11 @@ unsafe impl Sync for ConptyControl {}
 
 #[derive(Debug, Clone)]
 struct BrowserSessionRuntime {
+    workspace_id: String,
+    surface_id: String,
     attached: bool,
     closed: bool,
+    status: String,
     tabs: HashMap<String, BrowserTabRuntime>,
     tracing_enabled: bool,
     network_interception: bool,
@@ -233,6 +238,9 @@ struct BrowserSessionRuntime {
     executable: String,
     last_error: Option<String>,
     process: Option<Arc<BrowserProcessRuntime>>,
+    next_sequence: u64,
+    history: VecDeque<Value>,
+    history_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +258,36 @@ struct BrowserTabRuntime {
     cookies: HashMap<String, String>,
     storage: HashMap<String, String>,
     last_artifact_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentAuditContext {
+    workspace_id: String,
+    surface_id: String,
+    agent_worker_id: Option<String>,
+    agent_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentWorkerRuntime {
+    workspace_id: String,
+    surface_id: String,
+    status: String,
+    terminal_session_id: String,
+    browser_session_id: Option<String>,
+    current_task_id: Option<String>,
+    closed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AgentTaskRuntime {
+    agent_worker_id: String,
+    prompt: String,
+    status: String,
+    terminal_session_id: String,
+    browser_session_id: Option<String>,
+    last_output_sequence: u64,
+    failure_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -481,6 +519,8 @@ impl RpcServer {
                 raw_limiters: Mutex::new(HashMap::new()),
                 terminal_runtime: Mutex::new(HashMap::new()),
                 browser_runtime: Mutex::new(HashMap::new()),
+                agent_workers: Mutex::new(HashMap::new()),
+                agent_tasks: Mutex::new(HashMap::new()),
                 terminal_subscriptions: StdMutex::new(HashMap::new()),
                 browser_subscriptions: StdMutex::new(HashMap::new()),
                 scheduler: StdMutex::new(SchedulerState::default()),
@@ -700,6 +740,9 @@ impl RpcServer {
             method if method.starts_with("browser.") => {
                 self.browser_dispatch(method, request.params).await
             }
+            method if method.starts_with("agent.") => {
+                self.agent_dispatch(method, request.params).await
+            }
             _ => Err(ServerError::NotFound),
         }
     }
@@ -718,13 +761,15 @@ impl RpcServer {
     async fn system_readiness(&self, params: Option<Value>) -> Result<Value, ServerError> {
         self.require_active_session(params.as_ref()).await?;
         let browser_ready = browser_dependency_ready(&self.config);
+        let terminal_ready = true;
         Ok(json!({
-            "ready": !self.is_shutting_down() && !self.breaker_is_open() && browser_ready,
+            "ready": !self.is_shutting_down() && !self.breaker_is_open() && browser_ready && terminal_ready,
             "accepting_requests": !self.is_shutting_down(),
             "breaker_open": self.breaker_is_open(),
             "queue_saturated": self.active_request_count() >= self.config.overload_reject_threshold,
             "store_available": true,
-            "browser_runtime_ready": browser_ready
+            "browser_runtime_ready": browser_ready,
+            "terminal_runtime_ready": terminal_ready
         }))
     }
 
@@ -733,6 +778,8 @@ impl RpcServer {
         let projection = self.state.projection.lock().await;
         let terminal_runtime = self.state.terminal_runtime.lock().await;
         let browser_runtime = self.state.browser_runtime.lock().await;
+        let agent_workers = self.state.agent_workers.lock().await;
+        let agent_tasks = self.state.agent_tasks.lock().await;
         let terminal_subscriptions = self
             .state
             .terminal_subscriptions
@@ -753,16 +800,43 @@ impl RpcServer {
             "browser_runtime_backend": "chromium-cdp",
             "browser_runtime_ready": browser_dependency_ready(&self.config),
             "browser_runtimes": browser_runtime.values().map(|session| json!({
+                "workspace_id": session.workspace_id,
+                "surface_id": session.surface_id,
                 "runtime": session.runtime,
+                "status": session.status,
                 "executable": session.executable,
                 "closed": session.closed,
                 "attached": session.attached,
-                "last_error": session.last_error
+                "last_error": session.last_error,
+                "history_events": session.history.len(),
+                "history_bytes": session.history_bytes
             })).collect::<Vec<_>>(),
+            "agent_workers": projection.agent_workers.values().map(|worker| json!({
+                "agent_worker_id": worker.agent_worker_id,
+                "workspace_id": worker.workspace_id,
+                "surface_id": worker.surface_id,
+                "status": worker.status,
+                "terminal_session_id": worker.terminal_session_id,
+                "browser_session_id": worker.browser_session_id,
+                "closed": worker.closed
+            })).collect::<Vec<_>>(),
+            "agent_tasks": projection.agent_tasks.values().map(|task| json!({
+                "agent_task_id": task.agent_task_id,
+                "agent_worker_id": task.agent_worker_id,
+                "status": task.status,
+                "terminal_session_id": task.terminal_session_id,
+                "browser_session_id": task.browser_session_id,
+                "last_output_sequence": task.last_output_sequence,
+                "failure_reason": task.failure_reason
+            })).collect::<Vec<_>>(),
+            "agent_runtime_count": agent_workers.len(),
+            "agent_task_runtime_count": agent_tasks.len(),
             "terminal_subscription_count": terminal_subscriptions.values().map(|v| v.len()).sum::<usize>(),
             "browser_subscription_count": browser_subscriptions.values().map(|v| v.len()).sum::<usize>(),
             "terminal_history_events": terminal_runtime.values().map(|session| session.history.len()).sum::<usize>(),
             "terminal_history_bytes": terminal_runtime.values().map(|session| session.history_bytes).sum::<usize>(),
+            "browser_history_events": browser_runtime.values().map(|session| session.history.len()).sum::<usize>(),
+            "browser_history_bytes": browser_runtime.values().map(|session| session.history_bytes).sum::<usize>(),
             "terminal_runtime_backend": selected_terminal_runtime_name(&self.config),
             "active_requests": self.active_request_count(),
             "shutting_down": self.is_shutting_down(),
@@ -807,8 +881,36 @@ impl RpcServer {
             self.state.browser_runtime.lock().await.len() as u64,
         );
         metrics.gauges.insert(
+            "runtime.browser.history_events".to_string(),
+            self.state
+                .browser_runtime
+                .lock()
+                .await
+                .values()
+                .map(|session| session.history.len() as u64)
+                .sum::<u64>(),
+        );
+        metrics.gauges.insert(
+            "runtime.browser.history_bytes".to_string(),
+            self.state
+                .browser_runtime
+                .lock()
+                .await
+                .values()
+                .map(|session| session.history_bytes as u64)
+                .sum::<u64>(),
+        );
+        metrics.gauges.insert(
             "runtime.browser.ready".to_string(),
             u64::from(browser_dependency_ready(&self.config)),
+        );
+        metrics.gauges.insert(
+            "runtime.agent.workers".to_string(),
+            self.state.agent_workers.lock().await.len() as u64,
+        );
+        metrics.gauges.insert(
+            "runtime.agent.tasks".to_string(),
+            self.state.agent_tasks.lock().await.len() as u64,
         );
         serde_json::to_value(metrics).map_err(|_| ServerError::Internal)
     }
@@ -971,6 +1073,7 @@ impl RpcServer {
                 self.browser_automation(command_id, audit, method, params_ref)
                     .await
             }
+            "browser.history" => self.browser_history(audit, params_ref).await,
             "browser.subscribe" => self.browser_subscribe(command_id, audit, method).await,
             "browser.raw.command" => self.browser_raw(command_id, audit, params_ref).await,
             _ => Err(ServerError::NotFound),
@@ -1086,6 +1189,615 @@ impl RpcServer {
             "terminal.subscribe" => self.terminal_subscribe(command_id, audit).await,
             _ => Err(ServerError::NotFound),
         }
+    }
+
+    async fn agent_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let token = extract_token(params.as_ref()).ok_or(ServerError::Unauthorized)?;
+        let now = now_unix_ms();
+        let session = self
+            .find_session(&token)
+            .await
+            .ok_or(ServerError::Unauthorized)?;
+        if !session.is_active(now) {
+            return Err(ServerError::Unauthorized);
+        }
+
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+        let audit = extract_agent_audit(params_ref, method)?;
+        let _scheduler = self.acquire_scheduler(method)?;
+
+        match method {
+            "agent.worker.create" => {
+                self.agent_worker_create(command_id, audit, params_ref)
+                    .await
+            }
+            "agent.worker.list" => self.agent_worker_list(audit).await,
+            "agent.worker.get" => self.agent_worker_get(audit).await,
+            "agent.worker.close" => self.agent_worker_close(command_id, audit).await,
+            "agent.task.start" => self.agent_task_start(command_id, audit, params_ref).await,
+            "agent.task.cancel" => self.agent_task_cancel(command_id, audit, params_ref).await,
+            "agent.task.list" => self.agent_task_list(audit).await,
+            "agent.task.get" => self.agent_task_get(audit).await,
+            "agent.attach.terminal" => {
+                self.agent_attach_terminal(command_id, audit, params_ref)
+                    .await
+            }
+            "agent.detach.terminal" => self.agent_detach_terminal(command_id, audit).await,
+            "agent.attach.browser" => {
+                self.agent_attach_browser(command_id, audit, params_ref)
+                    .await
+            }
+            "agent.detach.browser" => self.agent_detach_browser(command_id, audit).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn agent_worker_create(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let worker_id = format!(
+            "aw-{}",
+            random_token()?.chars().take(12).collect::<String>()
+        );
+        let spawn_result = self
+            .terminal_spawn(
+                format!("{command_id}-worker-spawn"),
+                TerminalAuditContext {
+                    workspace_id: audit.workspace_id.clone(),
+                    surface_id: audit.surface_id.clone(),
+                    terminal_session_id: None,
+                },
+                params,
+            )
+            .await?;
+        let terminal_session_id = spawn_result
+            .get("terminal_session_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::Internal)?
+            .to_string();
+        let browser_session_id = params
+            .get("browser_session_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if let Some(browser_session_id) = browser_session_id.as_ref() {
+            self.ensure_browser_unowned(browser_session_id, None)
+                .await?;
+            self.ensure_browser_exists(browser_session_id).await?;
+        }
+        {
+            let mut workers = self.state.agent_workers.lock().await;
+            workers.insert(
+                worker_id.clone(),
+                AgentWorkerRuntime {
+                    workspace_id: audit.workspace_id.clone(),
+                    surface_id: audit.surface_id.clone(),
+                    status: "ready".to_string(),
+                    terminal_session_id: terminal_session_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    current_task_id: None,
+                    closed: false,
+                },
+            );
+        }
+        let result = json!({
+            "agent_worker_id": worker_id,
+            "workspace_id": audit.workspace_id,
+            "surface_id": audit.surface_id,
+            "status": "ready",
+            "terminal_session_id": terminal_session_id,
+            "browser_session_id": browser_session_id
+        });
+        let payload = json!({
+            "agent_worker_id": result["agent_worker_id"],
+            "workspace_id": result["workspace_id"],
+            "surface_id": result["surface_id"],
+            "terminal_session_id": result["terminal_session_id"],
+            "browser_session_id": result["browser_session_id"],
+            "status": result["status"],
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentWorkerCreated,
+            payload["agent_worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_worker_list(&self, audit: AgentAuditContext) -> Result<Value, ServerError> {
+        let workers = self.state.agent_workers.lock().await;
+        let tasks = self.state.agent_tasks.lock().await;
+        let list = workers
+            .iter()
+            .filter(|(_, worker)| {
+                worker.workspace_id == audit.workspace_id && worker.surface_id == audit.surface_id
+            })
+            .map(|(worker_id, worker)| {
+                let current_task = worker.current_task_id.as_ref().and_then(|task_id| {
+                    tasks.get(task_id).map(|task| {
+                        json!({
+                            "agent_task_id": task_id,
+                            "status": task.status,
+                            "last_output_sequence": task.last_output_sequence,
+                            "failure_reason": task.failure_reason
+                        })
+                    })
+                });
+                json!({
+                    "agent_worker_id": worker_id,
+                    "workspace_id": worker.workspace_id,
+                    "surface_id": worker.surface_id,
+                    "status": worker.status,
+                    "terminal_session_id": worker.terminal_session_id,
+                    "browser_session_id": worker.browser_session_id,
+                    "current_task_id": worker.current_task_id,
+                    "closed": worker.closed,
+                    "current_task": current_task
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "workers": list }))
+    }
+
+    async fn agent_worker_get(&self, audit: AgentAuditContext) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let workers = self.state.agent_workers.lock().await;
+        let worker = workers.get(&worker_id).ok_or(ServerError::NotFound)?;
+        let task_snapshot = if let Some(task_id) = &worker.current_task_id {
+            self.state.agent_tasks.lock().await.get(task_id).cloned()
+        } else {
+            None
+        };
+        Ok(json!({
+            "agent_worker_id": worker_id,
+            "workspace_id": worker.workspace_id,
+            "surface_id": worker.surface_id,
+            "status": worker.status,
+            "terminal_session_id": worker.terminal_session_id,
+            "browser_session_id": worker.browser_session_id,
+            "current_task_id": worker.current_task_id,
+            "closed": worker.closed,
+            "current_task": task_snapshot.map(|task| json!({
+                "agent_task_id": worker.current_task_id,
+                "status": task.status,
+                "prompt": task.prompt,
+                "last_output_sequence": task.last_output_sequence,
+                "failure_reason": task.failure_reason
+            }))
+        }))
+    }
+
+    async fn agent_worker_close(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+    ) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let (terminal_session_id, current_task_id) = {
+            let mut workers = self.state.agent_workers.lock().await;
+            let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
+            if worker.closed {
+                return Err(ServerError::Conflict);
+            }
+            worker.closed = true;
+            worker.status = "closed".to_string();
+            let current_task_id = worker.current_task_id.take();
+            (worker.terminal_session_id.clone(), current_task_id)
+        };
+        if let Some(task_id) = current_task_id {
+            if let Some(task) = self.state.agent_tasks.lock().await.get_mut(&task_id) {
+                task.status = "closed".to_string();
+                task.failure_reason = Some("worker closed".to_string());
+            }
+        }
+        self.kill_terminal_session(&terminal_session_id).await?;
+        let result = json!({
+            "agent_worker_id": worker_id,
+            "closed": true,
+            "terminal_session_id": terminal_session_id
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentWorkerClosed,
+            result["agent_worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_worker_id": result["agent_worker_id"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_task_start(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let prompt = params
+            .get("prompt")
+            .or_else(|| params.get("input"))
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?
+            .to_string();
+        let (terminal_session_id, browser_session_id) = {
+            let mut workers = self.state.agent_workers.lock().await;
+            let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
+            if worker.closed {
+                return Err(ServerError::Conflict);
+            }
+            if worker.current_task_id.is_some() {
+                return Err(ServerError::Conflict);
+            }
+            worker.status = "running".to_string();
+            (
+                worker.terminal_session_id.clone(),
+                worker.browser_session_id.clone(),
+            )
+        };
+        let terminal_result = self
+            .terminal_input(
+                format!("{command_id}-task-input"),
+                TerminalAuditContext {
+                    workspace_id: audit.workspace_id.clone(),
+                    surface_id: audit.surface_id.clone(),
+                    terminal_session_id: Some(terminal_session_id.clone()),
+                },
+                &json!({
+                    "input": prompt,
+                    "workspace_id": audit.workspace_id,
+                    "surface_id": audit.surface_id,
+                    "terminal_session_id": terminal_session_id,
+                    "command_id": format!("{command_id}-task-input")
+                }),
+            )
+            .await?;
+        let task_id = format!(
+            "at-{}",
+            random_token()?.chars().take(12).collect::<String>()
+        );
+        let last_output_sequence = self.last_terminal_sequence(&terminal_session_id).await;
+        {
+            let mut tasks = self.state.agent_tasks.lock().await;
+            tasks.insert(
+                task_id.clone(),
+                AgentTaskRuntime {
+                    agent_worker_id: worker_id.clone(),
+                    prompt: params
+                        .get("prompt")
+                        .or_else(|| params.get("input"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    status: "running".to_string(),
+                    terminal_session_id: terminal_session_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    last_output_sequence,
+                    failure_reason: None,
+                },
+            );
+        }
+        {
+            let mut workers = self.state.agent_workers.lock().await;
+            if let Some(worker) = workers.get_mut(&worker_id) {
+                worker.current_task_id = Some(task_id.clone());
+            }
+        }
+        let result = json!({
+            "agent_task_id": task_id,
+            "agent_worker_id": worker_id,
+            "status": "running",
+            "terminal_session_id": terminal_session_id,
+            "browser_session_id": browser_session_id,
+            "last_output_sequence": last_output_sequence,
+            "terminal_result": terminal_result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentTaskStarted,
+            result["agent_task_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_task_id": result["agent_task_id"],
+                "agent_worker_id": result["agent_worker_id"],
+                "terminal_session_id": result["terminal_session_id"],
+                "browser_session_id": result["browser_session_id"],
+                "status": result["status"],
+                "last_output_sequence": result["last_output_sequence"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_task_cancel(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let task_id = audit.agent_task_id.ok_or(ServerError::InvalidRequest)?;
+        let reason = params
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("cancelled by user")
+            .to_string();
+        let (worker_id, terminal_session_id) = {
+            let mut tasks = self.state.agent_tasks.lock().await;
+            let task = tasks.get_mut(&task_id).ok_or(ServerError::NotFound)?;
+            if task.status != "running" {
+                return Err(ServerError::Conflict);
+            }
+            task.status = "cancelled".to_string();
+            task.failure_reason = Some(reason.clone());
+            task.last_output_sequence =
+                self.last_terminal_sequence(&task.terminal_session_id).await;
+            (
+                task.agent_worker_id.clone(),
+                task.terminal_session_id.clone(),
+            )
+        };
+        self.try_interrupt_terminal_session(&terminal_session_id)
+            .await?;
+        {
+            let mut workers = self.state.agent_workers.lock().await;
+            if let Some(worker) = workers.get_mut(&worker_id) {
+                worker.current_task_id = None;
+                if !worker.closed {
+                    worker.status = "ready".to_string();
+                }
+            }
+        }
+        let result = json!({
+            "agent_task_id": task_id,
+            "agent_worker_id": worker_id,
+            "cancelled": true,
+            "reason": reason
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentTaskCancelled,
+            result["agent_task_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_task_id": result["agent_task_id"],
+                "failure_reason": result["reason"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_task_list(&self, audit: AgentAuditContext) -> Result<Value, ServerError> {
+        let tasks = self.state.agent_tasks.lock().await;
+        let workers = self.state.agent_workers.lock().await;
+        let list = tasks
+            .iter()
+            .filter(|(_, task)| {
+                workers
+                    .get(&task.agent_worker_id)
+                    .map(|worker| {
+                        worker.workspace_id == audit.workspace_id
+                            && worker.surface_id == audit.surface_id
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(task_id, task)| {
+                json!({
+                    "agent_task_id": task_id,
+                    "agent_worker_id": task.agent_worker_id,
+                    "status": task.status,
+                    "prompt": task.prompt,
+                    "terminal_session_id": task.terminal_session_id,
+                    "browser_session_id": task.browser_session_id,
+                    "last_output_sequence": task.last_output_sequence,
+                    "failure_reason": task.failure_reason
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "tasks": list }))
+    }
+
+    async fn agent_task_get(&self, audit: AgentAuditContext) -> Result<Value, ServerError> {
+        let task_id = audit.agent_task_id.ok_or(ServerError::InvalidRequest)?;
+        let tasks = self.state.agent_tasks.lock().await;
+        let task = tasks.get(&task_id).ok_or(ServerError::NotFound)?;
+        Ok(json!({
+            "agent_task_id": task_id,
+            "agent_worker_id": task.agent_worker_id,
+            "status": task.status,
+            "prompt": task.prompt,
+            "terminal_session_id": task.terminal_session_id,
+            "browser_session_id": task.browser_session_id,
+            "last_output_sequence": self.last_terminal_sequence(&task.terminal_session_id).await,
+            "failure_reason": task.failure_reason
+        }))
+    }
+
+    async fn agent_attach_terminal(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let terminal_session_id = params
+            .get("terminal_session_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?
+            .to_string();
+        self.ensure_terminal_exists(&terminal_session_id).await?;
+        self.ensure_terminal_unowned(&terminal_session_id, Some(&worker_id))
+            .await?;
+        {
+            let mut workers = self.state.agent_workers.lock().await;
+            let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
+            if worker.closed || worker.current_task_id.is_some() {
+                return Err(ServerError::Conflict);
+            }
+            worker.terminal_session_id = terminal_session_id.clone();
+        }
+        let result = json!({
+            "agent_worker_id": worker_id,
+            "terminal_session_id": terminal_session_id,
+            "attached": true
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentTerminalAttached,
+            result["agent_worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_worker_id": result["agent_worker_id"],
+                "terminal_session_id": result["terminal_session_id"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_detach_terminal(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+    ) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let terminal_session_id = {
+            let mut workers = self.state.agent_workers.lock().await;
+            let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
+            if worker.current_task_id.is_some() {
+                return Err(ServerError::Conflict);
+            }
+            std::mem::take(&mut worker.terminal_session_id)
+        };
+        if terminal_session_id.is_empty() {
+            return Err(ServerError::Conflict);
+        }
+        let result = json!({
+            "agent_worker_id": worker_id,
+            "terminal_session_id": terminal_session_id,
+            "attached": false
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentTerminalDetached,
+            result["agent_worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_worker_id": result["agent_worker_id"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_attach_browser(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        let browser_session_id = params
+            .get("browser_session_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?
+            .to_string();
+        self.ensure_browser_exists(&browser_session_id).await?;
+        self.ensure_browser_unowned(&browser_session_id, Some(&worker_id))
+            .await?;
+        {
+            let mut workers = self.state.agent_workers.lock().await;
+            let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
+            if worker.closed {
+                return Err(ServerError::Conflict);
+            }
+            worker.browser_session_id = Some(browser_session_id.clone());
+        }
+        let result = json!({
+            "agent_worker_id": worker_id,
+            "browser_session_id": browser_session_id,
+            "attached": true
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentBrowserAttached,
+            result["agent_worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_worker_id": result["agent_worker_id"],
+                "browser_session_id": result["browser_session_id"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn agent_detach_browser(
+        &self,
+        command_id: String,
+        audit: AgentAuditContext,
+    ) -> Result<Value, ServerError> {
+        let worker_id = audit.agent_worker_id.ok_or(ServerError::InvalidRequest)?;
+        {
+            let mut workers = self.state.agent_workers.lock().await;
+            let worker = workers.get_mut(&worker_id).ok_or(ServerError::NotFound)?;
+            worker.browser_session_id = None;
+        }
+        let result = json!({
+            "agent_worker_id": worker_id,
+            "attached": false
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::AgentBrowserDetached,
+            result["agent_worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            command_id,
+            json!({
+                "agent_worker_id": result["agent_worker_id"],
+                "result": result
+            }),
+        );
+        self.persist_and_apply(event).await
     }
 
     async fn terminal_spawn(
@@ -1533,8 +2245,11 @@ impl RpcServer {
             runtime.insert(
                 browser_session_id.clone(),
                 BrowserSessionRuntime {
+                    workspace_id: audit.workspace_id.clone(),
+                    surface_id: audit.surface_id.clone(),
                     attached: true,
                     closed: false,
+                    status: "ready".to_string(),
                     tabs: HashMap::new(),
                     tracing_enabled: false,
                     network_interception: false,
@@ -1542,6 +2257,9 @@ impl RpcServer {
                     executable: executable.clone(),
                     last_error,
                     process,
+                    next_sequence: 1,
+                    history: VecDeque::new(),
+                    history_bytes: 0,
                 },
             );
         }
@@ -1554,7 +2272,8 @@ impl RpcServer {
                 "surface_id": audit.surface_id,
                 "runtime": runtime_name
             }),
-        );
+        )
+        .await;
         let payload = json!({
             "workspace_id": audit.workspace_id,
             "surface_id": audit.surface_id,
@@ -1595,7 +2314,8 @@ impl RpcServer {
         self.publish_browser_event(
             &browser_session_id,
             json!({"type":"browser.session.attached","browser_session_id": browser_session_id}),
-        );
+        )
+        .await;
         let result = json!({"browser_session_id": browser_session_id, "attached": true});
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -1637,7 +2357,8 @@ impl RpcServer {
         self.publish_browser_event(
             &browser_session_id,
             json!({"type":"browser.session.detached","browser_session_id": browser_session_id}),
-        );
+        )
+        .await;
         let result = json!({"browser_session_id": browser_session_id, "attached": false});
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -1692,7 +2413,8 @@ impl RpcServer {
         self.publish_browser_event(
             &browser_session_id,
             json!({"type":"browser.session.closed","browser_session_id": browser_session_id}),
-        );
+        )
+        .await;
         let result = json!({"browser_session_id": browser_session_id, "closed": true});
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -1791,7 +2513,8 @@ impl RpcServer {
                 "url": target_info.url,
                 "title": target_info.title
             }),
-        );
+        )
+        .await;
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -1908,7 +2631,8 @@ impl RpcServer {
                 "browser_session_id": browser_session_id,
                 "browser_tab_id": browser_tab_id
             }),
-        );
+        )
+        .await;
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -1968,7 +2692,8 @@ impl RpcServer {
                 "browser_session_id": browser_session_id,
                 "browser_tab_id": browser_tab_id
             }),
-        );
+        )
+        .await;
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -2092,7 +2817,8 @@ impl RpcServer {
                 "title": title,
                 "load_state": load_state
             }),
-        );
+        )
+        .await;
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -2434,7 +3160,8 @@ impl RpcServer {
                 "browser_tab_id": browser_tab_id,
                 "details": extra
             }),
-        );
+        )
+        .await;
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -2485,9 +3212,11 @@ impl RpcServer {
         )?;
         let result = json!({
             "subscribed": true,
+            "browser_session_id": browser_session_id,
             "subscriber_id": subscriber_id,
             "events": events,
-            "dropped_events": dropped_events
+            "dropped_events": dropped_events,
+            "last_sequence": self.last_browser_sequence(&browser_session_id).await
         });
         let payload = json!({
             "browser_session_id": browser_session_id,
@@ -2504,6 +3233,53 @@ impl RpcServer {
             payload,
         );
         self.persist_and_apply(event).await
+    }
+
+    async fn browser_history(
+        &self,
+        audit: BrowserAuditContext,
+        params: &Value,
+    ) -> Result<Value, ServerError> {
+        let browser_session_id = audit
+            .browser_session_id
+            .ok_or(ServerError::InvalidRequest)?;
+        let from_sequence = params
+            .get("from_sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_events = params
+            .get("max_events")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(self.config.queue_limit.max(1))
+            .max(1);
+        let runtime = self.state.browser_runtime.lock().await;
+        let session = runtime
+            .get(&browser_session_id)
+            .ok_or(ServerError::NotFound)?;
+        let events = session
+            .history
+            .iter()
+            .filter(|event| event["sequence"].as_u64().unwrap_or_default() >= from_sequence)
+            .take(max_events)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = session
+            .history
+            .iter()
+            .filter(|event| event["sequence"].as_u64().unwrap_or_default() >= from_sequence)
+            .count()
+            > events.len();
+        Ok(json!({
+            "browser_session_id": browser_session_id,
+            "runtime": session.runtime,
+            "status": session.status,
+            "last_sequence": session.next_sequence.saturating_sub(1),
+            "events": events,
+            "has_more": has_more,
+            "attached": session.attached,
+            "closed": session.closed
+        }))
     }
 
     async fn browser_raw(
@@ -2556,7 +3332,8 @@ impl RpcServer {
                 "raw_command": command,
                 "result": response
             }),
-        );
+        )
+        .await;
         let result = json!({
             "browser_session_id": browser_session_id,
             "browser_tab_id": browser_tab_id,
@@ -2636,17 +3413,16 @@ impl RpcServer {
         .await;
     }
 
-    fn publish_browser_event(&self, browser_session_id: &str, event: Value) {
-        let mut all = self
-            .state
-            .browser_subscriptions
-            .lock()
-            .expect("subscription lock poisoned");
-        if let Some(subs) = all.get_mut(browser_session_id) {
-            for sub in subs.values_mut() {
-                sub.push(event.clone(), self.config.queue_limit.max(1));
-            }
-        }
+    async fn publish_browser_event(&self, browser_session_id: &str, event: Value) {
+        publish_browser_event_for_state(
+            &self.state,
+            self.config.queue_limit.max(1),
+            self.config.queue_limit.max(1),
+            self.config.queue_limit.saturating_mul(1024),
+            browser_session_id,
+            event,
+        )
+        .await;
     }
 
     fn cleanup_browser_subscribers(&self, browser_session_id: &str) {
@@ -2797,6 +3573,16 @@ impl RpcServer {
             .unwrap_or(0)
     }
 
+    async fn last_browser_sequence(&self, browser_session_id: &str) -> u64 {
+        self.state
+            .browser_runtime
+            .lock()
+            .await
+            .get(browser_session_id)
+            .map(|session| session.next_sequence.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
     async fn enforce_terminal_spawn_limits(
         &self,
         audit: &TerminalAuditContext,
@@ -2840,6 +3626,106 @@ impl RpcServer {
         if workspace_sessions >= self.config.terminal_max_sessions_per_workspace {
             return Err(ServerError::RateLimited);
         }
+        Ok(())
+    }
+
+    async fn ensure_terminal_exists(&self, terminal_session_id: &str) -> Result<(), ServerError> {
+        let runtime = self.state.terminal_runtime.lock().await;
+        if runtime.contains_key(terminal_session_id) {
+            Ok(())
+        } else {
+            Err(ServerError::NotFound)
+        }
+    }
+
+    async fn ensure_browser_exists(&self, browser_session_id: &str) -> Result<(), ServerError> {
+        let runtime = self.state.browser_runtime.lock().await;
+        if runtime.contains_key(browser_session_id) {
+            Ok(())
+        } else {
+            Err(ServerError::NotFound)
+        }
+    }
+
+    async fn ensure_terminal_unowned(
+        &self,
+        terminal_session_id: &str,
+        except_worker_id: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let workers = self.state.agent_workers.lock().await;
+        if workers.iter().any(|(worker_id, worker)| {
+            !worker.closed
+                && worker.terminal_session_id == terminal_session_id
+                && except_worker_id
+                    .map(|id| id != worker_id.as_str())
+                    .unwrap_or(true)
+        }) {
+            return Err(ServerError::Conflict);
+        }
+        Ok(())
+    }
+
+    async fn ensure_browser_unowned(
+        &self,
+        browser_session_id: &str,
+        except_worker_id: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let workers = self.state.agent_workers.lock().await;
+        if workers.iter().any(|(worker_id, worker)| {
+            !worker.closed
+                && worker.browser_session_id.as_deref() == Some(browser_session_id)
+                && except_worker_id
+                    .map(|id| id != worker_id.as_str())
+                    .unwrap_or(true)
+        }) {
+            return Err(ServerError::Conflict);
+        }
+        Ok(())
+    }
+
+    async fn try_interrupt_terminal_session(
+        &self,
+        terminal_session_id: &str,
+    ) -> Result<(), ServerError> {
+        let input = {
+            let runtime = self.state.terminal_runtime.lock().await;
+            let session = runtime
+                .get(terminal_session_id)
+                .ok_or(ServerError::NotFound)?;
+            session.input.clone().ok_or(ServerError::Conflict)?
+        };
+        let _ = write_to_terminal_input(input, "\u{3}").await?;
+        Ok(())
+    }
+
+    async fn kill_terminal_session(&self, terminal_session_id: &str) -> Result<(), ServerError> {
+        let (pid, kill_tx, already_stopped) = {
+            let mut runtime = self.state.terminal_runtime.lock().await;
+            let session = runtime
+                .get_mut(terminal_session_id)
+                .ok_or(ServerError::NotFound)?;
+            let pid = session.pid;
+            let already_stopped = !session.alive;
+            session.alive = false;
+            session.status = "closed".to_string();
+            session.input = None;
+            session.exit_code.get_or_insert(-1);
+            (pid, session.kill_tx.take(), already_stopped)
+        };
+        if let Some(kill_tx) = kill_tx {
+            let _ = kill_tx.send(());
+        } else if !already_stopped {
+            return Err(ServerError::Conflict);
+        }
+        self.publish_terminal_event(
+            terminal_session_id,
+            json!({
+                "type":"terminal.killed",
+                "terminal_session_id": terminal_session_id,
+                "pid": pid
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -3064,6 +3950,8 @@ impl RpcServer {
         }
         self.state.terminal_runtime.lock().await.clear();
         self.state.browser_runtime.lock().await.clear();
+        self.state.agent_workers.lock().await.clear();
+        self.state.agent_tasks.lock().await.clear();
         self.state
             .terminal_subscriptions
             .lock()
@@ -3563,6 +4451,102 @@ async fn publish_terminal_event_for_state(
         .lock()
         .expect("subscription lock poisoned");
     if let Some(subs) = all.get_mut(terminal_session_id) {
+        for sub in subs.values_mut() {
+            sub.push(event.clone(), queue_limit);
+        }
+    }
+}
+
+async fn publish_browser_event_for_state(
+    state: &Arc<ServerState>,
+    queue_limit: usize,
+    history_limit_events: usize,
+    history_limit_bytes: usize,
+    browser_session_id: &str,
+    mut event: Value,
+) {
+    let (status, runtime_name, workspace_id, surface_id, sequence, timestamp_ms) = {
+        let mut runtime = state.browser_runtime.lock().await;
+        if let Some(session) = runtime.get_mut(browser_session_id) {
+            let sequence = session.next_sequence;
+            session.next_sequence = session.next_sequence.saturating_add(1);
+            let timestamp_ms = now_unix_ms();
+            if let Some(object) = event.as_object_mut() {
+                object
+                    .entry("sequence".to_string())
+                    .or_insert(json!(sequence));
+                object
+                    .entry("timestamp_ms".to_string())
+                    .or_insert(json!(timestamp_ms));
+                object
+                    .entry("status".to_string())
+                    .or_insert(json!(session.status.clone()));
+                object
+                    .entry("runtime".to_string())
+                    .or_insert(json!(session.runtime.clone()));
+                object
+                    .entry("workspace_id".to_string())
+                    .or_insert(json!(session.workspace_id.clone()));
+                object
+                    .entry("surface_id".to_string())
+                    .or_insert(json!(session.surface_id.clone()));
+            }
+            let encoded_len = event.to_string().len();
+            session.history.push_back(event.clone());
+            session.history_bytes = session.history_bytes.saturating_add(encoded_len);
+            while session.history.len() > history_limit_events
+                || session.history_bytes > history_limit_bytes
+            {
+                if let Some(removed) = session.history.pop_front() {
+                    session.history_bytes = session
+                        .history_bytes
+                        .saturating_sub(removed.to_string().len());
+                } else {
+                    break;
+                }
+            }
+            (
+                session.status.clone(),
+                session.runtime.clone(),
+                session.workspace_id.clone(),
+                session.surface_id.clone(),
+                sequence,
+                timestamp_ms,
+            )
+        } else {
+            (
+                "unknown".to_string(),
+                "unknown".to_string(),
+                String::new(),
+                String::new(),
+                0,
+                now_unix_ms(),
+            )
+        }
+    };
+    if let Some(object) = event.as_object_mut() {
+        object
+            .entry("sequence".to_string())
+            .or_insert(json!(sequence));
+        object
+            .entry("timestamp_ms".to_string())
+            .or_insert(json!(timestamp_ms));
+        object.entry("status".to_string()).or_insert(json!(status));
+        object
+            .entry("runtime".to_string())
+            .or_insert(json!(runtime_name));
+        object
+            .entry("workspace_id".to_string())
+            .or_insert(json!(workspace_id));
+        object
+            .entry("surface_id".to_string())
+            .or_insert(json!(surface_id));
+    }
+    let mut all = state
+        .browser_subscriptions
+        .lock()
+        .expect("subscription lock poisoned");
+    if let Some(subs) = all.get_mut(browser_session_id) {
         for sub in subs.values_mut() {
             sub.push(event.clone(), queue_limit);
         }
@@ -4252,6 +5236,9 @@ fn browser_http_request(method: &str, url: &str) -> Result<String, ServerError> 
 
 fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerError> {
     let configured = config.browser_executable_or_channel.trim();
+    if configured.eq_ignore_ascii_case("__synthetic__") {
+        return Err(ServerError::Internal);
+    }
     if !configured.is_empty() && Path::new(configured).exists() {
         return Ok(configured.to_string());
     }
@@ -4484,6 +5471,44 @@ fn write_browser_artifact(
     Ok(path.to_string_lossy().to_string())
 }
 
+fn extract_agent_audit(params: &Value, method: &str) -> Result<AgentAuditContext, ServerError> {
+    let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
+    let workspace_id = object
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?
+        .to_string();
+    let surface_id = object
+        .get("surface_id")
+        .and_then(Value::as_str)
+        .ok_or(ServerError::InvalidRequest)?
+        .to_string();
+    let agent_worker_id = object
+        .get("agent_worker_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let agent_task_id = object
+        .get("agent_task_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let needs_worker = !matches!(
+        method,
+        "agent.worker.create" | "agent.worker.list" | "agent.task.list"
+    );
+    if needs_worker && method != "agent.task.cancel" && agent_worker_id.is_none() {
+        return Err(ServerError::InvalidRequest);
+    }
+    if matches!(method, "agent.task.cancel" | "agent.task.get") && agent_task_id.is_none() {
+        return Err(ServerError::InvalidRequest);
+    }
+    Ok(AgentAuditContext {
+        workspace_id,
+        surface_id,
+        agent_worker_id,
+        agent_task_id,
+    })
+}
+
 fn extract_browser_audit(params: &Value, method: &str) -> Result<BrowserAuditContext, ServerError> {
     let object = params.as_object().ok_or(ServerError::InvalidRequest)?;
     let workspace_id = object
@@ -4640,6 +5665,8 @@ mod tests {
                 .join(format!("maxc-server-{label}-{}", now_unix_ms()))
                 .to_string_lossy()
                 .to_string(),
+            browser_executable_or_channel: "__synthetic__".to_string(),
+            terminal_runtime: "process-stdio".to_string(),
             snapshot_interval_events: 2,
             snapshot_retain_count: 2,
             segment_max_bytes: 1024 * 64,
@@ -4846,6 +5873,7 @@ mod tests {
             queue_limit: 8,
             ..test_config("terminal-lifecycle")
         };
+        let expect_resize_applied = selected_terminal_runtime_name(&cfg) == "conpty";
         let server = RpcServer::new(cfg).expect("server");
 
         let session = json!({
@@ -4988,7 +6016,7 @@ mod tests {
         let resize_out: Value =
             serde_json::from_str(&server.handle_json_line("c", &resize).await).expect("json");
         assert_eq!(resize_out["result"]["cols"], 120);
-        assert_eq!(resize_out["result"]["applied"], cfg!(windows));
+        assert_eq!(resize_out["result"]["applied"], expect_resize_applied);
 
         let kill = json!({
             "id": 22,
@@ -5903,5 +6931,869 @@ mod tests {
             write_browser_artifact(&process, "tab-1", "shot", "txt", b"hello").expect("artifact");
         assert!(std::path::Path::new(&path).exists());
         let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[tokio::test]
+    async fn browser_history_returns_sequence_buffer() {
+        let cfg = BackendConfig {
+            browser_executable_or_channel: "__synthetic__".to_string(),
+            ..test_config("browser-history")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        let auth: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-auth",
+                    &json!({"id":1,"method":"session.create","params":{"command_id":"cmd-auth-browser-history"}}).to_string(),
+                )
+                .await,
+        )
+        .expect("auth");
+        let token = auth["result"]["token"].as_str().expect("token");
+
+        let created: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-browser",
+                    &json!({
+                        "id":2,
+                        "method":"browser.create",
+                        "params":{
+                            "command_id":"cmd-browser-history-create",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("browser create");
+        let browser_session_id = created["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session");
+
+        let _ = server
+            .handle_json_line(
+                "conn-browser",
+                &json!({
+                    "id":3,
+                    "method":"browser.subscribe",
+                    "params":{
+                        "command_id":"cmd-browser-subscribe",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "browser_session_id":browser_session_id,
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let opened: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-browser",
+                    &json!({
+                        "id":4,
+                        "method":"browser.tab.open",
+                        "params":{
+                            "command_id":"cmd-browser-history-tab",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "browser_session_id":browser_session_id,
+                            "url":"https://example.com",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("tab open");
+        let tab_id = opened["result"]["browser_tab_id"].as_str().expect("tab id");
+
+        let _ = server
+            .handle_json_line(
+                "conn-browser",
+                &json!({
+                    "id":5,
+                    "method":"browser.goto",
+                    "params":{
+                        "command_id":"cmd-browser-history-goto",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "browser_session_id":browser_session_id,
+                        "tab_id":tab_id,
+                        "url":"https://example.com/next",
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let history: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-browser",
+                    &json!({
+                        "id":6,
+                        "method":"browser.history",
+                        "params":{
+                            "command_id":"cmd-browser-history-read",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "browser_session_id":browser_session_id,
+                            "from_sequence":1,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("browser history");
+        assert!(
+            history["result"]["last_sequence"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 2
+        );
+        assert!(history["result"]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .any(|event| event["type"] == "browser.navigation"));
+        let _ = server
+            .handle_json_line(
+                "conn-browser",
+                &json!({
+                    "id":7,
+                    "method":"browser.close",
+                    "params":{
+                        "command_id":"cmd-browser-history-close",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "browser_session_id":browser_session_id,
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn agent_worker_and_task_flow_is_supported() {
+        let cfg = test_config("agent-flow");
+        let server = RpcServer::new(cfg).expect("server");
+        let auth: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-auth",
+                    &json!({"id":1,"method":"session.create","params":{"command_id":"cmd-auth-agent"}}).to_string(),
+                )
+                .await,
+        )
+        .expect("auth");
+        let token = auth["result"]["token"].as_str().expect("token");
+
+        let worker: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":2,
+                        "method":"agent.worker.create",
+                        "params":{
+                            "command_id":"cmd-agent-worker-create",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("worker create");
+        let worker_id = worker["result"]["agent_worker_id"]
+            .as_str()
+            .expect("worker id");
+
+        let task: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":3,
+                        "method":"agent.task.start",
+                        "params":{
+                            "command_id":"cmd-agent-task-start",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "prompt":"echo phase9-phase10",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("task start");
+        let task_id = task["result"]["agent_task_id"].as_str().expect("task id");
+
+        let fetched: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":4,
+                        "method":"agent.task.get",
+                        "params":{
+                            "command_id":"cmd-agent-task-get",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "agent_task_id":task_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("task get");
+        assert_eq!(fetched["result"]["status"], "running");
+
+        let cancelled: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":5,
+                        "method":"agent.task.cancel",
+                        "params":{
+                            "command_id":"cmd-agent-task-cancel",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_task_id":task_id,
+                            "reason":"test cancel",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("task cancel");
+        assert_eq!(cancelled["result"]["cancelled"], true);
+        let closed: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":6,
+                        "method":"agent.worker.close",
+                        "params":{
+                            "command_id":"cmd-agent-worker-close",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("worker close");
+        assert_eq!(closed["result"]["closed"], true);
+    }
+
+    #[tokio::test]
+    async fn agent_worker_attach_list_get_detach_and_close_are_supported() {
+        let cfg = BackendConfig {
+            browser_executable_or_channel: "__synthetic__".to_string(),
+            ..test_config("agent-lifecycle")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        let auth: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-auth",
+                    &json!({"id":1,"method":"session.create","params":{"command_id":"cmd-auth-agent-lifecycle"}}).to_string(),
+                )
+                .await,
+        )
+        .expect("auth");
+        let token = auth["result"]["token"].as_str().expect("token");
+
+        let worker: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":2,
+                        "method":"agent.worker.create",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-create",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("worker create");
+        let worker_id = worker["result"]["agent_worker_id"]
+            .as_str()
+            .expect("worker id");
+        let terminal_session_id = worker["result"]["terminal_session_id"]
+            .as_str()
+            .expect("terminal session")
+            .to_string();
+
+        let browser: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":3,
+                        "method":"browser.create",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-browser",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("browser create");
+        let browser_session_id = browser["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session")
+            .to_string();
+
+        let attach_browser: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":4,
+                        "method":"agent.attach.browser",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-attach-browser",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "browser_session_id":browser_session_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("attach browser");
+        assert_eq!(attach_browser["result"]["attached"], true);
+
+        let detach_terminal: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":5,
+                        "method":"agent.detach.terminal",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-detach-terminal",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("detach terminal");
+        assert_eq!(detach_terminal["result"]["attached"], false);
+
+        let attach_terminal: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":6,
+                        "method":"agent.attach.terminal",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-attach-terminal",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "terminal_session_id":terminal_session_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("attach terminal");
+        assert_eq!(attach_terminal["result"]["attached"], true);
+
+        let listed: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":7,
+                        "method":"agent.worker.list",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-list",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("worker list");
+        assert_eq!(listed["result"]["workers"][0]["agent_worker_id"], worker_id);
+
+        let fetched: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":8,
+                        "method":"agent.worker.get",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-get",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("worker get");
+        assert_eq!(fetched["result"]["browser_session_id"], browser_session_id);
+
+        let detach_browser: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":9,
+                        "method":"agent.detach.browser",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-detach-browser",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("detach browser");
+        assert_eq!(detach_browser["result"]["attached"], false);
+
+        let closed: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-agent",
+                    &json!({
+                        "id":10,
+                        "method":"agent.worker.close",
+                        "params":{
+                            "command_id":"cmd-agent-lifecycle-close",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id":worker_id,
+                            "auth":{"token":token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("worker close");
+        assert_eq!(closed["result"]["closed"], true);
+    }
+
+    #[tokio::test]
+    async fn browser_attachment_conflicts_across_workers() {
+        let cfg = BackendConfig {
+            browser_executable_or_channel: "__synthetic__".to_string(),
+            ..test_config("agent-browser-conflict")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        let auth: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn-auth",
+                    &json!({"id":1,"method":"session.create","params":{"command_id":"cmd-auth-agent-browser"}}).to_string(),
+                )
+                .await,
+        )
+        .expect("auth");
+        let token = auth["result"]["token"].as_str().expect("token");
+        let browser_session_id = "bs-test".to_string();
+        {
+            let mut browser_runtime = server.state.browser_runtime.lock().await;
+            browser_runtime.insert(
+                browser_session_id.clone(),
+                BrowserSessionRuntime {
+                    workspace_id: "ws-1".to_string(),
+                    surface_id: "sf-1".to_string(),
+                    attached: true,
+                    closed: false,
+                    status: "ready".to_string(),
+                    tabs: HashMap::new(),
+                    tracing_enabled: false,
+                    network_interception: false,
+                    runtime: "browser-simulated".to_string(),
+                    executable: "synthetic".to_string(),
+                    last_error: None,
+                    process: None,
+                    next_sequence: 1,
+                    history: VecDeque::new(),
+                    history_bytes: 0,
+                },
+            );
+        }
+        {
+            let mut workers = server.state.agent_workers.lock().await;
+            workers.insert(
+                "aw-a".to_string(),
+                AgentWorkerRuntime {
+                    workspace_id: "ws-1".to_string(),
+                    surface_id: "sf-1".to_string(),
+                    status: "ready".to_string(),
+                    terminal_session_id: "ts-a".to_string(),
+                    browser_session_id: None,
+                    current_task_id: None,
+                    closed: false,
+                },
+            );
+            workers.insert(
+                "aw-b".to_string(),
+                AgentWorkerRuntime {
+                    workspace_id: "ws-1".to_string(),
+                    surface_id: "sf-1".to_string(),
+                    status: "ready".to_string(),
+                    terminal_session_id: "ts-b".to_string(),
+                    browser_session_id: None,
+                    current_task_id: None,
+                    closed: false,
+                },
+            );
+        }
+
+        let _ = server
+            .handle_json_line(
+                "conn-agent",
+                &json!({
+                    "id":5,
+                    "method":"agent.attach.browser",
+                    "params":{
+                        "command_id":"cmd-agent-attach-browser-a",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "agent_worker_id":"aw-a",
+                        "browser_session_id":browser_session_id,
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let second = server
+            .handle_json_line(
+                "conn-agent",
+                &json!({
+                    "id":6,
+                    "method":"agent.attach.browser",
+                    "params":{
+                        "command_id":"cmd-agent-attach-browser-b",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "agent_worker_id":"aw-b",
+                        "browser_session_id":browser_session_id,
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&second).expect("json");
+        assert_eq!(parsed["error"]["code"], "CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn session_revoke_and_agent_task_list_are_supported() {
+        let server = RpcServer::new(test_config("session-revoke-agent-list")).expect("server");
+
+        let created: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 1,
+                        "method": "session.create",
+                        "params": {"command_id":"cmd-session-create"}
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let token = created["result"]["token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+
+        let worker: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 2,
+                        "method": "agent.worker.create",
+                        "params": {
+                            "command_id":"cmd-worker-create",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let worker_id = worker["result"]["agent_worker_id"]
+            .as_str()
+            .expect("worker id");
+
+        let task: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 3,
+                        "method": "agent.task.start",
+                        "params": {
+                            "command_id":"cmd-task-start",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "agent_worker_id": worker_id,
+                            "prompt":"echo hi",
+                            "auth":{"token": created["result"]["token"].as_str().expect("token")}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert!(task.get("result").is_some());
+
+        let task_list: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 4,
+                        "method": "agent.task.list",
+                        "params": {
+                            "command_id":"cmd-task-list",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token": created["result"]["token"].as_str().expect("token")}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(
+            task_list["result"]["tasks"].as_array().map(|v| v.len()),
+            Some(1)
+        );
+
+        let revoke: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 5,
+                        "method": "session.revoke",
+                        "params": {
+                            "command_id":"cmd-session-revoke",
+                            "auth":{"token": created["result"]["token"].as_str().expect("token")}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(revoke["result"]["revoked"], true);
+    }
+
+    #[tokio::test]
+    async fn browser_tab_list_focus_and_close_work() {
+        let server = RpcServer::new(test_config("browser-list-focus-close")).expect("server");
+        let session: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 1,
+                        "method": "session.create",
+                        "params": {"command_id":"cmd-auth-browser-list"}
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let token = session["result"]["token"].as_str().expect("token");
+
+        let browser: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 2,
+                        "method": "browser.create",
+                        "params": {
+                            "command_id":"cmd-browser-create",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let browser_session_id = browser["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session");
+
+        let tab: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 3,
+                        "method": "browser.tab.open",
+                        "params": {
+                            "command_id":"cmd-browser-tab-open",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "browser_session_id": browser_session_id,
+                            "auth":{"token": token},
+                            "url":"https://example.com"
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let tab_id = tab["result"]["browser_tab_id"].as_str().expect("tab id");
+
+        let list: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 4,
+                        "method": "browser.tab.list",
+                        "params": {
+                            "command_id":"cmd-browser-tab-list",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "browser_session_id": browser_session_id,
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(list["result"]["tabs"].as_array().map(|v| v.len()), Some(1));
+
+        let focus: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 5,
+                        "method": "browser.tab.focus",
+                        "params": {
+                            "command_id":"cmd-browser-tab-focus",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "browser_session_id": browser_session_id,
+                            "tab_id": tab_id,
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(focus["result"]["focused"], true);
+
+        let close: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 6,
+                        "method": "browser.tab.close",
+                        "params": {
+                            "command_id":"cmd-browser-tab-close",
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-1",
+                            "browser_session_id": browser_session_id,
+                            "tab_id": tab_id,
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(close["result"]["closed"], true);
     }
 }

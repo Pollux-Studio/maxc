@@ -80,6 +80,12 @@ Kill:
 cargo run -p maxc-cli -- terminal kill --token <token> --workspace-id ws-1 --surface-id sf-1 --terminal-session-id ts-123
 ```
 
+History:
+
+```bash
+cargo run -p maxc-cli -- terminal history --token <token> --workspace-id ws-1 --surface-id sf-1 --terminal-session-id ts-123 --from-sequence 10
+```
+
 ### Browser
 
 Create:
@@ -100,10 +106,48 @@ Navigate:
 cargo run -p maxc-cli -- browser goto --token <token> --workspace-id ws-1 --surface-id sf-1 --browser-session-id bs-123 --tab-id tab-123 --url https://example.com/dashboard
 ```
 
+History:
+
+```bash
+cargo run -p maxc-cli -- browser history --token <token> --workspace-id ws-1 --surface-id sf-1 --browser-session-id bs-123 --from-sequence 4
+```
+
 Close:
 
 ```bash
 cargo run -p maxc-cli -- browser close --token <token> --workspace-id ws-1 --surface-id sf-1 --browser-session-id bs-123
+```
+
+### Agent
+
+Create worker:
+
+```bash
+cargo run -p maxc-cli -- agent worker create --token <token> --workspace-id ws-1 --surface-id sf-1
+```
+
+List workers:
+
+```bash
+cargo run -p maxc-cli -- agent worker list --token <token> --workspace-id ws-1 --surface-id sf-1
+```
+
+Start task:
+
+```bash
+cargo run -p maxc-cli -- agent task start --token <token> --workspace-id ws-1 --surface-id sf-1 --agent-worker-id aw-123 --prompt "run tests"
+```
+
+Cancel task:
+
+```bash
+cargo run -p maxc-cli -- agent task cancel --token <token> --workspace-id ws-1 --surface-id sf-1 --agent-task-id at-123 --reason "user cancel"
+```
+
+Attach browser:
+
+```bash
+cargo run -p maxc-cli -- agent attach browser --token <token> --workspace-id ws-1 --surface-id sf-1 --agent-worker-id aw-123 --browser-session-id bs-123
 ```
 
 ## Proper Usage

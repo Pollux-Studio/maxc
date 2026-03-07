@@ -74,24 +74,104 @@ enum Command {
         tab_id: String,
         url: String,
     },
+    BrowserHistory {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        browser_session_id: String,
+        from_sequence: Option<u64>,
+        max_events: Option<usize>,
+    },
     BrowserClose {
         token: String,
         workspace_id: String,
         surface_id: String,
         browser_session_id: String,
     },
+    AgentWorkerCreate {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+    },
+    AgentWorkerList {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+    },
+    AgentWorkerGet {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+    },
+    AgentWorkerClose {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+    },
+    AgentTaskStart {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+        prompt: String,
+    },
+    AgentTaskList {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+    },
+    AgentTaskGet {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_task_id: String,
+        agent_worker_id: Option<String>,
+    },
+    AgentTaskCancel {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_task_id: String,
+        reason: Option<String>,
+    },
+    AgentAttachTerminal {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+        terminal_session_id: String,
+    },
+    AgentDetachTerminal {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+    },
+    AgentAttachBrowser {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+        browser_session_id: String,
+    },
+    AgentDetachBrowser {
+        token: String,
+        workspace_id: String,
+        surface_id: String,
+        agent_worker_id: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (pretty, command) = parse_cli(std::env::args().skip(1).collect())?;
-    let transport = NamedPipeTransport::new(r"\\.\pipe\maxc-rpc");
-    let response = transport.send(build_request(command)).await?;
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else {
-        println!("{}", serde_json::to_string(&response)?);
-    }
+    let output = run_cli(
+        std::env::args().skip(1).collect(),
+        &NamedPipeTransport::new(r"\\.\pipe\maxc-rpc"),
+    )
+    .await?;
+    println!("{output}");
     Ok(())
 }
 
@@ -139,6 +219,23 @@ impl RpcTransport for NamedPipeTransport {
     }
 }
 
+async fn run_cli(
+    args: Vec<String>,
+    transport: &impl RpcTransport,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pretty, command) = parse_cli(args)?;
+    let response = transport.send(build_request(command)).await?;
+    render_response(&response, pretty)
+}
+
+fn render_response(response: &Value, pretty: bool) -> Result<String, Box<dyn std::error::Error>> {
+    if pretty {
+        Ok(serde_json::to_string_pretty(response)?)
+    } else {
+        Ok(serde_json::to_string(response)?)
+    }
+}
+
 fn parse_cli(args: Vec<String>) -> Result<(bool, Command), Box<dyn std::error::Error>> {
     let mut args = args;
     let pretty = remove_flag(&mut args, "--pretty");
@@ -162,6 +259,7 @@ fn parse_cli(args: Vec<String>) -> Result<(bool, Command), Box<dyn std::error::E
         "session" => parse_session(&args[1..])?,
         "terminal" => parse_terminal(&args[1..])?,
         "browser" => parse_browser(&args[1..])?,
+        "agent" => parse_agent(&args[1..])?,
         _ => return Err(format!("unknown command: {}", args[0]).into()),
     };
     Ok((pretty, command))
@@ -256,6 +354,14 @@ fn parse_browser(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
             tab_id: required(&flags, "--tab-id")?,
             url: required(&flags, "--url")?,
         }),
+        "history" => Ok(Command::BrowserHistory {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            browser_session_id: required(&flags, "--browser-session-id")?,
+            from_sequence: optional_parse(&flags, "--from-sequence")?,
+            max_events: optional_parse(&flags, "--max-events")?,
+        }),
         "close" => Ok(Command::BrowserClose {
             token: required(&flags, "--token")?,
             workspace_id: required(&flags, "--workspace-id")?,
@@ -263,6 +369,90 @@ fn parse_browser(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
             browser_session_id: required(&flags, "--browser-session-id")?,
         }),
         _ => Err("unknown browser subcommand".into()),
+    }
+}
+
+fn parse_agent(args: &[String]) -> Result<Command, Box<dyn std::error::Error>> {
+    if args.len() < 2 {
+        return Err("missing agent subcommand".into());
+    }
+    let flags = parse_flags(&args[2..])?;
+    match (args[0].as_str(), args[1].as_str()) {
+        ("worker", "create") => Ok(Command::AgentWorkerCreate {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+        }),
+        ("worker", "list") => Ok(Command::AgentWorkerList {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+        }),
+        ("worker", "get") => Ok(Command::AgentWorkerGet {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+        }),
+        ("worker", "close") => Ok(Command::AgentWorkerClose {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+        }),
+        ("task", "start") => Ok(Command::AgentTaskStart {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+            prompt: required(&flags, "--prompt")?,
+        }),
+        ("task", "list") => Ok(Command::AgentTaskList {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+        }),
+        ("task", "get") => Ok(Command::AgentTaskGet {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_task_id: required(&flags, "--agent-task-id")?,
+            agent_worker_id: flags.get("--agent-worker-id").cloned(),
+        }),
+        ("task", "cancel") => Ok(Command::AgentTaskCancel {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_task_id: required(&flags, "--agent-task-id")?,
+            reason: flags.get("--reason").cloned(),
+        }),
+        ("attach", "terminal") => Ok(Command::AgentAttachTerminal {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+            terminal_session_id: required(&flags, "--terminal-session-id")?,
+        }),
+        ("detach", "terminal") => Ok(Command::AgentDetachTerminal {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+        }),
+        ("attach", "browser") => Ok(Command::AgentAttachBrowser {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+            browser_session_id: required(&flags, "--browser-session-id")?,
+        }),
+        ("detach", "browser") => Ok(Command::AgentDetachBrowser {
+            token: required(&flags, "--token")?,
+            workspace_id: required(&flags, "--workspace-id")?,
+            surface_id: required(&flags, "--surface-id")?,
+            agent_worker_id: required(&flags, "--agent-worker-id")?,
+        }),
+        _ => Err("unknown agent subcommand".into()),
     }
 }
 
@@ -489,6 +679,209 @@ fn build_request(command: Command) -> RpcRequest {
                 "auth": {"token": token}
             })),
         ),
+        Command::BrowserHistory {
+            token,
+            workspace_id,
+            surface_id,
+            browser_session_id,
+            from_sequence,
+            max_events,
+        } => request(
+            "browser.history",
+            Some(json!({
+                "command_id": command_id("browser-history"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "browser_session_id": browser_session_id,
+                "from_sequence": from_sequence,
+                "max_events": max_events,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentWorkerCreate {
+            token,
+            workspace_id,
+            surface_id,
+        } => request(
+            "agent.worker.create",
+            Some(json!({
+                "command_id": command_id("agent-worker-create"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentWorkerList {
+            token,
+            workspace_id,
+            surface_id,
+        } => request(
+            "agent.worker.list",
+            Some(json!({
+                "command_id": command_id("agent-worker-list"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentWorkerGet {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+        } => request(
+            "agent.worker.get",
+            Some(json!({
+                "command_id": command_id("agent-worker-get"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentWorkerClose {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+        } => request(
+            "agent.worker.close",
+            Some(json!({
+                "command_id": command_id("agent-worker-close"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentTaskStart {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+            prompt,
+        } => request(
+            "agent.task.start",
+            Some(json!({
+                "command_id": command_id("agent-task-start"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "prompt": prompt,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentTaskList {
+            token,
+            workspace_id,
+            surface_id,
+        } => request(
+            "agent.task.list",
+            Some(json!({
+                "command_id": command_id("agent-task-list"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentTaskGet {
+            token,
+            workspace_id,
+            surface_id,
+            agent_task_id,
+            agent_worker_id,
+        } => request(
+            "agent.task.get",
+            Some(json!({
+                "command_id": command_id("agent-task-get"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_task_id": agent_task_id,
+                "agent_worker_id": agent_worker_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentTaskCancel {
+            token,
+            workspace_id,
+            surface_id,
+            agent_task_id,
+            reason,
+        } => request(
+            "agent.task.cancel",
+            Some(json!({
+                "command_id": command_id("agent-task-cancel"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_task_id": agent_task_id,
+                "reason": reason,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentAttachTerminal {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+            terminal_session_id,
+        } => request(
+            "agent.attach.terminal",
+            Some(json!({
+                "command_id": command_id("agent-attach-terminal"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "terminal_session_id": terminal_session_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentDetachTerminal {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+        } => request(
+            "agent.detach.terminal",
+            Some(json!({
+                "command_id": command_id("agent-detach-terminal"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentAttachBrowser {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+            browser_session_id,
+        } => request(
+            "agent.attach.browser",
+            Some(json!({
+                "command_id": command_id("agent-attach-browser"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "browser_session_id": browser_session_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::AgentDetachBrowser {
+            token,
+            workspace_id,
+            surface_id,
+            agent_worker_id,
+        } => request(
+            "agent.detach.browser",
+            Some(json!({
+                "command_id": command_id("agent-detach-browser"),
+                "workspace_id": workspace_id,
+                "surface_id": surface_id,
+                "agent_worker_id": agent_worker_id,
+                "auth": {"token": token}
+            })),
+        ),
     }
 }
 
@@ -528,6 +921,16 @@ mod tests {
                 .handle_json_line("cli-test", &serde_json::to_string(&request)?)
                 .await;
             Ok(serde_json::from_str(&raw)?)
+        }
+    }
+
+    struct StaticTransport {
+        response: Value,
+    }
+
+    impl RpcTransport for StaticTransport {
+        async fn send(&self, _request: RpcRequest) -> Result<Value, Box<dyn std::error::Error>> {
+            Ok(self.response.clone())
         }
     }
 
@@ -678,6 +1081,21 @@ mod tests {
         ])
         .expect("browser close");
         assert_eq!(build_request(close).method, "browser.close");
+
+        let (_, history) = parse_cli(vec![
+            "browser".to_string(),
+            "history".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--workspace-id".to_string(),
+            "ws-1".to_string(),
+            "--surface-id".to_string(),
+            "sf-1".to_string(),
+            "--browser-session-id".to_string(),
+            "bs-1".to_string(),
+        ])
+        .expect("browser history");
+        assert_eq!(build_request(history).method, "browser.history");
     }
 
     #[test]
@@ -741,12 +1159,201 @@ mod tests {
     }
 
     #[test]
+    fn parse_agent_and_browser_history_commands() {
+        let cases = vec![
+            vec![
+                "browser",
+                "history",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--browser-session-id",
+                "bs-1",
+                "--from-sequence",
+                "7",
+            ],
+            vec![
+                "agent",
+                "worker",
+                "create",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+            ],
+            vec![
+                "agent",
+                "worker",
+                "list",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+            ],
+            vec![
+                "agent",
+                "worker",
+                "get",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+            ],
+            vec![
+                "agent",
+                "worker",
+                "close",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+            ],
+            vec![
+                "agent",
+                "task",
+                "start",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+                "--prompt",
+                "run tests",
+            ],
+            vec![
+                "agent",
+                "task",
+                "list",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+            ],
+            vec![
+                "agent",
+                "task",
+                "get",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-task-id",
+                "at-1",
+                "--agent-worker-id",
+                "aw-1",
+            ],
+            vec![
+                "agent",
+                "task",
+                "cancel",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-task-id",
+                "at-1",
+                "--reason",
+                "cancel",
+            ],
+            vec![
+                "agent",
+                "attach",
+                "terminal",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+                "--terminal-session-id",
+                "ts-1",
+            ],
+            vec![
+                "agent",
+                "detach",
+                "terminal",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+            ],
+            vec![
+                "agent",
+                "attach",
+                "browser",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+                "--browser-session-id",
+                "bs-1",
+            ],
+            vec![
+                "agent",
+                "detach",
+                "browser",
+                "--token",
+                "tok",
+                "--workspace-id",
+                "ws-1",
+                "--surface-id",
+                "sf-1",
+                "--agent-worker-id",
+                "aw-1",
+            ],
+        ];
+
+        for args in cases {
+            let (_, command) =
+                parse_cli(args.into_iter().map(ToString::to_string).collect()).expect("parse");
+            let request = build_request(command);
+            assert!(request.method.starts_with("agent.") || request.method == "browser.history");
+            assert!(request.params.is_some());
+        }
+    }
+
+    #[test]
     fn parse_errors_and_helpers_are_stable() {
         assert!(parse_cli(vec![]).is_err());
         assert!(parse_cli(vec!["wat".to_string()]).is_err());
         assert!(parse_session(&[]).is_err());
         assert!(parse_terminal(&[]).is_err());
         assert!(parse_browser(&[]).is_err());
+        assert!(parse_agent(&[]).is_err());
         assert!(parse_flags(&["value".to_string()]).is_err());
         assert!(parse_flags(&["--token".to_string()]).is_err());
 
@@ -777,6 +1384,31 @@ mod tests {
         assert_eq!(auth["auth"]["token"], "tok");
         assert_eq!(command_id("demo"), "cli-demo");
         assert_eq!(request("system.health", None).method, "system.health");
+        assert!(NamedPipeTransport::new("pipe-demo")
+            .pipe_name
+            .contains("pipe-demo"));
+    }
+
+    #[tokio::test]
+    async fn run_cli_renders_pretty_and_compact_output() {
+        let transport = StaticTransport {
+            response: json!({"result": {"ok": true}}),
+        };
+        let compact = run_cli(vec!["health".to_string()], &transport)
+            .await
+            .expect("compact");
+        assert_eq!(compact, "{\"result\":{\"ok\":true}}");
+
+        let pretty = run_cli(
+            vec!["--pretty".to_string(), "health".to_string()],
+            &transport,
+        )
+        .await
+        .expect("pretty");
+        assert!(pretty.contains('\n'));
+        assert!(render_response(&json!({"ok": true}), false)
+            .expect("render")
+            .contains("\"ok\":true"));
     }
 
     #[tokio::test]
@@ -821,12 +1453,108 @@ mod tests {
 
         let browser = transport
             .send(build_request(Command::BrowserCreate {
-                token,
+                token: token.clone(),
                 workspace_id: "ws-1".to_string(),
                 surface_id: "sf-1".to_string(),
             }))
             .await
             .expect("browser create");
-        assert!(browser["result"]["browser_session_id"].is_string());
+        let browser_session_id = browser["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session id")
+            .to_string();
+
+        let worker = transport
+            .send(build_request(Command::AgentWorkerCreate {
+                token: token.clone(),
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-2".to_string(),
+            }))
+            .await
+            .expect("worker create");
+        let worker_id = worker["result"]["agent_worker_id"]
+            .as_str()
+            .expect("worker id")
+            .to_string();
+
+        let task = transport
+            .send(build_request(Command::AgentTaskStart {
+                token: token.clone(),
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-2".to_string(),
+                agent_worker_id: worker_id.clone(),
+                prompt: "echo cli-agent".to_string(),
+            }))
+            .await
+            .expect("task start");
+        let task_id = task["result"]["agent_task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let workers = transport
+            .send(build_request(Command::AgentWorkerList {
+                token: token.clone(),
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-2".to_string(),
+            }))
+            .await
+            .expect("worker list");
+        assert_eq!(
+            workers["result"]["workers"][0]["agent_worker_id"],
+            worker_id
+        );
+
+        let fetched_task = transport
+            .send(build_request(Command::AgentTaskGet {
+                token: token.clone(),
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-2".to_string(),
+                agent_task_id: task_id.clone(),
+                agent_worker_id: Some(worker_id.clone()),
+            }))
+            .await
+            .expect("task get");
+        assert_eq!(fetched_task["result"]["agent_task_id"], task_id);
+
+        let cancelled = transport
+            .send(build_request(Command::AgentTaskCancel {
+                token,
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-2".to_string(),
+                agent_task_id: task_id,
+                reason: Some("cli test".to_string()),
+            }))
+            .await
+            .expect("task cancel");
+        assert_eq!(cancelled["result"]["cancelled"], true);
+
+        let closed = transport
+            .send(build_request(Command::AgentWorkerClose {
+                token: created["result"]["token"]
+                    .as_str()
+                    .expect("token")
+                    .to_string(),
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-2".to_string(),
+                agent_worker_id: worker_id,
+            }))
+            .await
+            .expect("worker close");
+        assert_eq!(closed["result"]["closed"], true);
+
+        let browser_closed = transport
+            .send(build_request(Command::BrowserClose {
+                token: created["result"]["token"]
+                    .as_str()
+                    .expect("token")
+                    .to_string(),
+                workspace_id: "ws-1".to_string(),
+                surface_id: "sf-1".to_string(),
+                browser_session_id,
+            }))
+            .await
+            .expect("browser close");
+        assert_eq!(browser_closed["result"]["closed"], true);
     }
 }

@@ -17,7 +17,8 @@ The backend is implemented as a Rust workspace centered on a local JSON-RPC serv
 
 - Session APIs: create, refresh, revoke.
 - Terminal APIs: spawn, input, resize, history, kill, subscribe.
-- Browser APIs: create, attach, detach, close, tab open/list/focus/close, goto/reload/back/forward, click/type/key/wait/screenshot/evaluate, cookie and storage controls, network intercept toggle, upload/download, tracing, raw commands, subscribe.
+- Browser APIs: create, attach, detach, close, tab open/list/focus/close, goto/reload/back/forward, click/type/key/wait/screenshot/evaluate, cookie and storage controls, network intercept toggle, upload/download, tracing, raw commands, history, subscribe.
+- Agent APIs: worker create/list/get/close, task start/list/get/cancel, terminal attach/detach, browser attach/detach.
 - System APIs: health, readiness, diagnostics, metrics, logs.
 - Reliability: rate limiting, overload rejection, request timeout, breaker, graceful shutdown, fault injection, recovery, idempotent `command_id`.
 - Terminal policy controls: session, input, env, and history limits plus optional cwd/program allowlists.
@@ -39,6 +40,8 @@ For frontend implementation, use `frontend-integration.md` together with `rpc-ap
 
 - Terminal execution is now backed by real local processes through the `terminal.*` RPC surface. On Windows the backend prefers ConPTY for process execution and resize behavior; non-Windows and test flows fall back to `process-stdio`.
 - Browser execution now prefers a real Chromium-backed CDP runtime and falls back to the synthetic runtime only when the current environment cannot launch a browser process.
+- Browser and terminal subscriptions now carry ordered `sequence`, `timestamp_ms`, `status`, and `runtime` fields, and both runtimes expose history APIs for reconnect-safe redraw.
+- Multi-agent orchestration runs on top of the existing real terminal runtime. Each worker owns one primary terminal session and may hold one browser session attachment at a time.
 - `system.health` is unauthenticated.
 - `system.readiness`, `system.diagnostics`, `system.metrics`, and `system.logs` require a valid session token.
 - The installed CLI binary name is `maxc-cli`. In examples below, use `cargo run -p maxc-cli -- ...` unless you rename the produced binary later.

@@ -78,7 +78,7 @@ Successful `terminal.spawn` responses now include additive real-runtime metadata
   - Returns `ok`, `version`, `shutting_down`, `breaker_open`, `active_requests`, `uptime_ms`.
 - `system.readiness`
   - Requires auth.
-  - Returns `ready`, `accepting_requests`, `breaker_open`, `queue_saturated`, `store_available`.
+  - Returns `ready`, `accepting_requests`, `breaker_open`, `queue_saturated`, `store_available`, `browser_runtime_ready`, `terminal_runtime_ready`.
 - `system.diagnostics`
   - Requires auth.
   - Returns session counts, runtime counts, subscription counts, breaker and shutdown state, and embedded metric snapshots.
@@ -161,6 +161,7 @@ Automation:
 - `browser.download`
 - `browser.trace.start`
 - `browser.trace.stop`
+- `browser.history`
 - `browser.subscribe`
 - `browser.raw.command`
 
@@ -168,6 +169,29 @@ Browser runtime notes:
 
 - `browser.create`, `browser.tab.open`, navigation methods, `browser.evaluate`, and `browser.screenshot` now prefer a real Chromium-backed runtime and return additive fields such as `runtime`, `title`, `load_state`, `artifact_path`, and `artifact_bytes`.
 - When the backend cannot launch a browser in the current environment, browser sessions fall back to a synthetic runtime and continue to preserve the same RPC envelopes.
+- `browser.subscribe` events and `browser.history` entries include ordered `sequence`, `timestamp_ms`, `status`, and `runtime` fields for reconnect-safe redraw.
+
+## Agent Methods
+
+- `agent.worker.create`
+- `agent.worker.list`
+- `agent.worker.get`
+- `agent.worker.close`
+- `agent.task.start`
+- `agent.task.list`
+- `agent.task.get`
+- `agent.task.cancel`
+- `agent.attach.terminal`
+- `agent.detach.terminal`
+- `agent.attach.browser`
+- `agent.detach.browser`
+
+Agent runtime notes:
+
+- `agent.worker.create` provisions a dedicated terminal-backed worker and returns `agent_worker_id`, `status`, and `terminal_session_id`.
+- `agent.task.start` routes work to the worker terminal and returns `agent_task_id`, `status`, `terminal_session_id`, and the last known terminal output sequence.
+- Browser attachment is exclusive per browser session. A second `agent.attach.browser` against the same `browser_session_id` returns `CONFLICT`.
+- `system.diagnostics` now exposes agent workers and tasks in addition to terminal and browser runtime state.
 
 Example:
 

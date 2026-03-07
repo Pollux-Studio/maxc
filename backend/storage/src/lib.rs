@@ -38,6 +38,14 @@ pub enum EventType {
     BrowserNavigationRequested,
     BrowserNavigationCompleted,
     BrowserNavigationFailed,
+    AgentWorkerCreated,
+    AgentWorkerClosed,
+    AgentTaskStarted,
+    AgentTaskCancelled,
+    AgentTerminalAttached,
+    AgentTerminalDetached,
+    AgentBrowserAttached,
+    AgentBrowserDetached,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,12 +121,36 @@ pub struct BrowserTabProjection {
     pub closed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWorkerProjection {
+    pub agent_worker_id: String,
+    pub workspace_id: String,
+    pub surface_id: String,
+    pub status: String,
+    pub terminal_session_id: Option<String>,
+    pub browser_session_id: Option<String>,
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskProjection {
+    pub agent_task_id: String,
+    pub agent_worker_id: String,
+    pub status: String,
+    pub terminal_session_id: Option<String>,
+    pub browser_session_id: Option<String>,
+    pub last_output_sequence: u64,
+    pub failure_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectionState {
     pub sessions: HashMap<String, SessionProjection>,
     pub browser_sessions: HashMap<String, BrowserSessionProjection>,
     pub browser_tabs: HashMap<String, BrowserTabProjection>,
     pub browser_automation_state: HashMap<String, Value>,
+    pub agent_workers: HashMap<String, AgentWorkerProjection>,
+    pub agent_tasks: HashMap<String, AgentTaskProjection>,
     pub command_results: HashMap<String, Value>,
     pub last_cursor: ReplayCursor,
 }
@@ -268,6 +300,138 @@ impl ProjectionState {
                         }
                     }
                 }
+            }
+            EventType::AgentWorkerCreated => {
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let surface_id = payload_str(&record.payload, "surface_id")?;
+                let status = record
+                    .payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ready")
+                    .to_string();
+                let terminal_session_id = record
+                    .payload
+                    .get("terminal_session_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                self.agent_workers.insert(
+                    agent_worker_id.to_string(),
+                    AgentWorkerProjection {
+                        agent_worker_id: agent_worker_id.to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        surface_id: surface_id.to_string(),
+                        status,
+                        terminal_session_id,
+                        browser_session_id: None,
+                        closed: false,
+                    },
+                );
+            }
+            EventType::AgentWorkerClosed => {
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let worker = self.agent_workers.get_mut(agent_worker_id).ok_or_else(|| {
+                    StoreError::InvalidPayload("close for unknown agent worker".to_string())
+                })?;
+                worker.closed = true;
+                worker.status = "closed".to_string();
+            }
+            EventType::AgentTaskStarted => {
+                let agent_task_id = payload_str(&record.payload, "agent_task_id")?;
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let status = record
+                    .payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("running")
+                    .to_string();
+                let terminal_session_id = record
+                    .payload
+                    .get("terminal_session_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let browser_session_id = record
+                    .payload
+                    .get("browser_session_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                self.agent_tasks.insert(
+                    agent_task_id.to_string(),
+                    AgentTaskProjection {
+                        agent_task_id: agent_task_id.to_string(),
+                        agent_worker_id: agent_worker_id.to_string(),
+                        status,
+                        terminal_session_id,
+                        browser_session_id,
+                        last_output_sequence: record
+                            .payload
+                            .get("last_output_sequence")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        failure_reason: record
+                            .payload
+                            .get("failure_reason")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    },
+                );
+                if let Some(worker) = self.agent_workers.get_mut(agent_worker_id) {
+                    worker.status = "running".to_string();
+                }
+            }
+            EventType::AgentTaskCancelled => {
+                let agent_task_id = payload_str(&record.payload, "agent_task_id")?;
+                let task = self.agent_tasks.get_mut(agent_task_id).ok_or_else(|| {
+                    StoreError::InvalidPayload("cancel for unknown agent task".to_string())
+                })?;
+                task.status = "cancelled".to_string();
+                task.failure_reason = record
+                    .payload
+                    .get("failure_reason")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                if let Some(worker) = self.agent_workers.get_mut(&task.agent_worker_id) {
+                    worker.status = "ready".to_string();
+                }
+            }
+            EventType::AgentTerminalAttached => {
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let terminal_session_id = payload_str(&record.payload, "terminal_session_id")?;
+                let worker = self.agent_workers.get_mut(agent_worker_id).ok_or_else(|| {
+                    StoreError::InvalidPayload(
+                        "terminal attach for unknown agent worker".to_string(),
+                    )
+                })?;
+                worker.terminal_session_id = Some(terminal_session_id.to_string());
+            }
+            EventType::AgentTerminalDetached => {
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let worker = self.agent_workers.get_mut(agent_worker_id).ok_or_else(|| {
+                    StoreError::InvalidPayload(
+                        "terminal detach for unknown agent worker".to_string(),
+                    )
+                })?;
+                worker.terminal_session_id = None;
+            }
+            EventType::AgentBrowserAttached => {
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let browser_session_id = payload_str(&record.payload, "browser_session_id")?;
+                let worker = self.agent_workers.get_mut(agent_worker_id).ok_or_else(|| {
+                    StoreError::InvalidPayload(
+                        "browser attach for unknown agent worker".to_string(),
+                    )
+                })?;
+                worker.browser_session_id = Some(browser_session_id.to_string());
+            }
+            EventType::AgentBrowserDetached => {
+                let agent_worker_id = payload_str(&record.payload, "agent_worker_id")?;
+                let worker = self.agent_workers.get_mut(agent_worker_id).ok_or_else(|| {
+                    StoreError::InvalidPayload(
+                        "browser detach for unknown agent worker".to_string(),
+                    )
+                })?;
+                worker.browser_session_id = None;
             }
         }
 

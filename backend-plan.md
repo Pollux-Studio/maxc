@@ -105,22 +105,22 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 ## Phase 9: Frontend Runtime Contract
 
 ### Tasks
-- [ ] Finalize terminal and browser event payload contracts with sequence/cursor support.
-- [ ] Add reconnect-safe runtime status and readback APIs for frontend rendering.
-- [ ] Finalize session/action gating and degraded-state contracts for the frontend.
-- [ ] Add CLI and integration coverage for reconnect-safe flows.
-- [ ] **Phase Quality Gate (Mandatory)**
-- [ ] **Commit Phase Changes (Mandatory)**
+- [x] Finalize terminal and browser event payload contracts with sequence/cursor support.
+- [x] Add reconnect-safe runtime status and readback APIs for frontend rendering.
+- [x] Finalize session/action gating and degraded-state contracts for the frontend.
+- [x] Add CLI and integration coverage for reconnect-safe flows.
+- [x] **Phase Quality Gate (Mandatory)**
+- [x] **Commit Phase Changes (Mandatory)**
 
 ## Phase 10: Multi-Agent Orchestration
 
 ### Tasks
-- [ ] Add agent worker, task, and delegation models.
-- [ ] Add RPCs for worker lifecycle, task routing, inspection, and cancellation.
-- [ ] Allow multiple concurrent agent workers to own real terminal and browser resources safely.
-- [ ] Expose worker state in diagnostics and frontend-facing status payloads.
-- [ ] **Phase Quality Gate (Mandatory)**
-- [ ] **Commit Phase Changes (Mandatory)**
+- [x] Add agent worker, task, and delegation models.
+- [x] Add RPCs for worker lifecycle, task routing, inspection, and cancellation.
+- [x] Allow multiple concurrent agent workers to own real terminal and browser resources safely.
+- [x] Expose worker state in diagnostics and frontend-facing status payloads.
+- [x] **Phase Quality Gate (Mandatory)**
+- [x] **Commit Phase Changes (Mandatory)**
 
 ## Phase 11: Security and Isolation
 

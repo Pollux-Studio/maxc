@@ -25,6 +25,8 @@ Disable mutating controls when:
 - `system.readiness.accepting_requests` is `false`
 - `system.readiness.breaker_open` is `true`
 - `system.readiness.queue_saturated` is `true`
+- `system.readiness.browser_runtime_ready` is `false` for browser actions
+- `system.readiness.terminal_runtime_ready` is `false` for terminal or agent actions
 
 ### 2. Session lifecycle
 
@@ -62,7 +64,8 @@ Frontend state should track:
 5. Navigate with `browser.goto`, `browser.reload`, `browser.back`, and `browser.forward`.
 6. Use action methods such as `browser.click`, `browser.type`, `browser.key`, and `browser.wait`.
 7. Use `browser.subscribe` to update the browser panel state.
-8. Close tabs with `browser.tab.close` and sessions with `browser.close`.
+8. Use `browser.history` after reconnects or detected sequence gaps to recover buffered browser events.
+9. Close tabs with `browser.tab.close` and sessions with `browser.close`.
 
 Frontend state should track:
 
@@ -75,6 +78,27 @@ Frontend state should track:
 - loading state
 - subscription status
 - last browser event timestamp
+- last browser event sequence
+
+### 5. Agent screen flow
+
+1. Call `agent.worker.create` to provision a worker with its own terminal session.
+2. Store `agent_worker_id` and the returned `terminal_session_id`.
+3. Optionally attach a browser session with `agent.attach.browser`.
+4. Start work with `agent.task.start`.
+5. Use `agent.worker.get`, `agent.task.get`, `system.diagnostics`, and the terminal/browser subscriptions to render current worker state.
+6. Cancel work with `agent.task.cancel` or close the worker with `agent.worker.close`.
+
+Frontend state should track:
+
+- `agent_worker_id`
+- `agent_task_id`
+- assigned `terminal_session_id`
+- optional `browser_session_id`
+- worker `status`
+- task `status`
+- last terminal output sequence
+- failure reason if present
 
 ### 5. Diagnostics and operator views
 
@@ -151,6 +175,7 @@ Use this model:
 - `system.logs`: poll every 3-5 seconds on an active logs screen
 - `terminal.subscribe` and `browser.subscribe`: keep active while the matching panel is visible
 - `terminal.history`: call on reconnect, restore, or detected sequence gap
+- `browser.history`: call on reconnect, restore, or detected sequence gap
 
 If a subscription fails:
 
@@ -158,7 +183,8 @@ If a subscription fails:
 2. mark it degraded
 3. offer reconnect
 4. call `terminal.history` from the last known sequence for redraw
-5. continue limited polling from diagnostics if available
+5. call `browser.history` from the last known sequence for browser redraw if needed
+6. continue limited polling from diagnostics if available
 
 ## UI State Mapping
 
@@ -230,6 +256,8 @@ Display at minimum:
 - call readiness before enabling mutating actions
 - support terminal lifecycle methods
 - support browser lifecycle, tab, and navigation methods
+- support browser history recovery
+- support agent worker/task lifecycle and ownership state
 - expose diagnostics, metrics, and logs views
 - handle every documented error code
 - generate unique `id` and `command_id` values
