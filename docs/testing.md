@@ -35,7 +35,7 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 ## Perf Verification
 
 ```bash
-cargo run -p maxc-automation --bin perf-harness --offline -- --profile ci --json
+cargo run -p maxc-automation --bin perf-harness --offline -- --mode synthetic --profile ci --json
 ```
 
 Use the perf harness when changing:
@@ -45,6 +45,16 @@ Use the perf harness when changing:
 - subscription fan-out
 - overload controls
 - diagnostics or instrumentation that touches hot paths
+
+Use real-runtime validation on a Windows machine with local terminal and browser dependencies available:
+
+```bash
+cargo run -p maxc-automation --bin perf-harness --offline -- --mode real-runtime --profile ci --json
+```
+
+- `--mode synthetic` is the deterministic CI baseline.
+- `--mode real-runtime` validates ConPTY, real browser startup, screenshots, and agent worker startup against `perf-baseline-real.json`.
+- The real-runtime suite is expected to run on Windows only.
 
 ## Offline Notes
 
@@ -59,3 +69,17 @@ When updating docs or examples:
 2. Verify the RPC method exists.
 3. Verify required auth and IDs match the implementation.
 4. Re-run at least the targeted crate tests for the touched surface.
+
+## Release Gate
+
+For a release-quality backend change, run:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
+cargo test --workspace --all-features --offline
+cargo run -p maxc-automation --bin perf-harness --offline -- --mode synthetic --profile ci --json
+cargo llvm-cov --workspace --all-features --fail-under-lines 85
+```
+
+Then run the Windows-only real-runtime perf suite before calling the backend release-ready.

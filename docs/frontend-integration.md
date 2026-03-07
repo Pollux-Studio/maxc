@@ -27,6 +27,8 @@ Disable mutating controls when:
 - `system.readiness.queue_saturated` is `true`
 - `system.readiness.browser_runtime_ready` is `false` for browser actions
 - `system.readiness.terminal_runtime_ready` is `false` for terminal or agent actions
+- `system.readiness.artifact_root_ready` is `false` for browser screenshot/download/trace actions
+- `system.readiness.event_store_ready` is `false` for any mutating flow that must persist state
 
 ### 2. Session lifecycle
 
@@ -263,10 +265,12 @@ Display at minimum:
 - handle every documented error code
 - generate unique `id` and `command_id` values
 - show degraded state for breaker-open, queue saturation, and shutdown
+- show degraded state when readiness reports missing runtime or storage dependencies
 
 ## Known Backend Limits
 
 - Terminal sessions now run real local processes and stream real output through `terminal.subscribe`.
 - Browser sessions prefer the real Chromium-backed runtime and fall back to a synthetic session only when the backend cannot launch a browser in the current environment.
+- Frontend should read `system.readiness` instead of inferring runtime availability from optimistic UI state. Browser, artifact, and storage dependency failures are surfaced explicitly there.
 - Non-Windows named-pipe transport is not implemented in the CLI.
 - The frontend should build against the RPC contract, not hidden assumptions about process or browser embedding internals.

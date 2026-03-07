@@ -17,6 +17,10 @@ Health indicates the process is alive. Readiness indicates it is safe to accept 
   - `accepting_requests` is `false`
   - `breaker_open` is `true`
   - `queue_saturated` is `true`
+  - `terminal_runtime_ready` is `false`
+  - `browser_runtime_ready` is `false` for browser-dependent flows
+  - `artifact_root_ready` is `false`
+  - `event_store_ready` is `false`
 
 ## Diagnostics
 
@@ -43,6 +47,7 @@ Use these in order:
 - Cleanup runs on backend startup and after artifact writes.
 - Retention is controlled by `MAXC_ARTIFACT_MAX_FILES`, `MAXC_ARTIFACT_MAX_TOTAL_BYTES`, `MAXC_ARTIFACT_TTL_MS`, and `MAXC_ARTIFACT_MAX_FILES_PER_SESSION`.
 - Use `system.diagnostics` or `system.metrics` to inspect current retained artifact counts and bytes.
+- `system.metrics` also exposes cleanup counters so operators can see evictions and cleanup runs.
 
 ## Graceful Shutdown
 
@@ -69,10 +74,27 @@ Use these in order:
 Run:
 
 ```bash
-cargo run -p maxc-automation --bin perf-harness --offline -- --profile ci --json
+cargo run -p maxc-automation --bin perf-harness --offline -- --mode synthetic --profile ci --json
 ```
 
 Compare results against `backend/automation/perf-baseline.json`.
+
+Before a Windows release or environment certification, also run:
+
+```bash
+cargo run -p maxc-automation --bin perf-harness --offline -- --mode real-runtime --profile ci --json
+```
+
+Compare those results against `backend/automation/perf-baseline-real.json`.
+
+## Release Checklist
+
+1. Confirm `system.health` returns `ok: true`.
+2. Confirm `system.readiness` returns `ready: true`, `terminal_runtime_ready: true`, `artifact_root_ready: true`, and `event_store_ready: true`.
+3. Confirm `browser_runtime_ready: true` before enabling browser or browser-backed agent flows.
+4. Run the synthetic validation suite and coverage gate.
+5. Run the Windows real-runtime perf suite.
+6. Inspect `system.diagnostics` and `system.metrics` for cleanup counters, active runtime counts, and dependency health before signoff.
 
 ## Example Diagnostic Flow
 

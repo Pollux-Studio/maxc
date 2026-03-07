@@ -21,6 +21,7 @@ The backend is implemented as a Rust workspace centered on a local JSON-RPC serv
 - Agent APIs: worker create/list/get/close, task start/list/get/cancel, terminal attach/detach, browser attach/detach.
 - System APIs: health, readiness, diagnostics, metrics, logs.
 - Reliability: rate limiting, overload rejection, request timeout, breaker, graceful shutdown, fault injection, recovery, idempotent `command_id`.
+- Release gate: synthetic CI perf guardrails, Windows real-runtime perf guardrails, dependency-aware readiness, artifact cleanup accounting, and restart-safe runtime recovery.
 - Security and policy controls: token scopes, ownership checks, terminal env/cwd/program allowlists, browser raw-command toggle, bounded browser artifact retention, and prompt/log redaction.
 - Observability: structured logs, spans, metrics snapshots, diagnostics RPCs.
 
@@ -42,6 +43,7 @@ For frontend implementation, use `frontend-integration.md` together with `rpc-ap
 - Browser execution now prefers a real Chromium-backed CDP runtime and falls back to the synthetic runtime only when the current environment cannot launch a browser process.
 - Browser and terminal subscriptions now carry ordered `sequence`, `timestamp_ms`, `status`, and `runtime` fields, and both runtimes expose history APIs for reconnect-safe redraw.
 - Multi-agent orchestration runs on top of the existing real terminal runtime. Each worker owns one primary terminal session and may hold one browser session attachment at a time.
+- `system.readiness` now reflects real dependency health for terminal runtime, browser runtime, artifact storage, and event-store writability instead of assuming those dependencies are available.
 - `system.health` is unauthenticated.
 - `system.readiness`, `system.diagnostics`, `system.metrics`, and `system.logs` require a valid session token.
 - Session tokens now carry additive `scopes` so diagnostics, runtime, and agent actions can be separated without changing the transport.

@@ -23,6 +23,7 @@ struct ThresholdConfig {
 #[derive(Debug, Clone)]
 struct BenchmarkResult {
     profile: String,
+    mode: String,
     iterations: usize,
     p50_ms: f64,
     p95_ms: f64,
@@ -51,12 +52,17 @@ struct CliRun {
 
 async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>> {
     let mut profile = String::from("ci");
+    let mut mode = String::from("synthetic");
     let mut json_output = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
             "--profile" if idx + 1 < args.len() => {
                 profile = args[idx + 1].clone();
+                idx += 1;
+            }
+            "--mode" if idx + 1 < args.len() => {
+                mode = args[idx + 1].clone();
                 idx += 1;
             }
             "--json" => {
@@ -66,24 +72,22 @@ async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>
         }
         idx += 1;
     }
-    execute_suite(&profile, json_output).await
+    execute_suite(&profile, &mode, json_output).await
 }
 
 async fn execute_suite(
     profile: &str,
+    mode: &str,
     json_output: bool,
 ) -> Result<CliRun, Box<dyn std::error::Error>> {
-    let profiles = load_profile_configs()?;
-    let thresholds = load_thresholds()?;
+    let mode = match mode {
+        "synthetic" | "real-runtime" => mode,
+        other => return Err(format!("unknown perf mode: {other}").into()),
+    };
+    let profiles = load_profile_configs(mode)?;
+    let thresholds = load_thresholds(mode)?;
     let names = if profile == "ci" {
-        vec![
-            "rpc_health",
-            "session_lifecycle",
-            "terminal_interactive",
-            "browser_navigation",
-            "browser_fanout",
-            "restart_recovery",
-        ]
+        default_suite_profiles(mode)
     } else {
         vec![profile]
     };
@@ -95,7 +99,7 @@ async fn execute_suite(
             .cloned()
             .unwrap_or_else(|| default_profile(name));
         let threshold = thresholds.get(name).cloned().unwrap_or_default();
-        let result = run_profile(name, &profile_cfg, &threshold).await?;
+        let result = run_profile(name, mode, &profile_cfg, &threshold).await?;
         results.push(result);
     }
 
@@ -103,10 +107,12 @@ async fn execute_suite(
     let output = if json_output {
         let payload = json!({
             "suite": profile,
+            "mode": mode,
             "pass": ok,
             "results": results.iter().map(|result| {
                 json!({
                     "profile": result.profile,
+                    "mode": result.mode,
                     "iterations": result.iterations,
                     "p50_ms": result.p50_ms,
                     "p95_ms": result.p95_ms,
@@ -121,8 +127,9 @@ async fn execute_suite(
         let mut text = String::new();
         for result in &results {
             text.push_str(&format!(
-                "{}: p50={:.2}ms p95={:.2}ms max={:.2}ms throughput={:.2}/s pass={}\n",
+                "{} [{}]: p50={:.2}ms p95={:.2}ms max={:.2}ms throughput={:.2}/s pass={}\n",
                 result.profile,
+                result.mode,
                 result.p50_ms,
                 result.p95_ms,
                 result.max_ms,
@@ -138,6 +145,7 @@ async fn execute_suite(
 
 async fn run_profile(
     name: &str,
+    mode: &str,
     profile_cfg: &ProfileConfig,
     threshold: &ThresholdConfig,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
@@ -148,14 +156,30 @@ async fn run_profile(
         event_dir: event_dir.to_string_lossy().to_string(),
         ..BackendConfig::default()
     };
-    if name == "terminal_interactive" {
+    if mode == "synthetic" && name == "terminal_interactive" {
         config.terminal_runtime = "process-stdio".to_string();
     }
-    if matches!(
-        name,
-        "browser_navigation" | "browser_fanout" | "restart_recovery"
-    ) {
+    if mode == "synthetic"
+        && matches!(
+            name,
+            "browser_navigation" | "browser_fanout" | "restart_recovery"
+        )
+    {
         config.browser_executable_or_channel = "__synthetic__".to_string();
+    }
+    if mode == "real-runtime" {
+        if !cfg!(windows) {
+            return Err("real-runtime perf mode requires Windows".into());
+        }
+        if matches!(
+            name,
+            "browser_create_latency" | "browser_navigation_latency" | "browser_screenshot_latency"
+        ) && !browser_runtime_available(&config)
+        {
+            return Err(
+                "real-runtime browser benchmarks require a local Chromium or Edge install".into(),
+            );
+        }
     }
     let server = RpcServer::new(config)?;
 
@@ -392,6 +416,188 @@ async fn run_profile(
             let _ = restarted.session_count().await;
             samples.push(restart_start.elapsed().as_secs_f64() * 1000.0);
         }
+        "terminal_spawn_latency" => {
+            let token = create_token(&server).await?;
+            for iter in 0..(profile_cfg.warmup + profile_cfg.iterations) {
+                let req = json!({
+                    "id": iter as i64 + 100,
+                    "method": "terminal.spawn",
+                    "params": {
+                        "command_id": format!("cmd-real-term-spawn-{iter}"),
+                        "workspace_id": format!("ws-real-{iter}"),
+                        "surface_id": format!("sf-real-{iter}"),
+                        "auth":{"token": token},
+                        "shell": benchmark_terminal_shell()
+                    }
+                });
+                let sample = measure_async(issue(&server, iter, req)).await?;
+                if iter >= profile_cfg.warmup {
+                    samples.push(sample);
+                }
+            }
+        }
+        "browser_create_latency" => {
+            let token = create_token(&server).await?;
+            for iter in 0..(profile_cfg.warmup + profile_cfg.iterations) {
+                let req = json!({
+                    "id": iter as i64 + 200,
+                    "method": "browser.create",
+                    "params": {
+                        "command_id": format!("cmd-real-browser-create-{iter}"),
+                        "workspace_id":"ws-real",
+                        "surface_id": format!("sf-browser-{iter}"),
+                        "auth":{"token": token}
+                    }
+                });
+                let sample = measure_async(issue(&server, iter, req)).await?;
+                if iter >= profile_cfg.warmup {
+                    samples.push(sample);
+                }
+            }
+        }
+        "browser_navigation_latency" => {
+            let token = create_token(&server).await?;
+            let browser = issue(
+                &server,
+                1,
+                json!({
+                    "id": 1,
+                    "method": "browser.create",
+                    "params": {
+                        "command_id":"cmd-real-browser-create",
+                        "workspace_id":"ws-real",
+                        "surface_id":"sf-real",
+                        "auth":{"token": token}
+                    }
+                }),
+            )
+            .await?;
+            let browser_session_id = browser["result"]["browser_session_id"]
+                .as_str()
+                .ok_or("missing browser session id")?
+                .to_string();
+            let tab = issue(
+                &server,
+                2,
+                json!({
+                    "id": 2,
+                    "method": "browser.tab.open",
+                    "params": {
+                        "command_id":"cmd-real-browser-tab",
+                        "workspace_id":"ws-real",
+                        "surface_id":"sf-real",
+                        "browser_session_id": browser_session_id,
+                        "auth":{"token": token},
+                        "url":"https://example.com"
+                    }
+                }),
+            )
+            .await?;
+            let browser_tab_id = tab["result"]["browser_tab_id"]
+                .as_str()
+                .ok_or("missing browser tab id")?
+                .to_string();
+            for iter in 0..(profile_cfg.warmup + profile_cfg.iterations) {
+                let req = json!({
+                    "id": iter as i64 + 210,
+                    "method": "browser.goto",
+                    "params": {
+                        "command_id": format!("cmd-real-browser-goto-{iter}"),
+                        "workspace_id":"ws-real",
+                        "surface_id":"sf-real",
+                        "browser_session_id": browser_session_id,
+                        "tab_id": browser_tab_id,
+                        "auth":{"token": token},
+                        "url": format!("https://example.com/real/{iter}")
+                    }
+                });
+                let sample = measure_async(issue(&server, iter, req)).await?;
+                if iter >= profile_cfg.warmup {
+                    samples.push(sample);
+                }
+            }
+        }
+        "browser_screenshot_latency" => {
+            let token = create_token(&server).await?;
+            let browser = issue(
+                &server,
+                1,
+                json!({
+                    "id": 1,
+                    "method": "browser.create",
+                    "params": {
+                        "command_id":"cmd-real-shot-create",
+                        "workspace_id":"ws-real",
+                        "surface_id":"sf-real",
+                        "auth":{"token": token}
+                    }
+                }),
+            )
+            .await?;
+            let browser_session_id = browser["result"]["browser_session_id"]
+                .as_str()
+                .ok_or("missing browser session id")?
+                .to_string();
+            let tab = issue(
+                &server,
+                2,
+                json!({
+                    "id": 2,
+                    "method": "browser.tab.open",
+                    "params": {
+                        "command_id":"cmd-real-shot-tab",
+                        "workspace_id":"ws-real",
+                        "surface_id":"sf-real",
+                        "browser_session_id": browser_session_id,
+                        "auth":{"token": token},
+                        "url":"https://example.com"
+                    }
+                }),
+            )
+            .await?;
+            let browser_tab_id = tab["result"]["browser_tab_id"]
+                .as_str()
+                .ok_or("missing browser tab id")?
+                .to_string();
+            for iter in 0..(profile_cfg.warmup + profile_cfg.iterations) {
+                let req = json!({
+                    "id": iter as i64 + 220,
+                    "method": "browser.screenshot",
+                    "params": {
+                        "command_id": format!("cmd-real-shot-{iter}"),
+                        "workspace_id":"ws-real",
+                        "surface_id":"sf-real",
+                        "browser_session_id": browser_session_id,
+                        "tab_id": browser_tab_id,
+                        "auth":{"token": token}
+                    }
+                });
+                let sample = measure_async(issue(&server, iter, req)).await?;
+                if iter >= profile_cfg.warmup {
+                    samples.push(sample);
+                }
+            }
+        }
+        "agent_worker_start_latency" => {
+            let token = create_token(&server).await?;
+            for iter in 0..(profile_cfg.warmup + profile_cfg.iterations) {
+                let req = json!({
+                    "id": iter as i64 + 300,
+                    "method": "agent.worker.create",
+                    "params": {
+                        "command_id": format!("cmd-real-agent-worker-{iter}"),
+                        "workspace_id":"ws-real",
+                        "surface_id": format!("sf-agent-{iter}"),
+                        "auth":{"token": token},
+                        "shell": benchmark_terminal_shell()
+                    }
+                });
+                let sample = measure_async(issue(&server, iter, req)).await?;
+                if iter >= profile_cfg.warmup {
+                    samples.push(sample);
+                }
+            }
+        }
         other => {
             return Err(format!("unknown profile: {other}").into());
         }
@@ -400,6 +606,7 @@ async fn run_profile(
     let total_s = started.elapsed().as_secs_f64().max(0.000_001);
     let result = summarize(
         name,
+        mode,
         profile_cfg.iterations.max(samples.len()),
         &samples,
         total_s,
@@ -411,6 +618,7 @@ async fn run_profile(
 
 fn summarize(
     profile: &str,
+    mode: &str,
     iterations: usize,
     samples: &[f64],
     total_s: f64,
@@ -429,6 +637,7 @@ fn summarize(
         .unwrap_or(true);
     BenchmarkResult {
         profile: profile.to_string(),
+        mode: mode.to_string(),
         iterations,
         p50_ms: p50,
         p95_ms: p95,
@@ -487,8 +696,10 @@ async fn create_token(server: &RpcServer) -> Result<String, Box<dyn std::error::
         .ok_or_else(|| "missing token".into())
 }
 
-fn load_profile_configs() -> Result<BTreeMap<String, ProfileConfig>, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(data_path("perf-profiles.json"))?;
+fn load_profile_configs(
+    mode: &str,
+) -> Result<BTreeMap<String, ProfileConfig>, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(data_path(profile_file_name(mode)))?;
     let raw: BTreeMap<String, Value> = serde_json::from_str(&content)?;
     let mut out = BTreeMap::new();
     for (name, value) in raw {
@@ -510,8 +721,10 @@ fn load_profile_configs() -> Result<BTreeMap<String, ProfileConfig>, Box<dyn std
     Ok(out)
 }
 
-fn load_thresholds() -> Result<BTreeMap<String, ThresholdConfig>, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(data_path("perf-baseline.json"))?;
+fn load_thresholds(
+    mode: &str,
+) -> Result<BTreeMap<String, ThresholdConfig>, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(data_path(threshold_file_name(mode)))?;
     let raw: BTreeMap<String, Value> = serde_json::from_str(&content)?;
     let mut out = BTreeMap::new();
     for (name, value) in raw {
@@ -541,6 +754,70 @@ fn default_profile(name: &str) -> ProfileConfig {
     }
 }
 
+fn default_suite_profiles(mode: &str) -> Vec<&'static str> {
+    match mode {
+        "synthetic" => vec![
+            "rpc_health",
+            "session_lifecycle",
+            "terminal_interactive",
+            "browser_navigation",
+            "browser_fanout",
+            "restart_recovery",
+        ],
+        "real-runtime" => vec![
+            "terminal_spawn_latency",
+            "terminal_interactive",
+            "browser_create_latency",
+            "browser_navigation_latency",
+            "browser_screenshot_latency",
+            "agent_worker_start_latency",
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn profile_file_name(mode: &str) -> &'static str {
+    match mode {
+        "synthetic" => "perf-profiles.json",
+        "real-runtime" => "perf-profiles-real.json",
+        _ => "perf-profiles.json",
+    }
+}
+
+fn threshold_file_name(mode: &str) -> &'static str {
+    match mode {
+        "synthetic" => "perf-baseline.json",
+        "real-runtime" => "perf-baseline-real.json",
+        _ => "perf-baseline.json",
+    }
+}
+
+fn browser_runtime_available(config: &BackendConfig) -> bool {
+    let configured = config.browser_executable_or_channel.trim();
+    if configured.eq_ignore_ascii_case("__synthetic__") {
+        return false;
+    }
+    if !configured.is_empty() && PathBuf::from(configured).exists() {
+        return true;
+    }
+    let candidates: &[&str] = match configured {
+        "chrome" | "chromium" | "" => &[
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+        "edge" | "msedge" => &[
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+        other => &[other],
+    };
+    candidates
+        .iter()
+        .any(|candidate| PathBuf::from(candidate).exists())
+}
+
 fn temp_event_dir(label: &str) -> PathBuf {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -555,7 +832,7 @@ fn data_path(file_name: &str) -> PathBuf {
 
 fn benchmark_terminal_shell() -> &'static str {
     if cfg!(windows) {
-        "cmd"
+        "powershell"
     } else {
         "sh"
     }
@@ -563,7 +840,7 @@ fn benchmark_terminal_shell() -> &'static str {
 
 fn benchmark_terminal_echo(iter: usize) -> String {
     if cfg!(windows) {
-        format!("echo {iter}")
+        format!("Write-Output {iter}")
     } else {
         format!("printf '{iter}\\n'")
     }
@@ -575,9 +852,9 @@ mod tests {
 
     #[test]
     fn loaders_and_defaults_work() {
-        let profiles = load_profile_configs().expect("profiles");
+        let profiles = load_profile_configs("synthetic").expect("profiles");
         assert!(profiles.contains_key("rpc_health"));
-        let thresholds = load_thresholds().expect("thresholds");
+        let thresholds = load_thresholds("synthetic").expect("thresholds");
         assert_eq!(
             thresholds
                 .get("browser_navigation")
@@ -588,12 +865,18 @@ mod tests {
         assert!(temp_event_dir("x")
             .to_string_lossy()
             .contains("maxc-perf-x-"));
+        assert_eq!(profile_file_name("real-runtime"), "perf-profiles-real.json");
+        assert_eq!(
+            threshold_file_name("real-runtime"),
+            "perf-baseline-real.json"
+        );
     }
 
     #[test]
     fn summarize_and_percentiles_are_stable() {
         let result = summarize(
             "demo",
+            "synthetic",
             4,
             &[1.0, 2.0, 3.0, 4.0],
             2.0,
@@ -611,6 +894,7 @@ mod tests {
     fn summarize_failures_and_helpers_cover_edge_cases() {
         let failing = summarize(
             "slow",
+            "synthetic",
             2,
             &[10.0, 20.0],
             4.0,
@@ -629,7 +913,7 @@ mod tests {
         );
         assert_eq!(
             benchmark_terminal_shell(),
-            if cfg!(windows) { "cmd" } else { "sh" }
+            if cfg!(windows) { "powershell" } else { "sh" }
         );
         assert!(!benchmark_terminal_echo(7).is_empty());
     }
@@ -644,12 +928,15 @@ mod tests {
             .output
             .as_deref()
             .expect("output")
-            .contains("rpc_health:"));
+            .contains("rpc_health [synthetic]:"));
 
-        let json_result = execute_suite("rpc_health", true).await.expect("json");
+        let json_result = execute_suite("rpc_health", "synthetic", true)
+            .await
+            .expect("json");
         assert!(json_result.pass);
         let output = json_result.output.expect("json output");
         assert!(output.contains("\"suite\": \"rpc_health\""));
+        assert!(output.contains("\"mode\": \"synthetic\""));
         assert!(output.contains("\"results\""));
     }
 
@@ -657,6 +944,7 @@ mod tests {
     async fn run_rpc_health_profile() {
         let result = run_profile(
             "rpc_health",
+            "synthetic",
             &ProfileConfig {
                 iterations: 3,
                 warmup: 1,
@@ -677,6 +965,7 @@ mod tests {
     async fn run_terminal_and_recovery_profiles() {
         let terminal = run_profile(
             "terminal_interactive",
+            "synthetic",
             &ProfileConfig {
                 iterations: 2,
                 warmup: 0,
@@ -693,6 +982,7 @@ mod tests {
 
         let recovery = run_profile(
             "restart_recovery",
+            "synthetic",
             &ProfileConfig {
                 iterations: 1,
                 warmup: 0,
@@ -712,6 +1002,7 @@ mod tests {
     async fn run_session_and_browser_profiles() {
         let session = run_profile(
             "session_lifecycle",
+            "synthetic",
             &ProfileConfig {
                 iterations: 2,
                 warmup: 0,
@@ -725,6 +1016,7 @@ mod tests {
 
         let browser_nav = run_profile(
             "browser_navigation",
+            "synthetic",
             &ProfileConfig {
                 iterations: 2,
                 warmup: 0,
@@ -738,6 +1030,7 @@ mod tests {
 
         let browser_fanout = run_profile(
             "browser_fanout",
+            "synthetic",
             &ProfileConfig {
                 iterations: 2,
                 warmup: 0,
@@ -779,6 +1072,7 @@ mod tests {
 
         let unknown = run_profile(
             "not-a-profile",
+            "synthetic",
             &ProfileConfig {
                 iterations: 1,
                 warmup: 0,
@@ -789,9 +1083,21 @@ mod tests {
         .await;
         assert!(unknown.is_err());
 
-        let failing = execute_suite("does-not-exist", false).await;
+        let failing = execute_suite("does-not-exist", "synthetic", false).await;
         assert!(failing.is_err());
 
         let _ = fs::remove_dir_all(event_dir);
+    }
+
+    #[test]
+    fn real_runtime_suite_names_and_browser_detection_work() {
+        let names = default_suite_profiles("real-runtime");
+        assert!(names.contains(&"terminal_spawn_latency"));
+        assert!(names.contains(&"agent_worker_start_latency"));
+        let synthetic = BackendConfig {
+            browser_executable_or_channel: "__synthetic__".to_string(),
+            ..BackendConfig::default()
+        };
+        assert!(!browser_runtime_available(&synthetic));
     }
 }

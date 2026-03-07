@@ -85,3 +85,4 @@ The backend reads `BackendConfig` from environment variables. Defaults are defin
 - Tune artifact retention with the `MAXC_ARTIFACT_*` settings instead of relying on manual cleanup.
 - Lower `MAXC_OVERLOAD_REJECT_THRESHOLD` only when testing overload behavior.
 - Keep `MAXC_BREAKER_FAILURE_THRESHOLD` and `MAXC_BREAKER_COOLDOWN_MS` conservative in development so failures are visible quickly.
+- Release readiness depends on four runtime checks: terminal runtime availability, browser runtime availability, artifact root writability, and event-store writability. Use `system.readiness` and `system.diagnostics` to confirm all four before enabling full frontend workflows.

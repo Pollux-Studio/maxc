@@ -76,6 +76,23 @@ struct TerminalAuditContext {
     terminal_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DependencyStatus {
+    terminal_runtime_ready: bool,
+    browser_runtime_ready: bool,
+    artifact_root_ready: bool,
+    event_store_ready: bool,
+}
+
+impl DependencyStatus {
+    fn ready(self) -> bool {
+        self.terminal_runtime_ready
+            && self.browser_runtime_ready
+            && self.artifact_root_ready
+            && self.event_store_ready
+    }
+}
+
 impl SessionRecord {
     fn from_projection(value: &SessionProjection) -> Self {
         Self {
@@ -775,16 +792,17 @@ impl RpcServer {
     async fn system_readiness(&self, params: Option<Value>) -> Result<Value, ServerError> {
         self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
             .await?;
-        let browser_ready = browser_dependency_ready(&self.config);
-        let terminal_ready = true;
+        let dependency = self.dependency_status();
         Ok(json!({
-            "ready": !self.is_shutting_down() && !self.breaker_is_open() && browser_ready && terminal_ready,
+            "ready": !self.is_shutting_down() && !self.breaker_is_open() && dependency.ready(),
             "accepting_requests": !self.is_shutting_down(),
             "breaker_open": self.breaker_is_open(),
             "queue_saturated": self.active_request_count() >= self.config.overload_reject_threshold,
-            "store_available": true,
-            "browser_runtime_ready": browser_ready,
-            "terminal_runtime_ready": terminal_ready
+            "store_available": dependency.event_store_ready,
+            "browser_runtime_ready": dependency.browser_runtime_ready,
+            "terminal_runtime_ready": dependency.terminal_runtime_ready,
+            "artifact_root_ready": dependency.artifact_root_ready,
+            "event_store_ready": dependency.event_store_ready
         }))
     }
 
@@ -808,6 +826,7 @@ impl RpcServer {
             .expect("subscription lock poisoned");
         let metrics = self.metrics_snapshot();
         let artifact_stats = self.collect_artifact_stats();
+        let dependency = self.dependency_status();
         Ok(json!({
             "sessions": projection.sessions.len(),
             "browser_sessions": projection.browser_sessions.len(),
@@ -815,7 +834,7 @@ impl RpcServer {
             "terminal_runtime_count": terminal_runtime.len(),
             "browser_runtime_count": browser_runtime.len(),
             "browser_runtime_backend": "chromium-cdp",
-            "browser_runtime_ready": browser_dependency_ready(&self.config),
+            "browser_runtime_ready": dependency.browser_runtime_ready,
             "browser_runtimes": browser_runtime.values().map(|session| json!({
                 "workspace_id": session.workspace_id,
                 "surface_id": session.surface_id,
@@ -857,6 +876,9 @@ impl RpcServer {
             "artifact_files": artifact_stats.files,
             "artifact_bytes": artifact_stats.bytes,
             "terminal_runtime_backend": selected_terminal_runtime_name(&self.config),
+            "terminal_runtime_ready": dependency.terminal_runtime_ready,
+            "artifact_root_ready": dependency.artifact_root_ready,
+            "event_store_ready": dependency.event_store_ready,
             "active_requests": self.active_request_count(),
             "shutting_down": self.is_shutting_down(),
             "breaker_open": self.breaker_is_open(),
@@ -869,6 +891,7 @@ impl RpcServer {
             .await?;
         let mut metrics = self.metrics_snapshot();
         let artifact_stats = self.collect_artifact_stats();
+        let dependency = self.dependency_status();
         metrics.gauges.insert(
             "rpc.active_requests".to_string(),
             self.active_request_count() as u64,
@@ -923,7 +946,19 @@ impl RpcServer {
         );
         metrics.gauges.insert(
             "runtime.browser.ready".to_string(),
-            u64::from(browser_dependency_ready(&self.config)),
+            u64::from(dependency.browser_runtime_ready),
+        );
+        metrics.gauges.insert(
+            "runtime.terminal.ready".to_string(),
+            u64::from(dependency.terminal_runtime_ready),
+        );
+        metrics.gauges.insert(
+            "runtime.artifacts.ready".to_string(),
+            u64::from(dependency.artifact_root_ready),
+        );
+        metrics.gauges.insert(
+            "storage.event_dir.ready".to_string(),
+            u64::from(dependency.event_store_ready),
         );
         metrics.gauges.insert(
             "runtime.agent.workers".to_string(),
@@ -4036,6 +4071,7 @@ impl RpcServer {
     }
 
     fn enforce_artifact_retention(&self, session_dir: Option<&Path>) -> Result<(), ServerError> {
+        let before = self.collect_artifact_stats();
         enforce_artifact_retention(
             &self.artifact_root_path(),
             session_dir,
@@ -4044,7 +4080,32 @@ impl RpcServer {
             self.config.artifact_max_total_bytes,
             self.config.artifact_max_files_per_session,
         )
-        .map_err(|_| ServerError::Internal)
+        .map_err(|_| ServerError::Internal)?;
+        let after = self.collect_artifact_stats();
+        let mut metrics = self.state.metrics.lock().expect("metrics lock poisoned");
+        metrics.incr_counter("runtime.artifacts.cleanup_runs_total", 1);
+        if before.files > after.files {
+            metrics.incr_counter(
+                "runtime.artifacts.evicted_files_total",
+                before.files - after.files,
+            );
+        }
+        if before.bytes > after.bytes {
+            metrics.incr_counter(
+                "runtime.artifacts.evicted_bytes_total",
+                before.bytes - after.bytes,
+            );
+        }
+        Ok(())
+    }
+
+    fn dependency_status(&self) -> DependencyStatus {
+        DependencyStatus {
+            terminal_runtime_ready: terminal_dependency_ready(&self.config),
+            browser_runtime_ready: browser_dependency_ready(&self.config),
+            artifact_root_ready: writable_directory_ready(&self.artifact_root_path()),
+            event_store_ready: writable_directory_ready(Path::new(&self.config.event_dir)),
+        }
     }
 
     async fn persist_and_apply(&self, event: EventRecord) -> Result<Value, ServerError> {
@@ -5095,6 +5156,30 @@ fn selected_terminal_runtime_name(config: &BackendConfig) -> &'static str {
         "conpty"
     } else {
         "process-stdio"
+    }
+}
+
+fn terminal_dependency_ready(config: &BackendConfig) -> bool {
+    match selected_terminal_runtime_name(config) {
+        "conpty" => cfg!(windows),
+        name => matches!(name, "process-stdio"),
+    }
+}
+
+fn writable_directory_ready(path: &Path) -> bool {
+    if path.exists() && !path.is_dir() {
+        return false;
+    }
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(format!(".maxc-ready-{}", now_unix_ms()));
+    match fs::write(&probe, b"ok") {
+        Ok(_) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -6934,6 +7019,8 @@ mod tests {
             .await;
         let readiness: Value = serde_json::from_str(&readiness).expect("json");
         assert!(readiness["result"]["ready"].is_boolean());
+        assert!(readiness["result"]["artifact_root_ready"].is_boolean());
+        assert!(readiness["result"]["event_store_ready"].is_boolean());
 
         let metrics = server
             .handle_json_line(
@@ -6948,6 +7035,8 @@ mod tests {
             .await;
         let metrics: Value = serde_json::from_str(&metrics).expect("json");
         assert!(metrics["result"]["counters"].is_object());
+        assert!(metrics["result"]["gauges"]["runtime.artifacts.ready"].is_u64());
+        assert!(metrics["result"]["gauges"]["storage.event_dir.ready"].is_u64());
 
         let logs = server
             .handle_json_line(
@@ -6976,7 +7065,263 @@ mod tests {
             .await;
         let diagnostics: Value = serde_json::from_str(&diagnostics).expect("json");
         assert!(diagnostics["result"]["metrics"].is_object());
+        assert!(diagnostics["result"]["artifact_root_ready"].is_boolean());
+        assert!(diagnostics["result"]["event_store_ready"].is_boolean());
         assert!(!server.telemetry_snapshot().logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_dependency_failures() {
+        let cfg = test_config("dependency-readiness");
+        let event_dir = PathBuf::from(&cfg.event_dir);
+        let server = RpcServer::new(cfg).expect("server");
+        let create = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {"command_id":"cmd-dependency-auth","scopes":["diagnostics"]}
+                })
+                .to_string(),
+            )
+            .await;
+        let create: Value = serde_json::from_str(&create).expect("json");
+        let token = create["result"]["token"].as_str().expect("token");
+
+        let artifact_root = event_dir.join("browser-artifacts");
+        let _ = fs::remove_dir_all(&artifact_root);
+        fs::write(&artifact_root, b"blocked").expect("artifact blocker");
+        let readiness = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 2,
+                    "method": "system.readiness",
+                    "params": {"command_id":"cmd-dependency-ready-1","auth":{"token": token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let readiness: Value = serde_json::from_str(&readiness).expect("json");
+        assert_eq!(readiness["result"]["artifact_root_ready"], false);
+        assert_eq!(readiness["result"]["ready"], false);
+
+        let _ = fs::remove_file(&artifact_root);
+        let _ = fs::remove_dir_all(&event_dir);
+        fs::write(&event_dir, b"blocked").expect("event dir blocker");
+        let readiness = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id": 3,
+                    "method": "system.readiness",
+                    "params": {"command_id":"cmd-dependency-ready-2","auth":{"token": token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let readiness: Value = serde_json::from_str(&readiness).expect("json");
+        assert_eq!(readiness["result"]["event_store_ready"], false);
+        assert_eq!(readiness["result"]["store_available"], false);
+        let _ = fs::remove_file(event_dir);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_metadata_without_restoring_live_browser_runtime() {
+        let cfg = test_config("restart-browser-runtime");
+        let event_dir = cfg.event_dir.clone();
+        let server = RpcServer::new(cfg.clone()).expect("server");
+        let auth = server
+            .handle_json_line(
+                "conn-a",
+                &json!({"id":1,"method":"session.create","params":{"command_id":"cmd-restart-auth"}})
+                    .to_string(),
+            )
+            .await;
+        let auth: Value = serde_json::from_str(&auth).expect("json");
+        let token = auth["result"]["token"].as_str().expect("token");
+
+        let browser = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id":2,
+                    "method":"browser.create",
+                    "params":{
+                        "command_id":"cmd-restart-browser",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-1",
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let browser: Value = serde_json::from_str(&browser).expect("json");
+        assert!(browser.get("result").is_some());
+
+        let restarted = RpcServer::new(BackendConfig { event_dir, ..cfg }).expect("restart");
+        let auth = restarted
+            .handle_json_line(
+                "conn-b",
+                &json!({"id":3,"method":"session.create","params":{"command_id":"cmd-restart-auth-2","scopes":["diagnostics"]}})
+                    .to_string(),
+            )
+            .await;
+        let auth: Value = serde_json::from_str(&auth).expect("json");
+        let diagnostics_token = auth["result"]["token"].as_str().expect("token");
+        let diagnostics = restarted
+            .handle_json_line(
+                "conn-b",
+                &json!({
+                    "id":4,
+                    "method":"system.diagnostics",
+                    "params":{"command_id":"cmd-restart-diag","auth":{"token":diagnostics_token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let diagnostics: Value = serde_json::from_str(&diagnostics).expect("json");
+        assert_eq!(diagnostics["result"]["browser_sessions"].as_u64(), Some(1));
+        assert_eq!(
+            diagnostics["result"]["browser_runtime_count"].as_u64(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_runtime_stress_flow_keeps_diagnostics_consistent() {
+        let cfg = BackendConfig {
+            queue_limit: 32,
+            ..test_config("mixed-stress")
+        };
+        let server = RpcServer::new(cfg).expect("server");
+        let auth = server
+            .handle_json_line(
+                "conn-a",
+                &json!({"id":1,"method":"session.create","params":{"command_id":"cmd-stress-auth"}})
+                    .to_string(),
+            )
+            .await;
+        let auth: Value = serde_json::from_str(&auth).expect("json");
+        let token = auth["result"]["token"].as_str().expect("token");
+
+        for idx in 0..3 {
+            let spawn = server
+                .handle_json_line(
+                    "conn-a",
+                    &json!({
+                        "id": 10 + idx,
+                        "method":"terminal.spawn",
+                        "params":{
+                            "command_id": format!("cmd-stress-term-{idx}"),
+                            "workspace_id":"ws-1",
+                            "surface_id": format!("sf-term-{idx}"),
+                            "auth":{"token":token},
+                            "shell": test_terminal_shell()
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+            let spawn: Value = serde_json::from_str(&spawn).expect("json");
+            assert!(spawn.get("result").is_some());
+        }
+
+        let browser = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id":20,
+                    "method":"browser.create",
+                    "params":{
+                        "command_id":"cmd-stress-browser",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-browser",
+                        "auth":{"token":token}
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let browser: Value = serde_json::from_str(&browser).expect("json");
+        let browser_session_id = browser["result"]["browser_session_id"]
+            .as_str()
+            .expect("browser session");
+        for idx in 0..3 {
+            let tab = server
+                .handle_json_line(
+                    "conn-a",
+                    &json!({
+                        "id": 30 + idx,
+                        "method":"browser.tab.open",
+                        "params":{
+                            "command_id": format!("cmd-stress-tab-{idx}"),
+                            "workspace_id":"ws-1",
+                            "surface_id":"sf-browser",
+                            "browser_session_id": browser_session_id,
+                            "auth":{"token":token},
+                            "url": format!("https://example.com/{idx}")
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+            let tab: Value = serde_json::from_str(&tab).expect("json");
+            assert!(tab.get("result").is_some());
+        }
+
+        let worker = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id":40,
+                    "method":"agent.worker.create",
+                    "params":{
+                        "command_id":"cmd-stress-worker",
+                        "workspace_id":"ws-1",
+                        "surface_id":"sf-agent",
+                        "auth":{"token":token},
+                        "shell": test_terminal_shell()
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let worker: Value = serde_json::from_str(&worker).expect("json");
+        assert!(worker.get("result").is_some());
+
+        let diagnostics = server
+            .handle_json_line(
+                "conn-a",
+                &json!({
+                    "id":50,
+                    "method":"system.diagnostics",
+                    "params":{"command_id":"cmd-stress-diag","auth":{"token":token}}
+                })
+                .to_string(),
+            )
+            .await;
+        let diagnostics: Value = serde_json::from_str(&diagnostics).expect("json");
+        assert!(
+            diagnostics["result"]["terminal_runtime_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 3
+        );
+        assert!(
+            diagnostics["result"]["browser_tabs"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 3
+        );
+        assert!(
+            diagnostics["result"]["agent_runtime_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
     }
 
     #[tokio::test]

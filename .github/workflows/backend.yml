@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  validate:
+  validate-linux:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -30,7 +30,31 @@ jobs:
         run: cargo test -p maxc-cli
 
       - name: backend perf guardrails
-        run: cargo run -p maxc-automation --bin perf-harness -- --profile ci --json
+        run: cargo run -p maxc-automation --bin perf-harness -- --mode synthetic --profile ci --json
 
       - name: cargo llvm-cov
         run: cargo llvm-cov --workspace --all-features --fail-under-lines 85
+
+  validate-windows-runtime:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: backend tests
+        run: cargo test --workspace --all-features
+
+      - name: backend synthetic perf guardrails
+        run: cargo run -p maxc-automation --bin perf-harness -- --mode synthetic --profile ci --json
+
+      - name: backend real runtime perf guardrails
+        run: cargo run -p maxc-automation --bin perf-harness -- --mode real-runtime --profile ci --json

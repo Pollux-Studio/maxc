@@ -1,0 +1,20 @@
+{
+  "terminal_spawn_latency": {
+    "p95_ms": 250.0
+  },
+  "terminal_interactive": {
+    "p95_ms": 80.0
+  },
+  "browser_create_latency": {
+    "p95_ms": 12000.0
+  },
+  "browser_navigation_latency": {
+    "p95_ms": 3000.0
+  },
+  "browser_screenshot_latency": {
+    "p95_ms": 3000.0
+  },
+  "agent_worker_start_latency": {
+    "p95_ms": 400.0
+  }
+}

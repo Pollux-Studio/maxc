@@ -135,9 +135,9 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 ## Phase 12: Real Runtime Release Gate
 
 ### Tasks
-- [ ] Replace synthetic benchmark assumptions with real terminal/browser latency benchmarks.
-- [ ] Add stress, crash, restart, and cleanup coverage for real runtimes.
-- [ ] Finalize readiness, shutdown, and release checks for real dependencies.
-- [ ] Update all runtime docs and examples to match shipped behavior.
-- [ ] **Phase Quality Gate (Mandatory)**
+- [x] Replace synthetic benchmark assumptions with real terminal/browser latency benchmarks.
+- [x] Add stress, crash, restart, and cleanup coverage for real runtimes.
+- [x] Finalize readiness, shutdown, and release checks for real dependencies.
+- [x] Update all runtime docs and examples to match shipped behavior.
+- [x] **Phase Quality Gate (Mandatory)**
 - [ ] **Commit Phase Changes (Mandatory)**
