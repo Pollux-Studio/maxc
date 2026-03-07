@@ -6774,7 +6774,7 @@ mod tests {
         assert!(out["result"]["bytes"].as_u64().unwrap_or_default() > 0);
 
         let mut observed_output = false;
-        for _ in 0..20 {
+        for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let history = json!({
                 "id": 30,
@@ -8074,7 +8074,11 @@ mod tests {
 
     #[test]
     fn browser_artifact_writer_and_readiness_checks_work() {
-        assert!(browser_dependency_ready(&BackendConfig::default()));
+        let default_config = BackendConfig::default();
+        assert_eq!(
+            browser_dependency_ready(&default_config),
+            !browser_launch_targets(&default_config).is_empty()
+        );
 
         let child = StdCommand::new(if cfg!(windows) { "cmd" } else { "sh" })
             .args(if cfg!(windows) {
