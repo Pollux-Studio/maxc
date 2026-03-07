@@ -140,4 +140,4 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 85
 - [x] Finalize readiness, shutdown, and release checks for real dependencies.
 - [x] Update all runtime docs and examples to match shipped behavior.
 - [x] **Phase Quality Gate (Mandatory)**
-- [ ] **Commit Phase Changes (Mandatory)**
+- [x] **Commit Phase Changes (Mandatory)**
