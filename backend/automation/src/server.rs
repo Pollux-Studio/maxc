@@ -8268,7 +8268,10 @@ mod tests {
             ..BackendConfig::default()
         };
         let targets = browser_launch_targets(&config);
-        assert_eq!(targets.first().map(|target| target.runtime.as_str()), Some("webview2"));
+        assert_eq!(
+            targets.first().map(|target| target.runtime.as_str()),
+            Some("webview2")
+        );
         let _ = fs::remove_file(temp_executable);
     }
 
