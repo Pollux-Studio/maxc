@@ -14,8 +14,11 @@ use rand::RngCore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
+#[cfg(windows)]
 use std::fs::File as StdFile;
-use std::io::{BufReader as StdBufReader, Read, Write};
+#[cfg(windows)]
+use std::io::BufReader as StdBufReader;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;

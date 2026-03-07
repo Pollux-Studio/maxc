@@ -6,6 +6,7 @@ on:
 
 jobs:
   validate-linux:
+    name: Backend validation (shared checks)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -36,6 +37,7 @@ jobs:
         run: cargo llvm-cov --workspace --all-features --fail-under-lines 85
 
   validate-windows-runtime:
+    name: Backend validation (Windows runtime)
     needs: validate-linux
     runs-on: windows-latest
     steps:
