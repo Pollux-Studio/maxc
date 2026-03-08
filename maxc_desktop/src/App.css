@@ -122,10 +122,18 @@
     }
   body {
     @apply bg-background text-foreground;
+    height: 100%;
+    overflow: hidden;
     }
   html {
     @apply font-mono;
+    height: 100%;
     }
+}
+
+#root {
+  height: 100%;
+  overflow: hidden;
 }
 
 .drag-region {

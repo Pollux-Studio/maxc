@@ -166,13 +166,24 @@ enum Command {
         surface_id: String,
         agent_worker_id: String,
     },
+    WorkspaceCreate {
+        token: String,
+        name: String,
+        folder: Option<String>,
+    },
+    WorkspaceList {
+        token: String,
+    },
 }
+
+const DEFAULT_SOCKET_PATH: &str = r"\\.\pipe\maxc-rpc";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = std::env::var("MAXC_SOCKET_PATH").unwrap_or(DEFAULT_SOCKET_PATH.to_string());
     let output = run_cli(
         std::env::args().skip(1).collect(),
-        &NamedPipeTransport::new(r"\\.\pipe\maxc-rpc"),
+        &NamedPipeTransport::new(&socket_path),
     )
     .await?;
     println!("{output}");
@@ -255,19 +266,20 @@ fn parse_cli(args: Vec<String>) -> Result<(bool, Command), Box<dyn std::error::E
         "readiness" => {
             let flags = parse_flags(&args[1..])?;
             Command::Readiness {
-                token: required(&flags, "--token")?,
+                token: resolve_token(&flags)?,
             }
         }
         "diagnostics" => {
             let flags = parse_flags(&args[1..])?;
             Command::Diagnostics {
-                token: required(&flags, "--token")?,
+                token: resolve_token(&flags)?,
             }
         }
         "session" => parse_session(&args[1..])?,
         "terminal" => parse_terminal(&args[1..])?,
         "browser" => parse_browser(&args[1..])?,
         "agent" => parse_agent(&args[1..])?,
+        "workspace" => parse_workspace(&args[1..])?,
         _ => return Err(format!("unknown command: {}", args[0]).into()),
     };
     Ok((pretty, command))
@@ -281,10 +293,10 @@ fn parse_session(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
     match args[0].as_str() {
         "create" => Ok(Command::SessionCreate),
         "refresh" => Ok(Command::SessionRefresh {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
         }),
         "revoke" => Ok(Command::SessionRevoke {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
         }),
         _ => Err("unknown session subcommand".into()),
     }
@@ -297,21 +309,21 @@ fn parse_terminal(args: &[String]) -> Result<Command, Box<dyn std::error::Error>
     let flags = parse_flags(&args[1..])?;
     match args[0].as_str() {
         "spawn" => Ok(Command::TerminalSpawn {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             cols: optional_parse(&flags, "--cols")?.unwrap_or(120),
             rows: optional_parse(&flags, "--rows")?.unwrap_or(30),
         }),
         "input" => Ok(Command::TerminalInput {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             terminal_session_id: required(&flags, "--terminal-session-id")?,
             input: required(&flags, "--input")?,
         }),
         "resize" => Ok(Command::TerminalResize {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             terminal_session_id: required(&flags, "--terminal-session-id")?,
@@ -319,7 +331,7 @@ fn parse_terminal(args: &[String]) -> Result<Command, Box<dyn std::error::Error>
             rows: required(&flags, "--rows")?.parse()?,
         }),
         "history" => Ok(Command::TerminalHistory {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             terminal_session_id: required(&flags, "--terminal-session-id")?,
@@ -327,7 +339,7 @@ fn parse_terminal(args: &[String]) -> Result<Command, Box<dyn std::error::Error>
             max_events: optional_parse(&flags, "--max-events")?,
         }),
         "kill" => Ok(Command::TerminalKill {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             terminal_session_id: required(&flags, "--terminal-session-id")?,
@@ -343,19 +355,19 @@ fn parse_browser(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
     let flags = parse_flags(&args[1..])?;
     match args[0].as_str() {
         "create" => Ok(Command::BrowserCreate {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
         }),
         "tab-open" => Ok(Command::BrowserTabOpen {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             browser_session_id: required(&flags, "--browser-session-id")?,
             url: required(&flags, "--url")?,
         }),
         "goto" => Ok(Command::BrowserGoto {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             browser_session_id: required(&flags, "--browser-session-id")?,
@@ -363,7 +375,7 @@ fn parse_browser(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
             url: required(&flags, "--url")?,
         }),
         "history" => Ok(Command::BrowserHistory {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             browser_session_id: required(&flags, "--browser-session-id")?,
@@ -371,7 +383,7 @@ fn parse_browser(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
             max_events: optional_parse(&flags, "--max-events")?,
         }),
         "close" => Ok(Command::BrowserClose {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             browser_session_id: required(&flags, "--browser-session-id")?,
@@ -387,80 +399,98 @@ fn parse_agent(args: &[String]) -> Result<Command, Box<dyn std::error::Error>> {
     let flags = parse_flags(&args[2..])?;
     match (args[0].as_str(), args[1].as_str()) {
         ("worker", "create") => Ok(Command::AgentWorkerCreate {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
         }),
         ("worker", "list") => Ok(Command::AgentWorkerList {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
         }),
         ("worker", "get") => Ok(Command::AgentWorkerGet {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
         }),
         ("worker", "close") => Ok(Command::AgentWorkerClose {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
         }),
         ("task", "start") => Ok(Command::AgentTaskStart {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
             prompt: required(&flags, "--prompt")?,
         }),
         ("task", "list") => Ok(Command::AgentTaskList {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
         }),
         ("task", "get") => Ok(Command::AgentTaskGet {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_task_id: required(&flags, "--agent-task-id")?,
             agent_worker_id: flags.get("--agent-worker-id").cloned(),
         }),
         ("task", "cancel") => Ok(Command::AgentTaskCancel {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_task_id: required(&flags, "--agent-task-id")?,
             reason: flags.get("--reason").cloned(),
         }),
         ("attach", "terminal") => Ok(Command::AgentAttachTerminal {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
             terminal_session_id: required(&flags, "--terminal-session-id")?,
         }),
         ("detach", "terminal") => Ok(Command::AgentDetachTerminal {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
         }),
         ("attach", "browser") => Ok(Command::AgentAttachBrowser {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
             browser_session_id: required(&flags, "--browser-session-id")?,
         }),
         ("detach", "browser") => Ok(Command::AgentDetachBrowser {
-            token: required(&flags, "--token")?,
+            token: resolve_token(&flags)?,
             workspace_id: required(&flags, "--workspace-id")?,
             surface_id: required(&flags, "--surface-id")?,
             agent_worker_id: required(&flags, "--agent-worker-id")?,
         }),
         _ => Err("unknown agent subcommand".into()),
+    }
+}
+
+fn parse_workspace(args: &[String]) -> Result<Command, Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        return Err("missing workspace subcommand".into());
+    }
+    let flags = parse_flags(&args[1..])?;
+    match args[0].as_str() {
+        "create" => Ok(Command::WorkspaceCreate {
+            token: resolve_token(&flags)?,
+            name: required(&flags, "--name")?,
+            folder: flags.get("--folder").cloned(),
+        }),
+        "list" => Ok(Command::WorkspaceList {
+            token: resolve_token(&flags)?,
+        }),
+        _ => Err("unknown workspace subcommand".into()),
     }
 }
 
@@ -498,6 +528,14 @@ fn required(
         .get(key)
         .cloned()
         .ok_or_else(|| format!("missing {key}").into())
+}
+
+/// Resolve the auth token: `--token` flag first, then `MAXC_TOKEN` env var.
+fn resolve_token(flags: &HashMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(token) = flags.get("--token") {
+        return Ok(token.clone());
+    }
+    std::env::var("MAXC_TOKEN").map_err(|_| "missing --token (or set MAXC_TOKEN env var)".into())
 }
 
 fn optional_parse<T: std::str::FromStr>(
@@ -887,6 +925,26 @@ fn build_request(command: Command) -> RpcRequest {
                 "workspace_id": workspace_id,
                 "surface_id": surface_id,
                 "agent_worker_id": agent_worker_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::WorkspaceCreate {
+            token,
+            name,
+            folder,
+        } => request(
+            "workspace.create",
+            Some(json!({
+                "command_id": command_id("workspace-create"),
+                "name": name,
+                "folder": folder.unwrap_or_default(),
+                "env_vars": {},
+                "auth": {"token": token}
+            })),
+        ),
+        Command::WorkspaceList { token } => request(
+            "workspace.list",
+            Some(json!({
                 "auth": {"token": token}
             })),
         ),
@@ -1360,6 +1418,76 @@ mod tests {
     }
 
     #[test]
+    fn parse_workspace_commands() {
+        let (_, create) = parse_cli(vec![
+            "workspace".to_string(),
+            "create".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--name".to_string(),
+            "my-project".to_string(),
+            "--folder".to_string(),
+            "/home/user/project".to_string(),
+        ])
+        .expect("workspace create");
+        let req = build_request(create);
+        assert_eq!(req.method, "workspace.create");
+        let params = req.params.expect("params");
+        assert_eq!(params["name"], "my-project");
+        assert_eq!(params["folder"], "/home/user/project");
+        assert_eq!(params["auth"]["token"], "tok");
+
+        let (_, list) = parse_cli(vec![
+            "workspace".to_string(),
+            "list".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+        ])
+        .expect("workspace list");
+        let req = build_request(list);
+        assert_eq!(req.method, "workspace.list");
+        assert_eq!(req.params.expect("params")["auth"]["token"], "tok");
+
+        // workspace create without folder is valid (folder is optional)
+        let (_, create_no_folder) = parse_cli(vec![
+            "workspace".to_string(),
+            "create".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+            "--name".to_string(),
+            "bare".to_string(),
+        ])
+        .expect("workspace create no folder");
+        let req = build_request(create_no_folder);
+        assert_eq!(req.params.expect("params")["folder"], "");
+
+        assert!(parse_workspace(&[]).is_err());
+        assert!(parse_workspace(&["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn resolve_token_falls_back_to_env() {
+        let flags = HashMap::new();
+        // With no flag and no env, should fail
+        std::env::remove_var("MAXC_TOKEN");
+        assert!(resolve_token(&flags).is_err());
+
+        // With env set, should succeed
+        std::env::set_var("MAXC_TOKEN", "env-tok-123");
+        let token = resolve_token(&flags).expect("env fallback");
+        assert_eq!(token, "env-tok-123");
+        std::env::remove_var("MAXC_TOKEN");
+
+        // Flag takes precedence over env
+        std::env::set_var("MAXC_TOKEN", "env-tok");
+        let mut flags_with_token = HashMap::new();
+        flags_with_token.insert("--token".to_string(), "flag-tok".to_string());
+        let token = resolve_token(&flags_with_token).expect("flag precedence");
+        assert_eq!(token, "flag-tok");
+        std::env::remove_var("MAXC_TOKEN");
+    }
+
+    #[test]
     fn parse_errors_and_helpers_are_stable() {
         assert!(parse_cli(vec![]).is_err());
         assert!(parse_cli(vec!["wat".to_string()]).is_err());
@@ -1481,6 +1609,32 @@ mod tests {
             .await
             .expect("health");
         assert_eq!(health["result"]["ok"], true);
+
+        // workspace commands
+        let ws_created = transport
+            .send(build_request(Command::WorkspaceCreate {
+                token: token.clone(),
+                name: "cli-test-ws".to_string(),
+                folder: Some("/tmp/test".to_string()),
+            }))
+            .await
+            .expect("workspace create");
+        assert!(ws_created["result"]["workspace_id"].is_string());
+        assert_eq!(ws_created["result"]["name"], "cli-test-ws");
+
+        let ws_list = transport
+            .send(build_request(Command::WorkspaceList {
+                token: token.clone(),
+            }))
+            .await
+            .expect("workspace list");
+        assert!(
+            ws_list["result"]["workspaces"]
+                .as_array()
+                .expect("array")
+                .len()
+                >= 1
+        );
 
         let readiness = transport
             .send(build_request(Command::Readiness {

@@ -770,6 +770,9 @@ impl RpcServer {
             "system.diagnostics" => self.system_diagnostics(request.params).await,
             "system.metrics" => self.system_metrics(request.params).await,
             "system.logs" => self.system_logs(request.params).await,
+            method if method.starts_with("workspace.") => {
+                self.workspace_dispatch(method, request.params).await
+            }
             method if method.starts_with("terminal.") => {
                 self.terminal_dispatch(method, request.params).await
             }
@@ -1116,6 +1119,101 @@ impl RpcServer {
         self.persist_and_apply(event).await
     }
 
+    async fn workspace_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
+
+        match method {
+            "workspace.create" => self.workspace_create(params).await,
+            "workspace.list" => self.workspace_list().await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn workspace_create(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let name = params_ref
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        if name.trim().is_empty() {
+            return Err(ServerError::InvalidRequest);
+        }
+
+        let folder = params_ref
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let env_vars = params_ref
+            .get("env_vars")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        {
+            let projection = self.state.projection.lock().await;
+            if projection.workspaces.len() >= self.config.workspace_max_count {
+                return Err(ServerError::Conflict);
+            }
+            if projection.workspaces.values().any(|ws| ws.name == name) {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let now = now_unix_ms();
+        let workspace_id = format!("ws-{}", &random_event_id()[..12]);
+
+        let result = json!({
+            "workspace_id": workspace_id,
+            "name": name,
+            "folder": folder,
+            "env_vars": env_vars,
+            "created_at_ms": now
+        });
+        let payload = json!({
+            "workspace_id": workspace_id,
+            "name": name,
+            "folder": folder,
+            "env_vars": env_vars,
+            "created_at_ms": now,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::WorkspaceCreated,
+            workspace_id.clone(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn workspace_list(&self) -> Result<Value, ServerError> {
+        let projection = self.state.projection.lock().await;
+        let workspaces: Vec<Value> = projection
+            .workspaces
+            .values()
+            .map(|ws| {
+                json!({
+                    "workspace_id": ws.workspace_id,
+                    "name": ws.name,
+                    "folder": ws.folder,
+                    "env_vars": ws.env_vars,
+                    "created_at_ms": ws.created_at_ms
+                })
+            })
+            .collect();
+        Ok(json!({ "workspaces": workspaces }))
+    }
+
     async fn browser_dispatch(
         &self,
         method: &str,
@@ -1126,15 +1224,23 @@ impl RpcServer {
             .require_active_session_scope(params.as_ref(), SessionScope::Runtime)
             .await?;
 
-        let command_id = extract_command_id(params.as_ref())?;
-        if let Some(existing) = self.lookup_command_result(&command_id).await {
-            return Ok(existing);
-        }
-
         let audit = extract_browser_audit(params_ref, method)?;
         self.enforce_browser_limits(method, params_ref, &audit)
             .await?;
         let _scheduler = self.acquire_scheduler(method)?;
+
+        // Read-only queries do not require command_id / idempotency.
+        match method {
+            "browser.tab.list" => return self.browser_tab_list(audit).await,
+            "browser.history" => return self.browser_history(audit, params_ref).await,
+            _ => {}
+        }
+
+        // Mutating methods require command_id for idempotency.
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
 
         match method {
             "browser.create" => self.browser_create(command_id, audit).await,
@@ -1142,7 +1248,6 @@ impl RpcServer {
             "browser.detach" => self.browser_detach(command_id, audit).await,
             "browser.close" => self.browser_close(command_id, audit).await,
             "browser.tab.open" => self.browser_tab_open(command_id, audit, params_ref).await,
-            "browser.tab.list" => self.browser_tab_list(audit).await,
             "browser.tab.focus" => self.browser_tab_focus(command_id, audit).await,
             "browser.tab.close" => self.browser_tab_close(command_id, audit).await,
             "browser.goto" | "browser.reload" | "browser.back" | "browser.forward" => {
@@ -1167,7 +1272,6 @@ impl RpcServer {
                 self.browser_automation(command_id, audit, method, params_ref)
                     .await
             }
-            "browser.history" => self.browser_history(audit, params_ref).await,
             "browser.subscribe" => self.browser_subscribe(command_id, audit, method).await,
             "browser.raw.command" => self.browser_raw(command_id, audit, params_ref).await,
             _ => Err(ServerError::NotFound),
@@ -1309,18 +1413,24 @@ impl RpcServer {
             .require_active_session_scope(params.as_ref(), SessionScope::Runtime)
             .await?;
 
+        let audit = extract_terminal_audit(params_ref, method)?;
+        let _scheduler = self.acquire_scheduler(method)?;
+
+        // Read-only queries do not require command_id / idempotency.
+        if method == "terminal.history" {
+            return self.terminal_history(audit, params_ref).await;
+        }
+
+        // Mutating methods require command_id for idempotency.
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
             return Ok(existing);
         }
-        let audit = extract_terminal_audit(params_ref, method)?;
-        let _scheduler = self.acquire_scheduler(method)?;
 
         match method {
             "terminal.spawn" => self.terminal_spawn(command_id, audit, params_ref).await,
             "terminal.input" => self.terminal_input(command_id, audit, params_ref).await,
             "terminal.resize" => self.terminal_resize(command_id, audit, params_ref).await,
-            "terminal.history" => self.terminal_history(audit, params_ref).await,
             "terminal.kill" => self.terminal_kill(command_id, audit).await,
             "terminal.subscribe" => self.terminal_subscribe(command_id, audit).await,
             _ => Err(ServerError::NotFound),
@@ -1337,25 +1447,32 @@ impl RpcServer {
             .require_active_session_scope(params.as_ref(), SessionScope::Agent)
             .await?;
 
+        let audit = extract_agent_audit(params_ref, method)?;
+        let _scheduler = self.acquire_scheduler(method)?;
+
+        // Read-only queries do not require command_id / idempotency.
+        match method {
+            "agent.worker.list" => return self.agent_worker_list(audit).await,
+            "agent.worker.get" => return self.agent_worker_get(audit).await,
+            "agent.task.list" => return self.agent_task_list(audit).await,
+            "agent.task.get" => return self.agent_task_get(audit).await,
+            _ => {}
+        }
+
+        // Mutating methods require command_id for idempotency.
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
             return Ok(existing);
         }
-        let audit = extract_agent_audit(params_ref, method)?;
-        let _scheduler = self.acquire_scheduler(method)?;
 
         match method {
             "agent.worker.create" => {
                 self.agent_worker_create(command_id, audit, params_ref)
                     .await
             }
-            "agent.worker.list" => self.agent_worker_list(audit).await,
-            "agent.worker.get" => self.agent_worker_get(audit).await,
             "agent.worker.close" => self.agent_worker_close(command_id, audit).await,
             "agent.task.start" => self.agent_task_start(command_id, audit, params_ref).await,
             "agent.task.cancel" => self.agent_task_cancel(command_id, audit, params_ref).await,
-            "agent.task.list" => self.agent_task_list(audit).await,
-            "agent.task.get" => self.agent_task_get(audit).await,
             "agent.attach.terminal" => {
                 self.agent_attach_terminal(command_id, audit, params_ref)
                     .await

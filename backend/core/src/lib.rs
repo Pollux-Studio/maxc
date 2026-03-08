@@ -145,6 +145,7 @@ pub struct BackendConfig {
     pub env_allowlist: Vec<String>,
     pub agent_allowed_workspace_roots: Vec<String>,
     pub agent_allowed_programs: Vec<String>,
+    pub workspace_max_count: usize,
     pub agent_max_workers: usize,
     pub agent_max_tasks_per_worker: usize,
     pub artifact_max_files: usize,
@@ -210,6 +211,7 @@ impl Default for BackendConfig {
             terminal_allowed_cwd_roots: Vec::new(),
             terminal_allowed_programs: Vec::new(),
             env_allowlist: Vec::new(),
+            workspace_max_count: 32,
             agent_allowed_workspace_roots: Vec::new(),
             agent_allowed_programs: Vec::new(),
             agent_max_workers: 8,
@@ -528,6 +530,15 @@ impl BackendConfig {
                 .map(|v| v.trim().to_string())
                 .collect();
         }
+        if let Some(value) = get("MAXC_WORKSPACE_MAX_COUNT") {
+            cfg.workspace_max_count =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_WORKSPACE_MAX_COUNT",
+                        value: value.clone(),
+                    })?;
+        }
         if let Some(value) = get("MAXC_AGENT_ALLOWED_WORKSPACE_ROOTS") {
             cfg.agent_allowed_workspace_roots = value
                 .split(';')
@@ -834,6 +845,12 @@ impl BackendConfig {
             return Err(ConfigError::InvalidValue {
                 key: "MAXC_TERMINAL_MAX_ENV_BYTES",
                 value: self.terminal_max_env_bytes.to_string(),
+            });
+        }
+        if self.workspace_max_count == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_WORKSPACE_MAX_COUNT",
+                value: self.workspace_max_count.to_string(),
             });
         }
         if self.agent_max_workers == 0 {

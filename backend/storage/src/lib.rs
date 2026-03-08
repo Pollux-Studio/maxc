@@ -46,6 +46,7 @@ pub enum EventType {
     AgentTerminalDetached,
     AgentBrowserAttached,
     AgentBrowserDetached,
+    WorkspaceCreated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +136,15 @@ pub struct AgentWorkerProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProjection {
+    pub workspace_id: String,
+    pub name: String,
+    pub folder: String,
+    pub env_vars: HashMap<String, String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTaskProjection {
     pub agent_task_id: String,
     pub agent_worker_id: String,
@@ -153,6 +163,8 @@ pub struct ProjectionState {
     pub browser_automation_state: HashMap<String, Value>,
     pub agent_workers: HashMap<String, AgentWorkerProjection>,
     pub agent_tasks: HashMap<String, AgentTaskProjection>,
+    #[serde(default)]
+    pub workspaces: HashMap<String, WorkspaceProjection>,
     pub command_results: HashMap<String, Value>,
     pub last_cursor: ReplayCursor,
 }
@@ -437,6 +449,37 @@ impl ProjectionState {
                     )
                 })?;
                 worker.browser_session_id = None;
+            }
+            EventType::WorkspaceCreated => {
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let name = payload_str(&record.payload, "name")?;
+                let folder = record
+                    .payload
+                    .get("folder")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let env_vars = record
+                    .payload
+                    .get("env_vars")
+                    .and_then(Value::as_object)
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect::<HashMap<String, String>>()
+                    })
+                    .unwrap_or_default();
+                let created_at_ms = payload_u64(&record.payload, "created_at_ms")?;
+                self.workspaces.insert(
+                    workspace_id.to_string(),
+                    WorkspaceProjection {
+                        workspace_id: workspace_id.to_string(),
+                        name: name.to_string(),
+                        folder,
+                        env_vars,
+                        created_at_ms,
+                    },
+                );
             }
         }
 
