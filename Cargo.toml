@@ -8,6 +8,7 @@ members = [
   "backend/storage",
   "backend/security",
   "backend/telemetry",
+  "maxc_desktop/src-tauri",
 ]
 resolver = "2"
 
