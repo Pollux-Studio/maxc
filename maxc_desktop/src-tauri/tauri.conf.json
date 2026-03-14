@@ -16,7 +16,9 @@
         "width": 1280,
         "height": 832,
         "decorations": false,
-        "center": true
+        "center": true,
+        "maximized": true,
+        "fullscreen": false
       }
     ],
     "security": {

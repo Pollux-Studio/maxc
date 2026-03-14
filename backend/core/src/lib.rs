@@ -146,6 +146,8 @@ pub struct BackendConfig {
     pub agent_allowed_workspace_roots: Vec<String>,
     pub agent_allowed_programs: Vec<String>,
     pub workspace_max_count: usize,
+    pub pane_max_per_workspace: usize,
+    pub surface_max_per_pane: usize,
     pub agent_max_workers: usize,
     pub agent_max_tasks_per_worker: usize,
     pub artifact_max_files: usize,
@@ -212,6 +214,8 @@ impl Default for BackendConfig {
             terminal_allowed_programs: Vec::new(),
             env_allowlist: Vec::new(),
             workspace_max_count: 32,
+            pane_max_per_workspace: 16,
+            surface_max_per_pane: 16,
             agent_allowed_workspace_roots: Vec::new(),
             agent_allowed_programs: Vec::new(),
             agent_max_workers: 8,
@@ -539,6 +543,24 @@ impl BackendConfig {
                         value: value.clone(),
                     })?;
         }
+        if let Some(value) = get("MAXC_PANE_MAX_PER_WORKSPACE") {
+            cfg.pane_max_per_workspace =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_PANE_MAX_PER_WORKSPACE",
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get("MAXC_SURFACE_MAX_PER_PANE") {
+            cfg.surface_max_per_pane =
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "MAXC_SURFACE_MAX_PER_PANE",
+                        value: value.clone(),
+                    })?;
+        }
         if let Some(value) = get("MAXC_AGENT_ALLOWED_WORKSPACE_ROOTS") {
             cfg.agent_allowed_workspace_roots = value
                 .split(';')
@@ -853,6 +875,18 @@ impl BackendConfig {
                 value: self.workspace_max_count.to_string(),
             });
         }
+        if self.pane_max_per_workspace == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_PANE_MAX_PER_WORKSPACE",
+                value: self.pane_max_per_workspace.to_string(),
+            });
+        }
+        if self.surface_max_per_pane == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAXC_SURFACE_MAX_PER_PANE",
+                value: self.surface_max_per_pane.to_string(),
+            });
+        }
         if self.agent_max_workers == 0 {
             return Err(ConfigError::InvalidValue {
                 key: "MAXC_AGENT_MAX_WORKERS",
@@ -1114,6 +1148,8 @@ mod tests {
             "MAXC_OVERLOAD_REJECT_THRESHOLD" => Some("77".to_string()),
             "MAXC_BREAKER_FAILURE_THRESHOLD" => Some("8".to_string()),
             "MAXC_BREAKER_COOLDOWN_MS" => Some("9000".to_string()),
+            "MAXC_PANE_MAX_PER_WORKSPACE" => Some("10".to_string()),
+            "MAXC_SURFACE_MAX_PER_PANE" => Some("12".to_string()),
             "MAXC_LOG_LEVEL" => Some("warn".to_string()),
             _ => None,
         })
@@ -1186,6 +1222,8 @@ mod tests {
             cfg.agent_allowed_programs,
             vec!["claude.exe".to_string(), "cargo.exe".to_string()]
         );
+        assert_eq!(cfg.pane_max_per_workspace, 10);
+        assert_eq!(cfg.surface_max_per_pane, 12);
         assert_eq!(cfg.agent_max_workers, 3);
         assert_eq!(cfg.agent_max_tasks_per_worker, 4);
         assert_eq!(cfg.artifact_max_files, 11);
@@ -1654,6 +1692,30 @@ mod tests {
             Err(ConfigError::InvalidValue {
                 key: "MAXC_LOG_LEVEL",
                 value: "verbose".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            pane_max_per_workspace: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_PANE_MAX_PER_WORKSPACE",
+                value: "0".to_string(),
+            })
+        );
+
+        let cfg = BackendConfig {
+            surface_max_per_pane: 0,
+            ..BackendConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "MAXC_SURFACE_MAX_PER_PANE",
+                value: "0".to_string(),
             })
         );
     }

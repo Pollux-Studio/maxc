@@ -143,3 +143,12 @@
 .no-drag {
   -webkit-app-region: no-drag;
 }
+
+.surface-tabbar {
+  scrollbar-width: none;
+}
+
+.surface-tabbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}

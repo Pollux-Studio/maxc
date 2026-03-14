@@ -47,6 +47,17 @@ pub enum EventType {
     AgentBrowserAttached,
     AgentBrowserDetached,
     WorkspaceCreated,
+    WorkspaceUpdated,
+    WorkspaceDeleted,
+    PaneCreated,
+    PaneSplit,
+    PaneClosed,
+    PaneResized,
+    SurfaceCreated,
+    SurfaceClosed,
+    SurfaceFocused,
+    NotificationSent,
+    NotificationCleared,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,6 +153,34 @@ pub struct WorkspaceProjection {
     pub folder: String,
     pub env_vars: HashMap<String, String>,
     pub created_at_ms: u64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneProjection {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub parent_pane_id: Option<String>,
+    pub split_direction: Option<String>,
+    pub split_ratio: f64,
+    pub order: u32,
+    pub created_at_ms: u64,
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceProjection {
+    pub surface_id: String,
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub panel_type: String,
+    pub panel_session_id: Option<String>,
+    pub order: u32,
+    pub focused: bool,
+    pub created_at_ms: u64,
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +194,18 @@ pub struct AgentTaskProjection {
     pub failure_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationProjection {
+    pub notification_id: String,
+    pub workspace_id: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub level: String,
+    pub source: String,
+    pub created_at_ms: u64,
+    pub read: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectionState {
     pub sessions: HashMap<String, SessionProjection>,
@@ -165,6 +216,12 @@ pub struct ProjectionState {
     pub agent_tasks: HashMap<String, AgentTaskProjection>,
     #[serde(default)]
     pub workspaces: HashMap<String, WorkspaceProjection>,
+    #[serde(default)]
+    pub panes: HashMap<String, PaneProjection>,
+    #[serde(default)]
+    pub surfaces: HashMap<String, SurfaceProjection>,
+    #[serde(default)]
+    pub notifications: HashMap<String, NotificationProjection>,
     pub command_results: HashMap<String, Value>,
     pub last_cursor: ReplayCursor,
 }
@@ -478,8 +535,270 @@ impl ProjectionState {
                         folder,
                         env_vars,
                         created_at_ms,
+                        deleted: false,
                     },
                 );
+            }
+            EventType::WorkspaceUpdated => {
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let workspace = self.workspaces.get_mut(workspace_id).ok_or_else(|| {
+                    StoreError::InvalidPayload("update for unknown workspace".to_string())
+                })?;
+                if let Some(name) = record.payload.get("name").and_then(Value::as_str) {
+                    workspace.name = name.to_string();
+                }
+                if let Some(folder) = record.payload.get("folder").and_then(Value::as_str) {
+                    workspace.folder = folder.to_string();
+                }
+                if let Some(env_vars) = record.payload.get("env_vars").and_then(Value::as_object) {
+                    workspace.env_vars = env_vars
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect();
+                }
+            }
+            EventType::WorkspaceDeleted => {
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let workspace = self.workspaces.get_mut(workspace_id).ok_or_else(|| {
+                    StoreError::InvalidPayload("delete for unknown workspace".to_string())
+                })?;
+                workspace.deleted = true;
+            }
+            EventType::PaneCreated => {
+                let pane_id = payload_str(&record.payload, "pane_id")?;
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let parent_pane_id = record
+                    .payload
+                    .get("parent_pane_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let split_direction = record
+                    .payload
+                    .get("split_direction")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let split_ratio = record
+                    .payload
+                    .get("split_ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                let order = record
+                    .payload
+                    .get("order")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                let created_at_ms = payload_u64(&record.payload, "created_at_ms")?;
+                self.panes.insert(
+                    pane_id.to_string(),
+                    PaneProjection {
+                        pane_id: pane_id.to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        parent_pane_id,
+                        split_direction,
+                        split_ratio,
+                        order,
+                        created_at_ms,
+                        closed: false,
+                    },
+                );
+            }
+            EventType::PaneSplit => {
+                let pane_id = payload_str(&record.payload, "pane_id")?;
+                let direction = payload_str(&record.payload, "direction")?;
+                let ratio = record
+                    .payload
+                    .get("ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5);
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    pane.split_direction = Some(direction.to_string());
+                    pane.split_ratio = ratio;
+                }
+                // If child pane IDs are provided, move existing surfaces into the first child
+                // so the active content stays visible after the split.
+                let child_a = record
+                    .payload
+                    .get("child_a")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                if let Some(child_a_id) = child_a {
+                    for surface in self
+                        .surfaces
+                        .values_mut()
+                        .filter(|s| s.pane_id == pane_id && !s.closed)
+                    {
+                        surface.pane_id = child_a_id.clone();
+                    }
+                }
+                // Child panes are created via separate PaneCreated events.
+            }
+            EventType::PaneClosed => {
+                let pane_id = payload_str(&record.payload, "pane_id")?;
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    pane.closed = true;
+                }
+            }
+            EventType::PaneResized => {
+                let pane_id = payload_str(&record.payload, "pane_id")?;
+                let ratio = record
+                    .payload
+                    .get("ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5);
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    pane.split_ratio = ratio;
+                }
+            }
+            EventType::SurfaceCreated => {
+                let surface_id = payload_str(&record.payload, "surface_id")?;
+                let pane_id = payload_str(&record.payload, "pane_id")?;
+                let workspace_id = payload_str(&record.payload, "workspace_id")?;
+                let title = record
+                    .payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled")
+                    .to_string();
+                let panel_type = record
+                    .payload
+                    .get("panel_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("terminal")
+                    .to_string();
+                let panel_session_id = record
+                    .payload
+                    .get("panel_session_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let order = record
+                    .payload
+                    .get("order")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                let created_at_ms = payload_u64(&record.payload, "created_at_ms")?;
+                self.surfaces.insert(
+                    surface_id.to_string(),
+                    SurfaceProjection {
+                        surface_id: surface_id.to_string(),
+                        pane_id: pane_id.to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        title,
+                        panel_type,
+                        panel_session_id,
+                        order,
+                        focused: true,
+                        created_at_ms,
+                        closed: false,
+                    },
+                );
+            }
+            EventType::SurfaceClosed => {
+                let surface_id = payload_str(&record.payload, "surface_id")?;
+                if let Some(surface) = self.surfaces.get_mut(surface_id) {
+                    surface.closed = true;
+                    surface.focused = false;
+                }
+            }
+            EventType::SurfaceFocused => {
+                let surface_id = payload_str(&record.payload, "surface_id")?;
+                let pane_id = record
+                    .payload
+                    .get("pane_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                // Unfocus all surfaces in the same pane, then focus target.
+                if !pane_id.is_empty() {
+                    for surf in self
+                        .surfaces
+                        .values_mut()
+                        .filter(|s| s.pane_id == pane_id && !s.closed)
+                    {
+                        surf.focused = surf.surface_id == surface_id;
+                    }
+                } else if let Some(surface) = self.surfaces.get_mut(surface_id) {
+                    surface.focused = true;
+                }
+            }
+            EventType::NotificationSent => {
+                let notification_id = payload_str(&record.payload, "notification_id")?;
+                let title = payload_str(&record.payload, "title")?;
+                let body = record
+                    .payload
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let level = record
+                    .payload
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info")
+                    .to_string();
+                let source = record
+                    .payload
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    .to_string();
+                let created_at_ms = payload_u64(&record.payload, "created_at_ms")?;
+                let read = record
+                    .payload
+                    .get("read")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let workspace_id = record
+                    .payload
+                    .get("workspace_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+
+                self.notifications.insert(
+                    notification_id.to_string(),
+                    NotificationProjection {
+                        notification_id: notification_id.to_string(),
+                        workspace_id,
+                        title: title.to_string(),
+                        body,
+                        level,
+                        source,
+                        created_at_ms,
+                        read,
+                    },
+                );
+            }
+            EventType::NotificationCleared => {
+                let maybe_notification_id = record
+                    .payload
+                    .get("notification_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let maybe_workspace_id = record
+                    .payload
+                    .get("workspace_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+
+                match (maybe_notification_id, maybe_workspace_id) {
+                    (Some(notification_id), _) => {
+                        if let Some(notification) = self.notifications.get_mut(&notification_id) {
+                            notification.read = true;
+                        }
+                    }
+                    (None, Some(workspace_id)) => {
+                        for notification in self
+                            .notifications
+                            .values_mut()
+                            .filter(|n| n.workspace_id.as_deref() == Some(&workspace_id))
+                        {
+                            notification.read = true;
+                        }
+                    }
+                    (None, None) => {
+                        for notification in self.notifications.values_mut() {
+                            notification.read = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -1109,6 +1428,68 @@ mod tests {
         assert!(recovered
             .browser_automation_state
             .contains_key("tab-1:last-nav"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn notification_events_are_projected_and_cleared() {
+        let dir = temp_dir("store-notifications");
+        let cfg = EventStoreConfig {
+            event_dir: dir.clone(),
+            segment_max_bytes: 4096,
+            snapshot_interval_events: 2,
+            snapshot_retain_count: 2,
+        };
+        let mut store = EventStore::new(cfg).expect("store");
+        let mut projection = ProjectionState::default();
+
+        let sent = EventRecord::new(
+            "evt-notify-1",
+            EventType::NotificationSent,
+            "notif-1",
+            "cmd-notify-1",
+            json!({
+                "notification_id": "notif-1",
+                "workspace_id": "ws-1",
+                "title": "Build finished",
+                "body": "All tests passed",
+                "level": "success",
+                "source": "cli",
+                "created_at_ms": 1,
+                "read": false,
+                "result": {"notification_id":"notif-1"}
+            }),
+        );
+        let cursor = store.append(&sent).expect("append");
+        projection.apply(&sent, cursor).expect("apply");
+
+        let cleared = EventRecord::new(
+            "evt-notify-2",
+            EventType::NotificationCleared,
+            "notifications",
+            "cmd-notify-2",
+            json!({
+                "workspace_id": "ws-1",
+                "result": {"cleared": true}
+            }),
+        );
+        let cursor = store.append(&cleared).expect("append");
+        projection.apply(&cleared, cursor).expect("apply");
+
+        let mut recovery_store = EventStore::new(EventStoreConfig {
+            event_dir: dir.clone(),
+            segment_max_bytes: 4096,
+            snapshot_interval_events: 2,
+            snapshot_retain_count: 2,
+        })
+        .expect("store");
+        let recovered = recovery_store.recover().expect("recover");
+        let notification = recovered
+            .notifications
+            .get("notif-1")
+            .expect("notification");
+        assert_eq!(notification.read, true);
+        assert!(recovered.command_results.contains_key("cmd-notify-2"));
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use maxc_automation::RpcServer;
 use maxc_core::BackendConfig;
@@ -63,6 +64,29 @@ fn parse_git_head(head_path: &Path) -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+async fn create_window(app: tauri::AppHandle) -> Result<String, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    let label = format!("window-{}", stamp);
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        label.clone(),
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("maxc_desktop")
+    .inner_size(1280.0, 832.0)
+    .decorations(false)
+    .center()
+    .build()
+    .map_err(|e: tauri::Error| e.to_string())?;
+
+    Ok(label)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = RPC_STATE.get_or_init(init_server).clone();
@@ -71,7 +95,12 @@ pub fn run() {
         .manage(state)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![rpc_call, get_git_branch])
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            rpc_call,
+            get_git_branch,
+            create_window
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

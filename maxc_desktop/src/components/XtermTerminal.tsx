@@ -13,6 +13,8 @@ export type XtermHandle = {
   focus(): void;
   /** Fit the terminal to its container */
   fit(): void;
+  /** Adjust font size by delta */
+  changeFontSize(delta: number): void;
 };
 
 export type XtermTerminalProps = {
@@ -74,6 +76,16 @@ export const XtermTerminal = forwardRef<XtermHandle, XtermTerminalProps>(
       },
       fit() {
         try { fitAddonRef.current?.fit(); } catch { /* ignore */ }
+      },
+      changeFontSize(delta: number) {
+        const term = termRef.current;
+        if (!term) return;
+        const current = term.options.fontSize ?? 13;
+        const next = Math.max(10, Math.min(24, current + delta));
+        if (next !== current) {
+          term.options.fontSize = next;
+          try { fitAddonRef.current?.fit(); } catch { /* ignore */ }
+        }
       },
     }));
 
