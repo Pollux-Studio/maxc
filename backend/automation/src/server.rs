@@ -3323,9 +3323,10 @@ impl RpcServer {
         launch: &mut TerminalLaunchSpec,
     ) -> Result<(), ServerError> {
         if !launch.env.contains_key("MAXC_SOCKET_PATH") {
-            launch
-                .env
-                .insert("MAXC_SOCKET_PATH".to_string(), self.config.socket_path.clone());
+            launch.env.insert(
+                "MAXC_SOCKET_PATH".to_string(),
+                self.config.socket_path.clone(),
+            );
         }
         if !launch.env.contains_key("MAXC_WORKSPACE_ID") {
             launch

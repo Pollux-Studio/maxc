@@ -91,8 +91,13 @@ async fn create_window(app: tauri::AppHandle) -> Result<String, String> {
 
 fn updater_endpoint(channel: &str) -> Result<String, String> {
     match channel {
-        "beta" => Ok("https://github.com/Pollux-Studio/maxc/releases/download/beta/latest.json".to_string()),
-        _ => Ok("https://github.com/Pollux-Studio/maxc/releases/download/stable/latest.json".to_string()),
+        "beta" => Ok(
+            "https://github.com/Pollux-Studio/maxc/releases/download/beta/latest.json".to_string(),
+        ),
+        _ => Ok(
+            "https://github.com/Pollux-Studio/maxc/releases/download/stable/latest.json"
+                .to_string(),
+        ),
     }
 }
 
