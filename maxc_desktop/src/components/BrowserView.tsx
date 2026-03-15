@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Globe2, RotateCw } from "lucide-react";
 import { Shimmer } from "@/components/ai-elements/shimmer";
-import { cn } from "@/lib/utils";
 
 export type BrowserViewProps = {
   surfaceId: string;
@@ -26,10 +25,7 @@ export function BrowserView({
   onReload,
   onBack,
   onForward,
-  onScreenshot,
   currentUrl,
-  screenshotData,
-  screenshotLoading,
   sessionLoading,
 }: BrowserViewProps) {
   const [urlInput, setUrlInput] = useState(currentUrl);
