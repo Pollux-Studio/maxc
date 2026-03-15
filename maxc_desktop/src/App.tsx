@@ -26,6 +26,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import logoWhite from "./assets/maxc_logo_white.svg";
 import { Button } from "@/components/ui/button";
 import { type XtermHandle } from "@/components/XtermTerminal";
 import { PaneContainer, type PaneNode, type BrowserState } from "@/components/PaneContainer";
@@ -109,8 +110,12 @@ function TitleBar() {
   return (
     <div className="flex items-center border-b bg-card/80 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur">
       <div className="drag-region flex items-center gap-2" data-tauri-drag-region>
-        <div className="size-2.5 rounded-full bg-primary" />
-        <div className="text-sm font-semibold text-foreground" data-tauri-drag-region>maxc</div>
+        <img
+          src={logoWhite}
+          alt="maxc"
+          className="h-4 w-auto select-none"
+          draggable={false}
+        />
       </div>
       <div className="ml-auto flex items-center gap-1">
         <Button
