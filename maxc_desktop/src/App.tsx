@@ -220,6 +220,9 @@ function App() {
   const browserCaptureRef = useRef<Map<string, number>>(new Map());
   const notificationInitialized = useRef(false);
   const notificationSeen = useRef<Set<string>>(new Set());
+  const inputBufferRef = useRef<Map<string, string>>(new Map());
+  const inputTimerRef = useRef<Map<string, number>>(new Map());
+  const inputInFlightRef = useRef<Set<string>>(new Set());
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((w) => w.workspace_id === selectedWorkspaceId) ?? workspaces[0] ?? null,
@@ -1134,25 +1137,62 @@ function App() {
   }
 
   // -- terminal input / resize handlers (keyed by surfaceId) --
-  const sendTerminalInput = useCallback(
-    async (surfaceId: string, data: string) => {
-      if (!token) return;
+  const flushTerminalInput = useCallback(
+    async (surfaceId: string) => {
+      const buffer = inputBufferRef.current.get(surfaceId);
+      if (!buffer) {
+        inputBufferRef.current.delete(surfaceId);
+        return;
+      }
+      if (inputInFlightRef.current.has(surfaceId)) {
+        const retry = window.setTimeout(() => flushTerminalInput(surfaceId), 12);
+        inputTimerRef.current.set(surfaceId, retry);
+        return;
+      }
       const surface = surfacesRef.current.find((s) => s.surfaceId === surfaceId);
-      if (!surface?.terminalSessionId) return;
+      if (!surface?.terminalSessionId || !token) {
+        inputBufferRef.current.delete(surfaceId);
+        return;
+      }
+      inputInFlightRef.current.add(surfaceId);
+      inputBufferRef.current.set(surfaceId, "");
       try {
         await rpc("terminal.input", {
           command_id: "ui-term-input-" + crypto.randomUUID(),
           workspace_id: surface.workspaceId,
           surface_id: surfaceId,
           terminal_session_id: surface.terminalSessionId,
-          input: data,
+          input: buffer,
           auth: { token },
         });
       } catch (err) {
         console.error("terminal.input error:", err);
+      } finally {
+        inputInFlightRef.current.delete(surfaceId);
+        const remaining = inputBufferRef.current.get(surfaceId);
+        if (remaining) {
+          const retry = window.setTimeout(() => flushTerminalInput(surfaceId), 0);
+          inputTimerRef.current.set(surfaceId, retry);
+        }
       }
     },
     [token],
+  );
+
+  const sendTerminalInput = useCallback(
+    (surfaceId: string, data: string) => {
+      if (!token) return;
+      const prev = inputBufferRef.current.get(surfaceId) ?? "";
+      inputBufferRef.current.set(surfaceId, prev + data);
+      if (!inputTimerRef.current.has(surfaceId)) {
+        const timer = window.setTimeout(() => {
+          inputTimerRef.current.delete(surfaceId);
+          void flushTerminalInput(surfaceId);
+        }, 12);
+        inputTimerRef.current.set(surfaceId, timer);
+      }
+    },
+    [flushTerminalInput, token],
   );
 
   const sendTerminalResize = useCallback(
