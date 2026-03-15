@@ -1488,7 +1488,7 @@ mod tests {
             .notifications
             .get("notif-1")
             .expect("notification");
-        assert_eq!(notification.read, true);
+        assert!(notification.read);
         assert!(recovered.command_results.contains_key("cmd-notify-2"));
         let _ = fs::remove_dir_all(dir);
     }

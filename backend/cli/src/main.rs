@@ -3360,13 +3360,8 @@ mod tests {
             }))
             .await
             .expect("workspace list");
-        assert!(
-            ws_list["result"]["workspaces"]
-                .as_array()
-                .expect("array")
-                .len()
-                >= 1
-        );
+        let workspaces = ws_list["result"]["workspaces"].as_array().expect("array");
+        assert!(!workspaces.is_empty());
 
         // workspace update
         let ws_id = ws_created["result"]["workspace_id"]
@@ -3413,13 +3408,10 @@ mod tests {
             }))
             .await
             .expect("pane list");
-        assert!(
-            pane_list["result"]["panes"]
-                .as_array()
-                .expect("panes array")
-                .len()
-                >= 1
-        );
+        let panes = pane_list["result"]["panes"]
+            .as_array()
+            .expect("panes array");
+        assert!(!panes.is_empty());
 
         let split = transport
             .send(build_request(Command::PaneSplit {
@@ -3465,13 +3457,10 @@ mod tests {
             }))
             .await
             .expect("surface list");
-        assert!(
-            surface_list["result"]["surfaces"]
-                .as_array()
-                .expect("surfaces array")
-                .len()
-                >= 1
-        );
+        let surfaces = surface_list["result"]["surfaces"]
+            .as_array()
+            .expect("surfaces array");
+        assert!(!surfaces.is_empty());
 
         let focused = transport
             .send(build_request(Command::SurfaceFocus {
