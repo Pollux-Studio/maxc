@@ -10,6 +10,7 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import {
   Bell,
+  ChevronDown,
   ChevronRight,
   FolderOpen,
   GitBranch,
@@ -2143,14 +2144,17 @@ function App() {
               </div>
               <div className="flex items-center gap-2">
                 <label className="text-[10px] text-muted-foreground">Channel</label>
-                <select
-                  className="h-7 rounded border bg-muted/40 px-2 text-[11px]"
-                  value={updateChannel}
-                  onChange={(e) => setUpdateChannel(e.target.value as "stable" | "beta")}
-                >
-                  <option value="stable">Stable</option>
-                  <option value="beta">Beta</option>
-                </select>
+                <div className="relative">
+                  <select
+                    className="h-7 appearance-none rounded-md border border-border/70 bg-background px-2 pr-6 text-[11px] text-foreground shadow-sm outline-none transition focus:border-primary/60 focus:ring-1 focus:ring-primary/30"
+                    value={updateChannel}
+                    onChange={(e) => setUpdateChannel(e.target.value as "stable" | "beta")}
+                  >
+                    <option value="stable">Stable</option>
+                    <option value="beta">Beta</option>
+                  </select>
+                  <ChevronDown className="pointer-events-none absolute right-1.5 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
+                </div>
                 <Button
                   variant="outline"
                   size="sm"
