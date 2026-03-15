@@ -770,6 +770,15 @@ impl RpcServer {
             "system.diagnostics" => self.system_diagnostics(request.params).await,
             "system.metrics" => self.system_metrics(request.params).await,
             "system.logs" => self.system_logs(request.params).await,
+            method if method.starts_with("workspace.") => {
+                self.workspace_dispatch(method, request.params).await
+            }
+            method if method.starts_with("pane.") => {
+                self.pane_dispatch(method, request.params).await
+            }
+            method if method.starts_with("surface.") => {
+                self.surface_dispatch(method, request.params).await
+            }
             method if method.starts_with("terminal.") => {
                 self.terminal_dispatch(method, request.params).await
             }
@@ -778,6 +787,9 @@ impl RpcServer {
             }
             method if method.starts_with("agent.") => {
                 self.agent_dispatch(method, request.params).await
+            }
+            method if method.starts_with("notification.") => {
+                self.notification_dispatch(method, request.params).await
             }
             _ => Err(ServerError::NotFound),
         }
@@ -1116,6 +1128,1128 @@ impl RpcServer {
         self.persist_and_apply(event).await
     }
 
+    async fn workspace_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
+
+        // Read-only queries
+        match method {
+            "workspace.list" => return self.workspace_list().await,
+            "workspace.layout" => return self.workspace_layout(params).await,
+            _ => {}
+        }
+
+        // Mutating
+        match method {
+            "workspace.create" => self.workspace_create(params).await,
+            "workspace.update" => self.workspace_update(params).await,
+            "workspace.delete" => self.workspace_delete(params).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn notification_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
+
+        match method {
+            "notification.list" => self.notification_list(params).await,
+            "notification.send" => self.notification_send(params).await,
+            "notification.clear" => self.notification_clear(params).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn notification_send(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let title = params_ref
+            .get("title")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        if title.trim().is_empty() {
+            return Err(ServerError::InvalidRequest);
+        }
+
+        let body = params_ref
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let level = params_ref
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("info");
+        let source = params_ref
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        let level_allowed = matches!(level, "info" | "success" | "warning" | "error");
+        if !level_allowed {
+            return Err(ServerError::InvalidRequest);
+        }
+
+        if let Some(ref ws_id) = workspace_id {
+            let projection = self.state.projection.lock().await;
+            if let Some(ws) = projection.workspaces.get(ws_id) {
+                if ws.deleted {
+                    return Err(ServerError::Conflict);
+                }
+            }
+            // If workspace doesn't exist in projection, allow it (agent may
+            // send notifications before workspace is created, or use arbitrary IDs).
+        }
+
+        let now = now_unix_ms();
+        let notification_id = format!("notif-{}", &random_event_id()[..12]);
+        let result = json!({
+            "notification_id": notification_id,
+            "workspace_id": workspace_id,
+            "title": title,
+            "body": body,
+            "level": level,
+            "source": source,
+            "created_at_ms": now,
+            "read": false
+        });
+
+        let mut payload = json!({
+            "notification_id": result["notification_id"],
+            "title": title,
+            "body": body,
+            "level": level,
+            "source": source,
+            "created_at_ms": now,
+            "read": false,
+            "result": result
+        });
+        if let Some(ws_id) = workspace_id {
+            payload["workspace_id"] = json!(ws_id);
+        }
+
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::NotificationSent,
+            notification_id,
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn notification_list(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref();
+        let workspace_id = params_ref
+            .and_then(|p| p.get("workspace_id"))
+            .and_then(Value::as_str);
+        let unread_only = params_ref
+            .and_then(|p| p.get("unread_only"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let limit = params_ref
+            .and_then(|p| p.get("limit"))
+            .and_then(Value::as_u64)
+            .unwrap_or(100) as usize;
+
+        let projection = self.state.projection.lock().await;
+        let mut notifications: Vec<_> = projection
+            .notifications
+            .values()
+            .filter(|n| match workspace_id {
+                Some(ws) => n.workspace_id.as_deref() == Some(ws),
+                None => true,
+            })
+            .filter(|n| if unread_only { !n.read } else { true })
+            .collect();
+
+        notifications.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
+        notifications.truncate(limit);
+
+        let unread_count = projection
+            .notifications
+            .values()
+            .filter(|n| !n.read)
+            .count();
+
+        Ok(json!({
+            "notifications": notifications.iter().map(|n| json!({
+                "notification_id": n.notification_id,
+                "workspace_id": n.workspace_id,
+                "title": n.title,
+                "body": n.body,
+                "level": n.level,
+                "source": n.source,
+                "created_at_ms": n.created_at_ms,
+                "read": n.read
+            })).collect::<Vec<_>>(),
+            "unread_count": unread_count
+        }))
+    }
+
+    async fn notification_clear(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let notification_id = params_ref
+            .get("notification_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        let cleared_count = {
+            let projection = self.state.projection.lock().await;
+            if let Some(ref notif_id) = notification_id {
+                if !projection.notifications.contains_key(notif_id) {
+                    return Err(ServerError::NotFound);
+                }
+                projection
+                    .notifications
+                    .values()
+                    .filter(|n| n.notification_id == *notif_id && !n.read)
+                    .count()
+            } else if let Some(ref ws) = workspace_id {
+                projection
+                    .notifications
+                    .values()
+                    .filter(|n| n.workspace_id.as_deref() == Some(ws) && !n.read)
+                    .count()
+            } else {
+                projection
+                    .notifications
+                    .values()
+                    .filter(|n| !n.read)
+                    .count()
+            }
+        };
+
+        let mut payload = json!({
+            "result": {
+                "cleared": true,
+                "cleared_count": cleared_count
+            }
+        });
+        if let Some(notif_id) = notification_id {
+            payload["notification_id"] = json!(notif_id);
+        }
+        if let Some(ws_id) = workspace_id {
+            payload["workspace_id"] = json!(ws_id);
+        }
+
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::NotificationCleared,
+            "notifications".to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn workspace_create(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let name = params_ref
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        if name.trim().is_empty() {
+            return Err(ServerError::InvalidRequest);
+        }
+
+        let folder = params_ref
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let raw_env_vars = params_ref
+            .get("env_vars")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        {
+            let projection = self.state.projection.lock().await;
+            if projection
+                .workspaces
+                .values()
+                .filter(|ws| !ws.deleted)
+                .count()
+                >= self.config.workspace_max_count
+            {
+                return Err(ServerError::Conflict);
+            }
+            if projection
+                .workspaces
+                .values()
+                .any(|ws| ws.name == name && !ws.deleted)
+            {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let now = now_unix_ms();
+        let workspace_id = format!("ws-{}", &random_event_id()[..12]);
+        let root_pane_id = format!("pane-{}", &random_event_id()[..12]);
+
+        let mut env_vars_obj = raw_env_vars
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        env_vars_obj
+            .entry("MAXC_SOCKET_PATH".to_string())
+            .or_insert(json!(self.config.socket_path.clone()));
+        env_vars_obj
+            .entry("MAXC_WORKSPACE_ID".to_string())
+            .or_insert(json!(workspace_id.clone()));
+        let env_vars = Value::Object(env_vars_obj);
+
+        let result = json!({
+            "workspace_id": workspace_id,
+            "name": name,
+            "folder": folder,
+            "env_vars": env_vars,
+            "created_at_ms": now,
+            "root_pane_id": root_pane_id
+        });
+        let payload = json!({
+            "workspace_id": workspace_id,
+            "name": name,
+            "folder": folder,
+            "env_vars": env_vars,
+            "created_at_ms": now,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::WorkspaceCreated,
+            workspace_id.clone(),
+            command_id.clone(),
+            payload,
+        );
+        self.persist_and_apply(event).await?;
+
+        // Auto-create a default root pane for the workspace.
+        let pane_payload = json!({
+            "pane_id": root_pane_id,
+            "workspace_id": workspace_id,
+            "split_ratio": 1.0,
+            "order": 0,
+            "created_at_ms": now,
+            "result": { "pane_id": root_pane_id }
+        });
+        let pane_event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneCreated,
+            root_pane_id.clone(),
+            format!("{command_id}-root-pane"),
+            pane_payload,
+        );
+        self.persist_and_apply(pane_event).await?;
+
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "name": name,
+            "folder": folder,
+            "env_vars": env_vars,
+            "created_at_ms": now,
+            "root_pane_id": root_pane_id
+        }))
+    }
+
+    async fn workspace_list(&self) -> Result<Value, ServerError> {
+        let projection = self.state.projection.lock().await;
+        let workspaces: Vec<Value> = projection
+            .workspaces
+            .values()
+            .filter(|ws| !ws.deleted)
+            .map(|ws| {
+                json!({
+                    "workspace_id": ws.workspace_id,
+                    "name": ws.name,
+                    "folder": ws.folder,
+                    "env_vars": ws.env_vars,
+                    "created_at_ms": ws.created_at_ms
+                })
+            })
+            .collect();
+        Ok(json!({ "workspaces": workspaces }))
+    }
+
+    async fn workspace_update(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        let old_name;
+        let old_folder;
+        {
+            let projection = self.state.projection.lock().await;
+            let ws = projection
+                .workspaces
+                .get(workspace_id)
+                .ok_or(ServerError::NotFound)?;
+            if ws.deleted {
+                return Err(ServerError::Conflict);
+            }
+            old_name = ws.name.clone();
+            old_folder = ws.folder.clone();
+        }
+
+        let new_name = params_ref
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&old_name);
+        let new_folder = params_ref
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or(&old_folder);
+        let env_vars = params_ref.get("env_vars").cloned();
+
+        // Check name uniqueness if changing
+        if new_name != old_name {
+            let projection = self.state.projection.lock().await;
+            if projection
+                .workspaces
+                .values()
+                .any(|ws| ws.name == new_name && ws.workspace_id != workspace_id && !ws.deleted)
+            {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let mut payload = json!({
+            "workspace_id": workspace_id,
+            "name": new_name,
+            "folder": new_folder,
+            "result": {
+                "workspace_id": workspace_id,
+                "name": new_name,
+                "folder": new_folder,
+                "updated": true
+            }
+        });
+        if let Some(ev) = env_vars {
+            payload["env_vars"] = ev;
+            payload["result"]["env_vars"] = payload["env_vars"].clone();
+        }
+
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::WorkspaceUpdated,
+            workspace_id.to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn workspace_delete(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        {
+            let projection = self.state.projection.lock().await;
+            let ws = projection
+                .workspaces
+                .get(workspace_id)
+                .ok_or(ServerError::NotFound)?;
+            if ws.deleted {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let payload = json!({
+            "workspace_id": workspace_id,
+            "result": { "workspace_id": workspace_id, "deleted": true }
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::WorkspaceDeleted,
+            workspace_id.to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn workspace_layout(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        let projection = self.state.projection.lock().await;
+
+        // Verify workspace exists
+        let ws = projection
+            .workspaces
+            .get(workspace_id)
+            .ok_or(ServerError::NotFound)?;
+        if ws.deleted {
+            return Err(ServerError::NotFound);
+        }
+
+        // Find root panes (no parent, in this workspace)
+        let ws_panes: Vec<_> = projection
+            .panes
+            .values()
+            .filter(|p| p.workspace_id == workspace_id && !p.closed)
+            .collect();
+        let roots: Vec<_> = ws_panes
+            .iter()
+            .filter(|p| p.parent_pane_id.is_none())
+            .collect();
+
+        fn build_tree(
+            pane_id: &str,
+            all_panes: &[&maxc_storage::PaneProjection],
+            all_surfaces: &[&maxc_storage::SurfaceProjection],
+        ) -> Value {
+            let pane = all_panes.iter().find(|p| p.pane_id == pane_id);
+            let children: Vec<_> = all_panes
+                .iter()
+                .filter(|p| p.parent_pane_id.as_deref() == Some(pane_id))
+                .collect();
+
+            if children.len() >= 2 {
+                let direction = pane
+                    .and_then(|p| p.split_direction.as_deref())
+                    .unwrap_or("vertical");
+                let mut sorted_children: Vec<_> = children;
+                sorted_children.sort_by_key(|c| c.order);
+                json!({
+                    "type": "split",
+                    "pane_id": pane_id,
+                    "direction": direction,
+                    "children": sorted_children.iter().map(|c| {
+                        build_tree(&c.pane_id, all_panes, all_surfaces)
+                    }).collect::<Vec<Value>>()
+                })
+            } else if children.len() == 1 {
+                // Collapse single-child splits so the remaining pane stays visible.
+                build_tree(&children[0].pane_id, all_panes, all_surfaces)
+            } else {
+                let pane_surfaces: Vec<Value> = all_surfaces
+                    .iter()
+                    .filter(|s| s.pane_id == pane_id)
+                    .map(|s| {
+                        json!({
+                            "surface_id": s.surface_id,
+                            "pane_id": s.pane_id,
+                            "workspace_id": s.workspace_id,
+                            "title": s.title,
+                            "panel_type": s.panel_type,
+                            "panel_session_id": s.panel_session_id,
+                            "order": s.order,
+                            "focused": s.focused
+                        })
+                    })
+                    .collect();
+                let active = all_surfaces
+                    .iter()
+                    .find(|s| s.pane_id == pane_id && s.focused)
+                    .map(|s| s.surface_id.as_str())
+                    .or_else(|| {
+                        all_surfaces
+                            .iter()
+                            .find(|s| s.pane_id == pane_id)
+                            .map(|s| s.surface_id.as_str())
+                    });
+                json!({
+                    "type": "leaf",
+                    "pane_id": pane_id,
+                    "surfaces": pane_surfaces,
+                    "active_surface_id": active
+                })
+            }
+        }
+
+        let ws_surfaces: Vec<_> = projection
+            .surfaces
+            .values()
+            .filter(|s| s.workspace_id == workspace_id && !s.closed)
+            .collect();
+        let pane_refs = ws_panes.to_vec();
+        let surface_refs = ws_surfaces.to_vec();
+
+        let layout = if let Some(root) = roots.first() {
+            build_tree(&root.pane_id, &pane_refs, &surface_refs)
+        } else {
+            json!({ "type": "leaf", "pane_id": null, "surfaces": [], "active_surface_id": null })
+        };
+
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "layout": layout
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Pane dispatch
+    // -----------------------------------------------------------------------
+
+    async fn pane_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
+
+        // Read-only
+        if method == "pane.list" {
+            return self.pane_list(params).await;
+        }
+
+        // Mutating
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        match method {
+            "pane.create" => self.pane_create(command_id, params).await,
+            "pane.split" => self.pane_split(command_id, params).await,
+            "pane.close" => self.pane_close(command_id, params).await,
+            "pane.resize" => self.pane_resize(command_id, params).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn pane_create(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let parent_pane_id = params_ref
+            .get("parent_pane_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let order = params_ref.get("order").and_then(Value::as_u64).unwrap_or(0) as u32;
+
+        {
+            let projection = self.state.projection.lock().await;
+            let count = projection
+                .panes
+                .values()
+                .filter(|p| p.workspace_id == workspace_id && !p.closed)
+                .count();
+            if count >= self.config.pane_max_per_workspace {
+                return Err(ServerError::RateLimited);
+            }
+        }
+
+        let now = now_unix_ms();
+        let pane_id = format!("pane-{}", &random_event_id()[..12]);
+
+        let result = json!({
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "parent_pane_id": parent_pane_id,
+            "order": order,
+            "created_at_ms": now
+        });
+        let payload = json!({
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "parent_pane_id": parent_pane_id,
+            "split_ratio": 1.0,
+            "order": order,
+            "created_at_ms": now,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneCreated,
+            pane_id.clone(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn pane_split(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let pane_id = params_ref
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let direction = params_ref
+            .get("direction")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        if direction != "horizontal" && direction != "vertical" {
+            return Err(ServerError::InvalidRequest);
+        }
+        let ratio = params_ref
+            .get("ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.5);
+
+        let workspace_id;
+        {
+            let projection = self.state.projection.lock().await;
+            let pane = projection.panes.get(pane_id).ok_or(ServerError::NotFound)?;
+            if pane.closed {
+                return Err(ServerError::Conflict);
+            }
+            workspace_id = pane.workspace_id.clone();
+            let count = projection
+                .panes
+                .values()
+                .filter(|p| p.workspace_id == workspace_id && !p.closed)
+                .count();
+            // Splitting adds 2 children, so check count + 2
+            if count + 2 > self.config.pane_max_per_workspace {
+                return Err(ServerError::RateLimited);
+            }
+        }
+
+        let now = now_unix_ms();
+        let child_a_id = format!("pane-{}", &random_event_id()[..12]);
+        let child_b_id = format!("pane-{}", &random_event_id()[..12]);
+
+        // Update parent to be a split node
+        let split_payload = json!({
+            "pane_id": pane_id,
+            "direction": direction,
+            "ratio": ratio,
+            "child_a": child_a_id,
+            "child_b": child_b_id,
+            "result": {
+                "pane_id": pane_id,
+                "direction": direction,
+                "ratio": ratio,
+                "child_a": child_a_id,
+                "child_b": child_b_id
+            }
+        });
+        let split_event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneSplit,
+            pane_id.to_string(),
+            command_id.clone(),
+            split_payload,
+        );
+        self.persist_and_apply(split_event).await?;
+
+        // Create child A
+        let child_a_payload = json!({
+            "pane_id": child_a_id,
+            "workspace_id": workspace_id,
+            "parent_pane_id": pane_id,
+            "split_ratio": 1.0,
+            "order": 0,
+            "created_at_ms": now,
+            "result": { "pane_id": child_a_id }
+        });
+        let child_a_event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneCreated,
+            child_a_id.clone(),
+            format!("{command_id}-child-a"),
+            child_a_payload,
+        );
+        self.persist_and_apply(child_a_event).await?;
+
+        // Create child B
+        let child_b_payload = json!({
+            "pane_id": child_b_id,
+            "workspace_id": workspace_id,
+            "parent_pane_id": pane_id,
+            "split_ratio": 1.0,
+            "order": 1,
+            "created_at_ms": now,
+            "result": { "pane_id": child_b_id }
+        });
+        let child_b_event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneCreated,
+            child_b_id.clone(),
+            format!("{command_id}-child-b"),
+            child_b_payload,
+        );
+        self.persist_and_apply(child_b_event).await?;
+
+        Ok(json!({
+            "pane_id": pane_id,
+            "direction": direction,
+            "ratio": ratio,
+            "child_a": child_a_id,
+            "child_b": child_b_id
+        }))
+    }
+
+    async fn pane_list(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let projection = self.state.projection.lock().await;
+        let panes: Vec<Value> = projection
+            .panes
+            .values()
+            .filter(|p| p.workspace_id == workspace_id && !p.closed)
+            .map(|p| {
+                json!({
+                    "pane_id": p.pane_id,
+                    "workspace_id": p.workspace_id,
+                    "parent_pane_id": p.parent_pane_id,
+                    "split_direction": p.split_direction,
+                    "split_ratio": p.split_ratio,
+                    "order": p.order,
+                    "created_at_ms": p.created_at_ms
+                })
+            })
+            .collect();
+        Ok(json!({ "panes": panes }))
+    }
+
+    async fn pane_close(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let pane_id = params_ref
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        {
+            let projection = self.state.projection.lock().await;
+            let pane = projection.panes.get(pane_id).ok_or(ServerError::NotFound)?;
+            if pane.closed {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let payload = json!({
+            "pane_id": pane_id,
+            "result": { "pane_id": pane_id, "closed": true }
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneClosed,
+            pane_id.to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn pane_resize(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let pane_id = params_ref
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let ratio = params_ref
+            .get("ratio")
+            .and_then(Value::as_f64)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        {
+            let projection = self.state.projection.lock().await;
+            let pane = projection.panes.get(pane_id).ok_or(ServerError::NotFound)?;
+            if pane.closed {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let payload = json!({
+            "pane_id": pane_id,
+            "ratio": ratio,
+            "result": { "pane_id": pane_id, "ratio": ratio }
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::PaneResized,
+            pane_id.to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Surface dispatch
+    // -----------------------------------------------------------------------
+
+    async fn surface_dispatch(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Runtime)
+            .await?;
+
+        // Read-only
+        if method == "surface.list" {
+            return self.surface_list(params).await;
+        }
+
+        // Mutating
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
+
+        match method {
+            "surface.create" => self.surface_create(command_id, params).await,
+            "surface.close" => self.surface_close(command_id, params).await,
+            "surface.focus" => self.surface_focus(command_id, params).await,
+            _ => Err(ServerError::NotFound),
+        }
+    }
+
+    async fn surface_create(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let pane_id = params_ref
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let workspace_id = params_ref
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+        let title = params_ref
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled");
+        let panel_type = params_ref
+            .get("panel_type")
+            .and_then(Value::as_str)
+            .unwrap_or("terminal");
+
+        {
+            let projection = self.state.projection.lock().await;
+            let count = projection
+                .surfaces
+                .values()
+                .filter(|s| s.pane_id == pane_id && !s.closed)
+                .count();
+            if count >= self.config.surface_max_per_pane {
+                return Err(ServerError::RateLimited);
+            }
+        }
+
+        let now = now_unix_ms();
+        let surface_id = format!("sf-{}", &random_event_id()[..12]);
+        let order = {
+            let projection = self.state.projection.lock().await;
+            projection
+                .surfaces
+                .values()
+                .filter(|s| s.pane_id == pane_id && !s.closed)
+                .count() as u32
+        };
+
+        let result = json!({
+            "surface_id": surface_id,
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "title": title,
+            "panel_type": panel_type,
+            "order": order,
+            "created_at_ms": now
+        });
+        let payload = json!({
+            "surface_id": surface_id,
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "title": title,
+            "panel_type": panel_type,
+            "order": order,
+            "created_at_ms": now,
+            "result": result
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::SurfaceCreated,
+            surface_id.clone(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn surface_list(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        // Allow listing by pane_id or workspace_id
+        let pane_id = params_ref.get("pane_id").and_then(Value::as_str);
+        let workspace_id = params_ref.get("workspace_id").and_then(Value::as_str);
+        if pane_id.is_none() && workspace_id.is_none() {
+            return Err(ServerError::InvalidRequest);
+        }
+        let projection = self.state.projection.lock().await;
+        let surfaces: Vec<Value> = projection
+            .surfaces
+            .values()
+            .filter(|s| {
+                if s.closed {
+                    return false;
+                }
+                if let Some(pid) = pane_id {
+                    if s.pane_id != pid {
+                        return false;
+                    }
+                }
+                if let Some(wid) = workspace_id {
+                    if s.workspace_id != wid {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|s| {
+                json!({
+                    "surface_id": s.surface_id,
+                    "pane_id": s.pane_id,
+                    "workspace_id": s.workspace_id,
+                    "title": s.title,
+                    "panel_type": s.panel_type,
+                    "panel_session_id": s.panel_session_id,
+                    "order": s.order,
+                    "focused": s.focused,
+                    "created_at_ms": s.created_at_ms
+                })
+            })
+            .collect();
+        Ok(json!({ "surfaces": surfaces }))
+    }
+
+    async fn surface_close(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let surface_id = params_ref
+            .get("surface_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        {
+            let projection = self.state.projection.lock().await;
+            let surface = projection
+                .surfaces
+                .get(surface_id)
+                .ok_or(ServerError::NotFound)?;
+            if surface.closed {
+                return Err(ServerError::Conflict);
+            }
+        }
+
+        let payload = json!({
+            "surface_id": surface_id,
+            "result": { "surface_id": surface_id, "closed": true }
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::SurfaceClosed,
+            surface_id.to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
+    async fn surface_focus(
+        &self,
+        command_id: String,
+        params: Option<Value>,
+    ) -> Result<Value, ServerError> {
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+        let surface_id = params_ref
+            .get("surface_id")
+            .and_then(Value::as_str)
+            .ok_or(ServerError::InvalidRequest)?;
+
+        let pane_id;
+        {
+            let projection = self.state.projection.lock().await;
+            let surface = projection
+                .surfaces
+                .get(surface_id)
+                .ok_or(ServerError::NotFound)?;
+            if surface.closed {
+                return Err(ServerError::Conflict);
+            }
+            pane_id = surface.pane_id.clone();
+        }
+
+        let payload = json!({
+            "surface_id": surface_id,
+            "pane_id": pane_id,
+            "result": { "surface_id": surface_id, "focused": true }
+        });
+        let event = EventRecord::new(
+            random_event_id(),
+            EventType::SurfaceFocused,
+            surface_id.to_string(),
+            command_id,
+            payload,
+        );
+        self.persist_and_apply(event).await
+    }
+
     async fn browser_dispatch(
         &self,
         method: &str,
@@ -1126,15 +2260,23 @@ impl RpcServer {
             .require_active_session_scope(params.as_ref(), SessionScope::Runtime)
             .await?;
 
-        let command_id = extract_command_id(params.as_ref())?;
-        if let Some(existing) = self.lookup_command_result(&command_id).await {
-            return Ok(existing);
-        }
-
         let audit = extract_browser_audit(params_ref, method)?;
         self.enforce_browser_limits(method, params_ref, &audit)
             .await?;
         let _scheduler = self.acquire_scheduler(method)?;
+
+        // Read-only queries do not require command_id / idempotency.
+        match method {
+            "browser.tab.list" => return self.browser_tab_list(audit).await,
+            "browser.history" => return self.browser_history(audit, params_ref).await,
+            _ => {}
+        }
+
+        // Mutating methods require command_id for idempotency.
+        let command_id = extract_command_id(params.as_ref())?;
+        if let Some(existing) = self.lookup_command_result(&command_id).await {
+            return Ok(existing);
+        }
 
         match method {
             "browser.create" => self.browser_create(command_id, audit).await,
@@ -1142,7 +2284,6 @@ impl RpcServer {
             "browser.detach" => self.browser_detach(command_id, audit).await,
             "browser.close" => self.browser_close(command_id, audit).await,
             "browser.tab.open" => self.browser_tab_open(command_id, audit, params_ref).await,
-            "browser.tab.list" => self.browser_tab_list(audit).await,
             "browser.tab.focus" => self.browser_tab_focus(command_id, audit).await,
             "browser.tab.close" => self.browser_tab_close(command_id, audit).await,
             "browser.goto" | "browser.reload" | "browser.back" | "browser.forward" => {
@@ -1167,7 +2308,6 @@ impl RpcServer {
                 self.browser_automation(command_id, audit, method, params_ref)
                     .await
             }
-            "browser.history" => self.browser_history(audit, params_ref).await,
             "browser.subscribe" => self.browser_subscribe(command_id, audit, method).await,
             "browser.raw.command" => self.browser_raw(command_id, audit, params_ref).await,
             _ => Err(ServerError::NotFound),
@@ -1309,18 +2449,24 @@ impl RpcServer {
             .require_active_session_scope(params.as_ref(), SessionScope::Runtime)
             .await?;
 
+        let audit = extract_terminal_audit(params_ref, method)?;
+        let _scheduler = self.acquire_scheduler(method)?;
+
+        // Read-only queries do not require command_id / idempotency.
+        if method == "terminal.history" {
+            return self.terminal_history(audit, params_ref).await;
+        }
+
+        // Mutating methods require command_id for idempotency.
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
             return Ok(existing);
         }
-        let audit = extract_terminal_audit(params_ref, method)?;
-        let _scheduler = self.acquire_scheduler(method)?;
 
         match method {
             "terminal.spawn" => self.terminal_spawn(command_id, audit, params_ref).await,
             "terminal.input" => self.terminal_input(command_id, audit, params_ref).await,
             "terminal.resize" => self.terminal_resize(command_id, audit, params_ref).await,
-            "terminal.history" => self.terminal_history(audit, params_ref).await,
             "terminal.kill" => self.terminal_kill(command_id, audit).await,
             "terminal.subscribe" => self.terminal_subscribe(command_id, audit).await,
             _ => Err(ServerError::NotFound),
@@ -1337,25 +2483,32 @@ impl RpcServer {
             .require_active_session_scope(params.as_ref(), SessionScope::Agent)
             .await?;
 
+        let audit = extract_agent_audit(params_ref, method)?;
+        let _scheduler = self.acquire_scheduler(method)?;
+
+        // Read-only queries do not require command_id / idempotency.
+        match method {
+            "agent.worker.list" => return self.agent_worker_list(audit).await,
+            "agent.worker.get" => return self.agent_worker_get(audit).await,
+            "agent.task.list" => return self.agent_task_list(audit).await,
+            "agent.task.get" => return self.agent_task_get(audit).await,
+            _ => {}
+        }
+
+        // Mutating methods require command_id for idempotency.
         let command_id = extract_command_id(params.as_ref())?;
         if let Some(existing) = self.lookup_command_result(&command_id).await {
             return Ok(existing);
         }
-        let audit = extract_agent_audit(params_ref, method)?;
-        let _scheduler = self.acquire_scheduler(method)?;
 
         match method {
             "agent.worker.create" => {
                 self.agent_worker_create(command_id, audit, params_ref)
                     .await
             }
-            "agent.worker.list" => self.agent_worker_list(audit).await,
-            "agent.worker.get" => self.agent_worker_get(audit).await,
             "agent.worker.close" => self.agent_worker_close(command_id, audit).await,
             "agent.task.start" => self.agent_task_start(command_id, audit, params_ref).await,
             "agent.task.cancel" => self.agent_task_cancel(command_id, audit, params_ref).await,
-            "agent.task.list" => self.agent_task_list(audit).await,
-            "agent.task.get" => self.agent_task_get(audit).await,
             "agent.attach.terminal" => {
                 self.agent_attach_terminal(command_id, audit, params_ref)
                     .await
@@ -2044,7 +3197,8 @@ impl RpcServer {
             .and_then(Value::as_u64)
             .map(|v| v as u16)
             .unwrap_or(30);
-        let launch = parse_terminal_launch_spec(params)?;
+        let mut launch = parse_terminal_launch_spec(params)?;
+        self.inject_maxc_env(&audit, params, &mut launch).await?;
         self.enforce_terminal_spawn_limits(&audit, &launch).await?;
         let terminal_session_id = format!(
             "ts-{}",
@@ -2160,6 +3314,48 @@ impl RpcServer {
             }),
         );
         self.persist_and_apply(event).await
+    }
+
+    async fn inject_maxc_env(
+        &self,
+        audit: &TerminalAuditContext,
+        params: &Value,
+        launch: &mut TerminalLaunchSpec,
+    ) -> Result<(), ServerError> {
+        if !launch.env.contains_key("MAXC_SOCKET_PATH") {
+            launch.env.insert(
+                "MAXC_SOCKET_PATH".to_string(),
+                self.config.socket_path.clone(),
+            );
+        }
+        if !launch.env.contains_key("MAXC_WORKSPACE_ID") {
+            launch
+                .env
+                .insert("MAXC_WORKSPACE_ID".to_string(), audit.workspace_id.clone());
+        }
+        if !launch.env.contains_key("MAXC_SURFACE_ID") {
+            launch
+                .env
+                .insert("MAXC_SURFACE_ID".to_string(), audit.surface_id.clone());
+        }
+        if !launch.env.contains_key("MAXC_PANE_ID") {
+            let pane_id = {
+                let projection = self.state.projection.lock().await;
+                projection
+                    .surfaces
+                    .get(&audit.surface_id)
+                    .map(|s| s.pane_id.clone())
+            };
+            if let Some(pane_id) = pane_id {
+                launch.env.insert("MAXC_PANE_ID".to_string(), pane_id);
+            }
+        }
+        if !launch.env.contains_key("MAXC_TOKEN") {
+            if let Some(token) = extract_token(Some(params)) {
+                launch.env.insert("MAXC_TOKEN".to_string(), token);
+            }
+        }
+        Ok(())
     }
 
     async fn terminal_input(
@@ -9146,5 +10342,96 @@ mod tests {
         )
         .expect("json");
         assert_eq!(close["result"]["closed"], true);
+    }
+
+    #[tokio::test]
+    async fn notification_send_list_and_clear_work() {
+        let server = RpcServer::new(test_config("notification-flow")).expect("server");
+        let session: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 1,
+                        "method": "session.create",
+                        "params": {"command_id":"cmd-auth-notify"}
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let token = session["result"]["token"].as_str().expect("token");
+
+        let sent: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 2,
+                        "method": "notification.send",
+                        "params": {
+                            "command_id":"cmd-notify-send",
+                            "title":"Build finished",
+                            "body":"All tests passed",
+                            "level":"success",
+                            "source":"test",
+                            "workspace_id":"ws-1",
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        let notification_id = sent["result"]["notification_id"]
+            .as_str()
+            .expect("notification id");
+
+        let listed: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 3,
+                        "method": "notification.list",
+                        "params": {
+                            "workspace_id":"ws-1",
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(
+            listed["result"]["notifications"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1
+        );
+
+        let cleared: Value = serde_json::from_str(
+            &server
+                .handle_json_line(
+                    "conn",
+                    &json!({
+                        "id": 4,
+                        "method": "notification.clear",
+                        "params": {
+                            "command_id":"cmd-notify-clear",
+                            "notification_id": notification_id,
+                            "auth":{"token": token}
+                        }
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .expect("json");
+        assert_eq!(cleared["result"]["cleared"], true);
     }
 }
