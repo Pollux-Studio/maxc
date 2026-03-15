@@ -113,7 +113,7 @@ function TitleBar() {
         <img
           src={logoWhite}
           alt="maxc"
-          className="h-4 w-auto select-none"
+          className="h-5 w-auto select-none"
           draggable={false}
         />
       </div>
