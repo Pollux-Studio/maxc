@@ -12,6 +12,7 @@ import {
   Bell,
   ChevronDown,
   ChevronRight,
+  Check,
   FolderOpen,
   GitBranch,
   Keyboard,
@@ -202,6 +203,7 @@ function App() {
     downloaded: 0,
     total: undefined,
   });
+  const [envCopied, setEnvCopied] = useState(false);
 
   // -- shortcut help --
   const [showShortcuts, setShowShortcuts] = useState(false);
@@ -2068,7 +2070,8 @@ function App() {
     async function copyEnvBlock() {
       try {
         await navigator.clipboard.writeText(envBlock);
-        setBackendStatus("Copied MAXC env to clipboard");
+        setEnvCopied(true);
+        window.setTimeout(() => setEnvCopied(false), 2000);
       } catch {
         setBackendStatus("Failed to copy env");
       }
@@ -2239,7 +2242,14 @@ function App() {
                   MAXC Environment
                 </span>
                 <Button variant="outline" size="sm" className="h-7 px-2" onClick={copyEnvBlock}>
-                  Copy
+                  {envCopied ? (
+                    <span className="inline-flex items-center gap-1">
+                      <Check className="size-3.5" />
+                      Copied
+                    </span>
+                  ) : (
+                    "Copy"
+                  )}
                 </Button>
               </div>
               <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted px-3 py-2 text-[11px] text-muted-foreground">
