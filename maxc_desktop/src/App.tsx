@@ -26,6 +26,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import logoDark from "./assets/maxc_logo_dark.svg";
 import logoWhite from "./assets/maxc_logo_white.svg";
 import { Button } from "@/components/ui/button";
 import { type XtermHandle } from "@/components/XtermTerminal";
@@ -95,7 +96,7 @@ type UpdateInfo = {
 // Title Bar
 // ---------------------------------------------------------------------------
 
-function TitleBar() {
+function TitleBar({ theme }: { theme: "dark" | "light" }) {
   const appWindow = useMemo(() => {
     try {
       return getCurrentWindow();
@@ -111,7 +112,7 @@ function TitleBar() {
     <div className="flex items-center border-b bg-card/80 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur">
       <div className="drag-region flex items-center gap-2" data-tauri-drag-region>
         <img
-          src={logoWhite}
+          src={theme === "light" ? logoDark : logoWhite}
           alt="maxc"
           className="h-5 w-auto select-none"
           draggable={false}
@@ -2323,7 +2324,7 @@ maxc notify --title "Task complete" --body "All tests passed" --level success`}
   // ---------------------------------------------------------------------------
   return (
     <div className="flex h-screen flex-col bg-background text-foreground overflow-hidden text-[13px]">
-      <TitleBar />
+      <TitleBar theme={theme} />
       <div className="flex flex-1 min-h-0">
         {renderWorkspaceSidebar()}
         <main className="flex flex-1 min-h-0 flex-col overflow-hidden">
