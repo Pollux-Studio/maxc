@@ -41,10 +41,10 @@ export function BrowserView({
   }, [currentUrl]);
 
   return (
-    <div className="flex h-full flex-col bg-[#0c0c0c]">
-      <div className="flex items-center gap-2 border-b border-[#1f1f1f] bg-[#111] px-2 py-1">
+    <div className="flex h-full flex-col bg-background">
+      <div className="flex items-center gap-2 border-b border-border bg-card px-2 py-1">
         <button
-          className="rounded p-1 text-[#777] hover:text-[#ddd] hover:bg-[#1b1b1b]"
+          className="rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted/60"
           onClick={() => {
             try {
               iframeRef.current?.contentWindow?.history.back();
@@ -56,7 +56,7 @@ export function BrowserView({
           <ArrowLeft className="size-3.5" />
         </button>
         <button
-          className="rounded p-1 text-[#777] hover:text-[#ddd] hover:bg-[#1b1b1b]"
+          className="rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted/60"
           onClick={() => {
             try {
               iframeRef.current?.contentWindow?.history.forward();
@@ -68,7 +68,7 @@ export function BrowserView({
           <ArrowRight className="size-3.5" />
         </button>
         <button
-          className="rounded p-1 text-[#777] hover:text-[#ddd] hover:bg-[#1b1b1b]"
+          className="rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted/60"
           onClick={() => {
             try {
               iframeRef.current?.contentWindow?.location.reload();
@@ -81,28 +81,28 @@ export function BrowserView({
         >
           <RotateCw className="size-3.5" />
         </button>
-        <div className="flex-1 flex items-center gap-2 rounded-md border border-[#2a2a2a] bg-[#0a0a0a] px-2 py-1">
-          <Globe2 className="size-3 text-[#666]" />
+        <div className="flex-1 flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2 py-1">
+          <Globe2 className="size-3 text-muted-foreground" />
           <input
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") onNavigate(surfaceId, urlInput);
             }}
-            className="w-full bg-transparent text-[11px] text-[#ddd] outline-none"
+            className="w-full bg-transparent text-[11px] text-foreground outline-none"
             placeholder="Enter URL"
           />
         </div>
       </div>
 
-      <div className="relative flex-1 min-h-0 bg-black">
+      <div className="relative flex-1 min-h-0 bg-background">
         {currentUrl ? (
           <iframe
             key={iframeKey}
             ref={iframeRef}
             src={currentUrl}
             title="Browser"
-            className="h-full w-full border-0 bg-black"
+            className="h-full w-full border-0 bg-background"
           />
         ) : (
           <div className="flex h-full items-center justify-center">
@@ -120,15 +120,15 @@ export function BrowserView({
           </div>
         )}
         {sessionLoading && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
-            <div className="flex flex-col items-center gap-2 text-[11px] text-[#d0d0d0]">
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/60">
+            <div className="flex flex-col items-center gap-2 text-[11px] text-foreground/80">
               <div className="flex items-center gap-2">
-                <span className="h-3 w-3 animate-spin rounded-full border border-[#555] border-t-[#cfcfcf]" />
-                <Shimmer className="text-[11px] text-[#d0d0d0]">
+                <span className="h-3 w-3 animate-spin rounded-full border border-muted-foreground/40 border-t-foreground/80" />
+                <Shimmer className="text-[11px] text-foreground/80">
                   Initializing browser…
                 </Shimmer>
               </div>
-              <Shimmer className="text-[10px] text-[#bdbdbd]">
+              <Shimmer className="text-[10px] text-muted-foreground">
                 Negotiating session… loading automation…
               </Shimmer>
             </div>

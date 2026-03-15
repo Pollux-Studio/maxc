@@ -149,7 +149,7 @@ export function PaneContainer(props: PaneContainerProps) {
         onClosePane={props.onClosePane}
         canClosePane={props.paneCount > 1}
       />
-      <div className="flex-1 min-h-0 bg-[#0c0c0c]">
+      <div className="flex-1 min-h-0 bg-background">
         {activeSurface?.panelType === "terminal" &&
         activeSurface.terminalSessionId ? (
           <XtermTerminal

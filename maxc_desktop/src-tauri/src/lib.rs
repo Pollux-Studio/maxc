@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use maxc_automation::RpcServer;
 use maxc_core::BackendConfig;
 use tauri::State;
+use tauri_plugin_updater::UpdaterExt;
+use url::Url;
 
 #[derive(Clone)]
 struct RpcState {
@@ -87,6 +89,56 @@ async fn create_window(app: tauri::AppHandle) -> Result<String, String> {
     Ok(label)
 }
 
+fn updater_endpoint(channel: &str) -> Result<String, String> {
+    match channel {
+        "beta" => Ok("https://github.com/Pollux-Studio/maxc/releases/download/beta/latest.json".to_string()),
+        _ => Ok("https://github.com/Pollux-Studio/maxc/releases/download/stable/latest.json".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle, channel: String) -> Result<serde_json::Value, String> {
+    let endpoint = updater_endpoint(channel.as_str())?;
+    let url = Url::parse(&endpoint).map_err(|e| e.to_string())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => Ok(serde_json::json!({
+            "available": true,
+            "version": update.version,
+            "current_version": update.current_version,
+            "date_ms": update.date.map(|d| d.unix_timestamp() * 1000),
+            "body": update.body
+        })),
+        None => Ok(serde_json::json!({ "available": false })),
+    }
+}
+
+#[tauri::command]
+async fn update_download_and_install(app: tauri::AppHandle, channel: String) -> Result<(), String> {
+    let endpoint = updater_endpoint(channel.as_str())?;
+    let url = Url::parse(&endpoint).map_err(|e| e.to_string())?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    if let Some(update) = updater.check().await.map_err(|e| e.to_string())? {
+        update
+            .download_and_install(|_, _| {}, || {})
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = RPC_STATE.get_or_init(init_server).clone();
@@ -96,10 +148,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             rpc_call,
             get_git_branch,
-            create_window
+            create_window,
+            update_check,
+            update_download_and_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

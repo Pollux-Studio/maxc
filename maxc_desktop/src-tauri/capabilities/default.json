@@ -13,6 +13,7 @@
     "core:window:allow-close",
     "core:window:allow-create",
     "core:webview:allow-create-webview-window",
-    "notification:default"
+    "notification:default",
+    "updater:default"
   ]
 }

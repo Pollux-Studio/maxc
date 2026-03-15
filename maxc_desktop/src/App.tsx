@@ -7,6 +7,7 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   Bell,
   ChevronRight,
@@ -79,6 +80,13 @@ type Readiness = {
 };
 
 type EnvEntry = { key: string; value: string };
+type UpdateInfo = {
+  available: boolean;
+  version?: string;
+  current_version?: string;
+  date_ms?: number | null;
+  body?: string | null;
+};
 
 // ---------------------------------------------------------------------------
 // Title Bar
@@ -178,6 +186,21 @@ function App() {
     const stored = window.localStorage.getItem("maxc-theme");
     return stored === "light" ? "light" : "dark";
   });
+  const [appVersion, setAppVersion] = useState("");
+  const [updateChannel, setUpdateChannel] = useState<"stable" | "beta">(() => {
+    if (typeof window === "undefined") return "stable";
+    const stored = window.localStorage.getItem("maxc-update-channel");
+    return stored === "beta" ? "beta" : "stable";
+  });
+  const [updateStatus, setUpdateStatus] = useState<
+    "idle" | "checking" | "available" | "uptodate" | "downloading" | "ready" | "error"
+  >("idle");
+  const [updateError, setUpdateError] = useState("");
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<{ downloaded: number; total?: number }>({
+    downloaded: 0,
+    total: undefined,
+  });
 
   // -- shortcut help --
   const [showShortcuts, setShowShortcuts] = useState(false);
@@ -210,6 +233,16 @@ function App() {
     }
     window.localStorage.setItem("maxc-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    getVersion()
+      .then((v) => setAppVersion(v))
+      .catch(() => setAppVersion(""));
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("maxc-update-channel", updateChannel);
+  }, [updateChannel]);
 
   const readyForActions = Boolean(token) && (readiness?.ready ?? false) && selectedWorkspace !== null;
 
@@ -1606,8 +1639,15 @@ function App() {
                       <span className="truncate max-w-[90px]">{ws.gitBranch}</span>
                     </div>
                   )}
-                  <span className="ml-auto text-[10px] text-muted-foreground/70">
-                    {ws.terminalCount > 0 ? `${ws.terminalCount} running` : "Idle"}
+                  <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-muted-foreground/70">
+                    {ws.terminalCount > 0 ? (
+                      <>
+                        <TerminalIcon className="size-2.5" />
+                        <span>{ws.terminalCount}</span>
+                      </>
+                    ) : (
+                      <span>Idle</span>
+                    )}
                   </span>
                 </div>
 
@@ -2022,6 +2062,7 @@ function App() {
         : "MAXC_SURFACE_ID=",
     ];
     const envBlock = envLines.join("\n");
+    const isUpdateDownloading = updateStatus === "downloading";
 
     async function copyEnvBlock() {
       try {
@@ -2029,6 +2070,37 @@ function App() {
         setBackendStatus("Copied MAXC env to clipboard");
       } catch {
         setBackendStatus("Failed to copy env");
+      }
+    }
+
+    async function checkForUpdates() {
+      setUpdateStatus("checking");
+      setUpdateError("");
+      setUpdateInfo(null);
+      try {
+        const result = await invoke<UpdateInfo>("update_check", { channel: updateChannel });
+        if (!result.available) {
+          setUpdateStatus("uptodate");
+          return;
+        }
+        setUpdateInfo(result);
+        setUpdateStatus("available");
+      } catch (err) {
+        setUpdateStatus("error");
+        setUpdateError((err as Error).message || "Update check failed");
+      }
+    }
+
+    async function downloadAndInstallUpdate() {
+      setUpdateStatus("downloading");
+      setUpdateError("");
+      setUpdateProgress({ downloaded: 0, total: undefined });
+      try {
+        await invoke("update_download_and_install", { channel: updateChannel });
+        setUpdateStatus("ready");
+      } catch (err) {
+        setUpdateStatus("error");
+        setUpdateError((err as Error).message || "Update download failed");
       }
     }
 
@@ -2055,8 +2127,88 @@ function App() {
           </div>
           <div className="flex-1 overflow-auto overflow-x-hidden px-5 py-4 space-y-5 text-xs">
             <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Updates
+                </span>
+                <div className="text-[10px] text-muted-foreground">
+                  {appVersion ? `v${appVersion}` : "v—"}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-[10px] text-muted-foreground">Channel</label>
+                <select
+                  className="h-7 rounded border bg-muted/40 px-2 text-[11px]"
+                  value={updateChannel}
+                  onChange={(e) => setUpdateChannel(e.target.value as "stable" | "beta")}
+                >
+                  <option value="stable">Stable</option>
+                  <option value="beta">Beta</option>
+                </select>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2"
+                  onClick={checkForUpdates}
+                  disabled={updateStatus === "checking" || isUpdateDownloading}
+                >
+                  {updateStatus === "checking" ? "Checking..." : "Check"}
+                </Button>
+              </div>
+              {updateStatus === "available" && updateInfo && (
+                <div className="rounded-md border bg-muted px-3 py-2">
+                  <div className="text-[11px] text-foreground">
+                    Update available: v{updateInfo.version ?? "new"}
+                  </div>
+                  {updateInfo.date_ms ? (
+                    <div className="text-[10px] text-muted-foreground">
+                      {new Date(updateInfo.date_ms).toLocaleString()}
+                    </div>
+                  ) : null}
+                  {updateInfo.body && (
+                    <div className="mt-2 text-[10px] text-muted-foreground whitespace-pre-wrap">
+                      {updateInfo.body}
+                    </div>
+                  )}
+                  <div className="mt-2">
+                    <Button
+                      variant="default"
+                      size="sm"
+                      className="h-7 px-2"
+                      onClick={downloadAndInstallUpdate}
+                      disabled={isUpdateDownloading}
+                    >
+                      {isUpdateDownloading ? "Downloading..." : "Download & Install"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+              {updateStatus === "downloading" && (
+                <div className="text-[10px] text-muted-foreground">
+                  Downloading update…{" "}
+                  {updateProgress.total
+                    ? `${Math.round((updateProgress.downloaded / updateProgress.total) * 100)}%`
+                    : ""}
+                </div>
+              )}
+              {updateStatus === "ready" && (
+                <div className="text-[10px] text-muted-foreground">
+                  Update installed. Restarting…
+                </div>
+              )}
+              {updateStatus === "uptodate" && (
+                <div className="text-[10px] text-muted-foreground">You are up to date.</div>
+              )}
+              {updateStatus === "error" && (
+                <div className="text-[10px] text-destructive">
+                  {updateError || "Updater not configured."}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2">
               <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Codex / Agent Connection
+                Agent Connection
               </div>
               <p className="text-muted-foreground">
                 Use these environment variables to let an external agent access all maxc
