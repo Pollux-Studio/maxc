@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "maxc_desktop",
+  "productName": "maxc",
   "version": "0.1.1",
   "identifier": "com.polluxstudio.maxc-desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "maxc_desktop",
+        "title": "maxc",
         "width": 1280,
         "height": 832,
         "decorations": false,
