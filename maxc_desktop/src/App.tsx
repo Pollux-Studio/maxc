@@ -2212,6 +2212,12 @@ function App() {
               )}
             </div>
 
+            <div className="flex items-center gap-3 text-[10px] text-muted-foreground/80">
+              <div className="h-px flex-1 bg-border/70" />
+              <span className="uppercase tracking-[0.2em]">Agent</span>
+              <div className="h-px flex-1 bg-border/70" />
+            </div>
+
             <div className="space-y-2">
               <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 Agent Connection
