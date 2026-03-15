@@ -3361,11 +3361,10 @@ mod tests {
             .await
             .expect("workspace list");
         assert!(
-            ws_list["result"]["workspaces"]
+            !ws_list["result"]["workspaces"]
                 .as_array()
                 .expect("array")
-                .len()
-                >= 1
+                .is_empty()
         );
 
         // workspace update
@@ -3414,11 +3413,10 @@ mod tests {
             .await
             .expect("pane list");
         assert!(
-            pane_list["result"]["panes"]
+            !pane_list["result"]["panes"]
                 .as_array()
                 .expect("panes array")
-                .len()
-                >= 1
+                .is_empty()
         );
 
         let split = transport
@@ -3466,11 +3464,10 @@ mod tests {
             .await
             .expect("surface list");
         assert!(
-            surface_list["result"]["surfaces"]
+            !surface_list["result"]["surfaces"]
                 .as_array()
                 .expect("surfaces array")
-                .len()
-                >= 1
+                .is_empty()
         );
 
         let focused = transport
