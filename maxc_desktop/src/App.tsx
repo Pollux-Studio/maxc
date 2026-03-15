@@ -10,7 +10,9 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import {
   Bell,
+  ChevronDown,
   ChevronRight,
+  Check,
   FolderOpen,
   GitBranch,
   Keyboard,
@@ -24,6 +26,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import logoDark from "./assets/maxc_logo_dark.svg";
+import logoWhite from "./assets/maxc_logo_white.svg";
 import { Button } from "@/components/ui/button";
 import { type XtermHandle } from "@/components/XtermTerminal";
 import { PaneContainer, type PaneNode, type BrowserState } from "@/components/PaneContainer";
@@ -92,7 +96,7 @@ type UpdateInfo = {
 // Title Bar
 // ---------------------------------------------------------------------------
 
-function TitleBar() {
+function TitleBar({ theme }: { theme: "dark" | "light" }) {
   const appWindow = useMemo(() => {
     try {
       return getCurrentWindow();
@@ -107,8 +111,12 @@ function TitleBar() {
   return (
     <div className="flex items-center border-b bg-card/80 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur">
       <div className="drag-region flex items-center gap-2" data-tauri-drag-region>
-        <div className="size-2.5 rounded-full bg-primary" />
-        <div className="text-sm font-semibold text-foreground" data-tauri-drag-region>maxc</div>
+        <img
+          src={theme === "light" ? logoDark : logoWhite}
+          alt="maxc"
+          className="h-5 w-auto select-none"
+          draggable={false}
+        />
       </div>
       <div className="ml-auto flex items-center gap-1">
         <Button
@@ -201,6 +209,7 @@ function App() {
     downloaded: 0,
     total: undefined,
   });
+  const [envCopied, setEnvCopied] = useState(false);
 
   // -- shortcut help --
   const [showShortcuts, setShowShortcuts] = useState(false);
@@ -217,6 +226,9 @@ function App() {
   const browserCaptureRef = useRef<Map<string, number>>(new Map());
   const notificationInitialized = useRef(false);
   const notificationSeen = useRef<Set<string>>(new Set());
+  const inputBufferRef = useRef<Map<string, string>>(new Map());
+  const inputTimerRef = useRef<Map<string, number>>(new Map());
+  const inputInFlightRef = useRef<Set<string>>(new Set());
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((w) => w.workspace_id === selectedWorkspaceId) ?? workspaces[0] ?? null,
@@ -1131,25 +1143,62 @@ function App() {
   }
 
   // -- terminal input / resize handlers (keyed by surfaceId) --
-  const sendTerminalInput = useCallback(
-    async (surfaceId: string, data: string) => {
-      if (!token) return;
+  const flushTerminalInput = useCallback(
+    async (surfaceId: string) => {
+      const buffer = inputBufferRef.current.get(surfaceId);
+      if (!buffer) {
+        inputBufferRef.current.delete(surfaceId);
+        return;
+      }
+      if (inputInFlightRef.current.has(surfaceId)) {
+        const retry = window.setTimeout(() => flushTerminalInput(surfaceId), 12);
+        inputTimerRef.current.set(surfaceId, retry);
+        return;
+      }
       const surface = surfacesRef.current.find((s) => s.surfaceId === surfaceId);
-      if (!surface?.terminalSessionId) return;
+      if (!surface?.terminalSessionId || !token) {
+        inputBufferRef.current.delete(surfaceId);
+        return;
+      }
+      inputInFlightRef.current.add(surfaceId);
+      inputBufferRef.current.set(surfaceId, "");
       try {
         await rpc("terminal.input", {
           command_id: "ui-term-input-" + crypto.randomUUID(),
           workspace_id: surface.workspaceId,
           surface_id: surfaceId,
           terminal_session_id: surface.terminalSessionId,
-          input: data,
+          input: buffer,
           auth: { token },
         });
       } catch (err) {
         console.error("terminal.input error:", err);
+      } finally {
+        inputInFlightRef.current.delete(surfaceId);
+        const remaining = inputBufferRef.current.get(surfaceId);
+        if (remaining) {
+          const retry = window.setTimeout(() => flushTerminalInput(surfaceId), 0);
+          inputTimerRef.current.set(surfaceId, retry);
+        }
       }
     },
     [token],
+  );
+
+  const sendTerminalInput = useCallback(
+    (surfaceId: string, data: string) => {
+      if (!token) return;
+      const prev = inputBufferRef.current.get(surfaceId) ?? "";
+      inputBufferRef.current.set(surfaceId, prev + data);
+      if (!inputTimerRef.current.has(surfaceId)) {
+        const timer = window.setTimeout(() => {
+          inputTimerRef.current.delete(surfaceId);
+          void flushTerminalInput(surfaceId);
+        }, 12);
+        inputTimerRef.current.set(surfaceId, timer);
+      }
+    },
+    [flushTerminalInput, token],
   );
 
   const sendTerminalResize = useCallback(
@@ -2067,7 +2116,8 @@ function App() {
     async function copyEnvBlock() {
       try {
         await navigator.clipboard.writeText(envBlock);
-        setBackendStatus("Copied MAXC env to clipboard");
+        setEnvCopied(true);
+        window.setTimeout(() => setEnvCopied(false), 2000);
       } catch {
         setBackendStatus("Failed to copy env");
       }
@@ -2086,8 +2136,14 @@ function App() {
         setUpdateInfo(result);
         setUpdateStatus("available");
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/404|not found|no release/i.test(message)) {
+          setUpdateStatus("uptodate");
+          setUpdateError("");
+          return;
+        }
         setUpdateStatus("error");
-        setUpdateError((err as Error).message || "Update check failed");
+        setUpdateError(message || "Update check failed");
       }
     }
 
@@ -2137,14 +2193,17 @@ function App() {
               </div>
               <div className="flex items-center gap-2">
                 <label className="text-[10px] text-muted-foreground">Channel</label>
-                <select
-                  className="h-7 rounded border bg-muted/40 px-2 text-[11px]"
-                  value={updateChannel}
-                  onChange={(e) => setUpdateChannel(e.target.value as "stable" | "beta")}
-                >
-                  <option value="stable">Stable</option>
-                  <option value="beta">Beta</option>
-                </select>
+                <div className="relative">
+                  <select
+                    className="h-7 appearance-none rounded-md border border-border/70 bg-background px-2 pr-6 text-[11px] text-foreground shadow-sm outline-none transition focus:border-primary/60 focus:ring-1 focus:ring-primary/30"
+                    value={updateChannel}
+                    onChange={(e) => setUpdateChannel(e.target.value as "stable" | "beta")}
+                  >
+                    <option value="stable">Stable</option>
+                    <option value="beta">Beta</option>
+                  </select>
+                  <ChevronDown className="pointer-events-none absolute right-1.5 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
+                </div>
                 <Button
                   variant="outline"
                   size="sm"
@@ -2206,6 +2265,12 @@ function App() {
               )}
             </div>
 
+            <div className="flex items-center gap-3 text-[10px] text-muted-foreground/80">
+              <div className="h-px flex-1 bg-border/70" />
+              <span className="uppercase tracking-[0.2em]">Agent</span>
+              <div className="h-px flex-1 bg-border/70" />
+            </div>
+
             <div className="space-y-2">
               <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 Agent Connection
@@ -2223,7 +2288,14 @@ function App() {
                   MAXC Environment
                 </span>
                 <Button variant="outline" size="sm" className="h-7 px-2" onClick={copyEnvBlock}>
-                  Copy
+                  {envCopied ? (
+                    <span className="inline-flex items-center gap-1">
+                      <Check className="size-3.5" />
+                      Copied
+                    </span>
+                  ) : (
+                    "Copy"
+                  )}
                 </Button>
               </div>
               <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted px-3 py-2 text-[11px] text-muted-foreground">
@@ -2252,7 +2324,7 @@ maxc notify --title "Task complete" --body "All tests passed" --level success`}
   // ---------------------------------------------------------------------------
   return (
     <div className="flex h-screen flex-col bg-background text-foreground overflow-hidden text-[13px]">
-      <TitleBar />
+      <TitleBar theme={theme} />
       <div className="flex flex-1 min-h-0">
         {renderWorkspaceSidebar()}
         <main className="flex flex-1 min-h-0 flex-col overflow-hidden">
