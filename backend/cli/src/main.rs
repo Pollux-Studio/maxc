@@ -3360,9 +3360,7 @@ mod tests {
             }))
             .await
             .expect("workspace list");
-        let workspaces = ws_list["result"]["workspaces"]
-            .as_array()
-            .expect("array");
+        let workspaces = ws_list["result"]["workspaces"].as_array().expect("array");
         assert!(!workspaces.is_empty());
 
         // workspace update
