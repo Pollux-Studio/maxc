@@ -64,6 +64,12 @@ jobs:
           cache: npm
           cache-dependency-path: maxc_desktop/package-lock.json
 
+      - name: Read app version
+        shell: bash
+        run: |
+          APP_VERSION=$(node -p "require('./maxc_desktop/src-tauri/tauri.conf.json').version")
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+
       - name: Install frontend deps
         working-directory: maxc_desktop
         run: npm ci
@@ -77,8 +83,9 @@ jobs:
         with:
           projectPath: maxc_desktop
           tagName: ${{ env.RELEASE_TAG }}
-          releaseName: maxc ${{ env.RELEASE_TAG }}
+          releaseName: maxc-v${{ env.APP_VERSION }} ${{ env.RELEASE_CHANNEL }}
           releaseBody: |
             Automated release for `${{ env.RELEASE_CHANNEL }}` channel.
+            Version: v${{ env.APP_VERSION }}
           releaseDraft: false
           prerelease: ${{ env.RELEASE_CHANNEL == 'beta' }}

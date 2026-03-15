@@ -2086,8 +2086,14 @@ function App() {
         setUpdateInfo(result);
         setUpdateStatus("available");
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/404|not found|no release/i.test(message)) {
+          setUpdateStatus("uptodate");
+          setUpdateError("");
+          return;
+        }
         setUpdateStatus("error");
-        setUpdateError((err as Error).message || "Update check failed");
+        setUpdateError(message || "Update check failed");
       }
     }
 
