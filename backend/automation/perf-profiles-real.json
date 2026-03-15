@@ -1,0 +1,26 @@
+{
+  "terminal_spawn_latency": {
+    "iterations": 10,
+    "warmup": 2
+  },
+  "terminal_interactive": {
+    "iterations": 10,
+    "warmup": 2
+  },
+  "browser_create_latency": {
+    "iterations": 5,
+    "warmup": 1
+  },
+  "browser_navigation_latency": {
+    "iterations": 5,
+    "warmup": 1
+  },
+  "browser_screenshot_latency": {
+    "iterations": 5,
+    "warmup": 1
+  },
+  "agent_worker_start_latency": {
+    "iterations": 5,
+    "warmup": 1
+  }
+}

@@ -1,0 +1,84 @@
+name: tauri-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel (stable or beta)
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tauri-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RELEASE_CHANNEL: ${{ github.event.inputs.channel }}
+  RELEASE_TAG: ${{ github.event.inputs.channel }}
+
+jobs:
+  build-release:
+    name: Build & release (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows, macos, linux]
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: macos
+            os: macos-latest
+          - platform: linux
+            os: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: maxc_desktop/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: maxc_desktop
+        run: npm ci
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: maxc_desktop
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: maxc ${{ env.RELEASE_TAG }}
+          releaseBody: |
+            Automated release for `${{ env.RELEASE_CHANNEL }}` channel.
+          releaseDraft: false
+          prerelease: ${{ env.RELEASE_CHANNEL == 'beta' }}

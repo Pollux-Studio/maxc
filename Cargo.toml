@@ -1,0 +1,25 @@
+[workspace]
+members = [
+  "backend/core",
+  "backend/automation",
+  "backend/browser",
+  "backend/cli",
+  "backend/terminal",
+  "backend/storage",
+  "backend/security",
+  "backend/telemetry",
+  "maxc_desktop/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "process"] }
+rand = "0.8"

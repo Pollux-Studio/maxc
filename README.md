@@ -178,7 +178,7 @@ maxc uses a modular architecture designed for performance and extensibility.
           │                           │
 
       Terminal Engine            Browser Engine
-         ConPTY                     WebView
+         ConPTY               Chromium + Playwright
 
           │                           │
           ▼                           ▼
@@ -213,7 +213,8 @@ terminal/
   terminal_renderer
 
 browser/
-  webview_runtime
+  chromium_runtime
+  playwright_driver
   dom_controller
   automation_api
 
@@ -259,6 +260,8 @@ Supported shells include:
 ## 🌐 Browser Engine
 
 Browser surfaces allow developers and AI agents to interact with web applications directly inside the workspace.
+
+Runtime direction: Chromium controlled through a Playwright-based backend driver.
 
 Capabilities include:
 
@@ -315,6 +318,45 @@ maxc supports desktop notifications and workspace alerts for events such as:
 * deployment status
 * agent requests
 
+## 🧭 User Workflow (Quick Start)
+
+Here is a practical end-to-end flow for using maxc:
+
+1. **Launch maxc**
+   - The main window opens with a sidebar and a primary workspace area.
+   - Open additional windows with `Ctrl+Shift+N`.
+
+2. **Create a workspace**
+   - Click the `+` in the sidebar (or press `Ctrl+N`).
+   - Give it a name, select a folder, and optionally set environment variables.
+   - A root pane is created automatically.
+
+3. **Split panes and open surfaces**
+   - Split right: `Ctrl+D`
+   - Split down: `Ctrl+Shift+D`
+   - New terminal surface: `Ctrl+T`
+   - New browser surface: `Ctrl+B`
+
+4. **Use terminals and browsers**
+   - Each pane has its own tab bar (surfaces are tabs).
+   - Terminals run your shell sessions.
+   - Browser surfaces open embedded sessions for app previews and automation.
+
+5. **Notifications**
+   - Agents and scripts can send notifications.
+   - The bell icon shows unread counts and opens the notification panel.
+
+6. **Automation via CLI / RPC**
+   - Any agent or script can control maxc via CLI or JSON-RPC:
+
+```bash
+maxc terminal spawn --workspace-id ws-1 --surface-id sf-1
+maxc terminal input --workspace-id ws-1 --surface-id sf-1 --terminal-session-id ts-1 --input "npm test\n"
+maxc browser create --workspace-id ws-1 --surface-id sf-2
+maxc browser tab-open --workspace-id ws-1 --surface-id sf-2 --browser-session-id bs-1 --url http://localhost:3000
+maxc notify --title "Tests complete" --body "All tests passed" --level success
+```
+
 ## ⚙ Configuration
 
 Configuration files allow customization of appearance and behavior.
@@ -354,7 +396,8 @@ maxc is built with modern systems technologies.
 * Tokio async runtime
 * ConPTY terminal backend
 * VTE terminal parser
-* WebView browser runtime
+* Chromium browser runtime
+* Playwright automation driver
 * Winit GPU based UI
 * Clap CLI framework
 * Serde JSON RPC
@@ -363,9 +406,9 @@ maxc is built with modern systems technologies.
 
 ### Phase 1
 
-Core terminal workspace
+Core workspace foundations
 
-* terminal engine
+* terminal + browser surface models
 * pane splitting
 * surface tabs
 
@@ -398,6 +441,10 @@ Notifications and metadata
 * status indicators
 * progress tracking
 * sidebar logs
+
+## 📚 Documentation
+
+For detailed backend implementation, RPC usage, CLI commands, operations, testing, and development workflow, see [docs/README.md](docs/README.md).
 
 ## 🤝 Contributing
 
