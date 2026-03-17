@@ -1,10 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use maxc_automation::RpcServer;
 use maxc_core::BackendConfig;
-use tauri::State;
+use tauri::{Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 
@@ -15,8 +15,17 @@ struct RpcState {
 
 static RPC_STATE: OnceLock<RpcState> = OnceLock::new();
 
-fn init_server() -> RpcState {
-    let config = BackendConfig::from_env().unwrap_or_else(|_| BackendConfig::default());
+fn init_server(data_dir: Option<PathBuf>) -> RpcState {
+    let mut config = BackendConfig::from_env().unwrap_or_else(|_| BackendConfig::default());
+
+    // Resolve event_dir to an absolute path under the app data directory.
+    // On Windows this is %APPDATA%/com.polluxstudio.maxc-desktop/
+    // This ensures the event store is always writable regardless of CWD.
+    if let Some(dir) = data_dir {
+        let events_dir = dir.join("events");
+        config.event_dir = events_dir.to_string_lossy().to_string();
+    }
+
     let server = RpcServer::new(config).expect("failed to start backend automation server");
     RpcState {
         server: Arc::new(server),
@@ -140,20 +149,29 @@ async fn update_download_and_install(app: tauri::AppHandle, channel: String) -> 
             .download_and_install(|_, _| {}, || {})
             .await
             .map_err(|e| e.to_string())?;
+
+        // Restart the app after successful update install
+        app.restart();
     }
     Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let state = RPC_STATE.get_or_init(init_server).clone();
-
     tauri::Builder::default()
-        .manage(state)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            // Resolve the app data directory for reliable event store path.
+            let data_dir = app.path().app_data_dir().ok();
+            let state = RPC_STATE
+                .get_or_init(|| init_server(data_dir))
+                .clone();
+            app.manage(state);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             rpc_call,
             get_git_branch,

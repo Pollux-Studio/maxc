@@ -10,15 +10,15 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import {
   Bell,
-  ChevronDown,
   ChevronRight,
-  Check,
   FolderOpen,
   GitBranch,
   Keyboard,
+  Loader2,
   Minus,
   Moon,
   Plus,
+  ScrollText,
   Settings,
   Square,
   Sun,
@@ -29,32 +29,20 @@ import {
 import logoDark from "./assets/maxc_logo_dark.svg";
 import logoWhite from "./assets/maxc_logo_white.svg";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { type XtermHandle } from "@/components/XtermTerminal";
 import { PaneContainer, type PaneNode, type BrowserState } from "@/components/PaneContainer";
 import { type SurfaceState } from "@/components/SurfaceTabBar";
 import { NotificationPanel, type NotificationItem } from "@/components/NotificationPanel";
+import { SettingsDialog } from "@/components/SettingsDialog";
 import { cn } from "@/lib/utils";
 import "./App.css";
-
-// ---------------------------------------------------------------------------
-// RPC helper
-// ---------------------------------------------------------------------------
-
-async function rpc<T = any>(method: string, params: Record<string, unknown>): Promise<T> {
-  const request = {
-    id: crypto.randomUUID(),
-    method,
-    params,
-  };
-  const raw = await invoke<string>("rpc_call", { request: JSON.stringify(request) });
-  const parsed = JSON.parse(raw);
-  if (parsed.error) {
-    const code = parsed.error.code || "ERROR";
-    const message = parsed.error.message || "Unknown error";
-    throw new Error(code + ": " + message);
-  }
-  return parsed.result as T;
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -84,14 +72,146 @@ type Readiness = {
 };
 
 type EnvEntry = { key: string; value: string };
-type UpdateInfo = {
-  available: boolean;
-  version?: string;
-  current_version?: string;
-  date_ms?: number | null;
-  body?: string | null;
+
+type ShortcutDef = {
+  id: string;
+  label: string;
+  defaultKeys: string;
 };
 
+type ShortcutBinding = ShortcutDef & { keys: string };
+
+type ParsedShortcut = ShortcutBinding & {
+  binding: {
+    key: string;
+    ctrl: boolean;
+    shift: boolean;
+    alt: boolean;
+  } | null;
+};
+
+const LOG_FILTERS = [
+  { id: "all", label: "All" },
+  { id: "system", label: "system.*" },
+  { id: "session", label: "session.*" },
+  { id: "workspace", label: "workspace.*" },
+  { id: "pane", label: "pane.*" },
+  { id: "surface", label: "surface.*" },
+  { id: "terminal", label: "terminal.*" },
+  { id: "browser", label: "browser.*" },
+  { id: "agent", label: "agent.*" },
+  { id: "notification", label: "notification.*" },
+  { id: "other", label: "Other" },
+];
+
+type BackendLogEntry = {
+  timestamp_ms: number;
+  level: "trace" | "debug" | "info" | "warn" | "error";
+  component: string;
+  event: string;
+  correlation_id: string;
+  command_id?: string | null;
+  connection_id?: string | null;
+  workspace_id?: string | null;
+  surface_id?: string | null;
+  method?: string | null;
+  duration_ms?: number | null;
+  status?: string | null;
+  fields?: Record<string, unknown>;
+};
+
+const DEFAULT_SHORTCUTS: ShortcutDef[] = [
+  { id: "new-window", label: "New window", defaultKeys: "Ctrl+Shift+N" },
+  { id: "new-workspace", label: "New workspace", defaultKeys: "Ctrl+N" },
+  { id: "new-terminal", label: "New terminal", defaultKeys: "Ctrl+T" },
+  { id: "new-browser", label: "New browser", defaultKeys: "Ctrl+B" },
+  { id: "split-right", label: "Split pane right", defaultKeys: "Ctrl+D" },
+  { id: "split-down", label: "Split pane down", defaultKeys: "Ctrl+Shift+D" },
+  { id: "toggle-shortcuts", label: "Toggle shortcuts", defaultKeys: "Ctrl+/" },
+];
+
+const MODIFIER_ALIASES = new Map<string, "ctrl" | "shift" | "alt">([
+  ["ctrl", "ctrl"],
+  ["control", "ctrl"],
+  ["cmd", "ctrl"],
+  ["command", "ctrl"],
+  ["meta", "ctrl"],
+  ["shift", "shift"],
+  ["alt", "alt"],
+  ["option", "alt"],
+]);
+
+function normalizeKeyToken(token: string) {
+  return token.length === 1 ? token.toLowerCase() : token.toLowerCase();
+}
+
+function parseShortcutKeys(raw: string) {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split("+").map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  let ctrl = false;
+  let shift = false;
+  let alt = false;
+  const keyPart = parts[parts.length - 1];
+  for (const part of parts.slice(0, -1)) {
+    const mod = MODIFIER_ALIASES.get(part.toLowerCase());
+    if (mod === "ctrl") ctrl = true;
+    if (mod === "shift") shift = true;
+    if (mod === "alt") alt = true;
+  }
+  if (MODIFIER_ALIASES.has(keyPart.toLowerCase())) return null;
+  return {
+    key: normalizeKeyToken(keyPart),
+    ctrl,
+    shift,
+    alt,
+  };
+}
+
+function matchesShortcutEvent(e: KeyboardEvent, binding: { key: string; ctrl: boolean; shift: boolean; alt: boolean }) {
+  const key = normalizeKeyToken(e.key);
+  if (key !== binding.key) return false;
+  const hasCtrl = e.ctrlKey || e.metaKey;
+  if (binding.ctrl !== hasCtrl) return false;
+  if (binding.shift !== e.shiftKey) return false;
+  if (binding.alt !== e.altKey) return false;
+  return true;
+}
+
+function getMethodFamily(method?: string | null) {
+  if (!method) return "other";
+  const normalized = method.toLowerCase();
+  const idx = normalized.indexOf(".");
+  if (idx <= 0) return "other";
+  return normalized.slice(0, idx);
+}
+
+function extractLogMethod(entry: BackendLogEntry) {
+  if (entry.method) return entry.method;
+  const fieldMethod = entry.fields?.method;
+  return typeof fieldMethod === "string" ? fieldMethod : null;
+}
+
+function shortcutsFromStorage(): Record<string, string> | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem("maxc-shortcuts");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildShortcutMap(overrides?: Record<string, string> | null) {
+  const map: Record<string, string> = {};
+  for (const def of DEFAULT_SHORTCUTS) {
+    map[def.id] = overrides?.[def.id] ?? def.defaultKeys;
+  }
+  return map;
+}
 // ---------------------------------------------------------------------------
 // Title Bar
 // ---------------------------------------------------------------------------
@@ -106,6 +226,7 @@ function TitleBar({ theme }: { theme: "dark" | "light" }) {
   }, []);
 
   const handleMin = () => appWindow?.minimize().catch(console.error);
+  const handleMax = () => appWindow?.toggleMaximize().catch(console.error);
   const handleClose = () => appWindow?.close().catch(console.error);
 
   return (
@@ -114,7 +235,7 @@ function TitleBar({ theme }: { theme: "dark" | "light" }) {
         <img
           src={theme === "light" ? logoDark : logoWhite}
           alt="maxc"
-          className="h-5 w-auto select-none"
+          className="h-6 w-auto select-none"
           draggable={false}
         />
       </div>
@@ -131,10 +252,9 @@ function TitleBar({ theme }: { theme: "dark" | "light" }) {
         <Button
           variant="ghost"
           size="icon-sm"
-          disabled
-          className="no-drag text-muted-foreground/40"
-          aria-label="Maximize (disabled)"
-          title="Maximize disabled"
+          onClick={(e) => { e.stopPropagation(); handleMax(); }}
+          className="no-drag"
+          aria-label="Toggle maximize"
         >
           <Square className="size-3.5" />
         </Button>
@@ -170,51 +290,54 @@ function App() {
   const [surfaces, setSurfaces] = useState<SurfaceState[]>([]);
   const [browserStates, setBrowserStates] = useState<Map<string, BrowserState>>(new Map());
 
-  // -- drawer state --
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [wsName, setWsName] = useState("");
-  const [wsFolder, setWsFolder] = useState("");
-  const [wsEnvVars, setWsEnvVars] = useState<EnvEntry[]>([]);
-  const [wsCreating, setWsCreating] = useState(false);
-  const [wsError, setWsError] = useState("");
-  const [editDrawerOpen, setEditDrawerOpen] = useState(false);
-  const [editWorkspaceId, setEditWorkspaceId] = useState("");
-  const [editEnvVars, setEditEnvVars] = useState<EnvEntry[]>([]);
-  const [editSaving, setEditSaving] = useState(false);
-  const [editError, setEditError] = useState("");
+  // -- settings dialog state --
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsDefaultTab, setSettingsDefaultTab] = useState("workspace");
+  const [settingsEditWorkspace, setSettingsEditWorkspace] = useState<Workspace | null>(null);
 
   // -- workspace metadata --
   const [gitBranches, setGitBranches] = useState<Record<string, string>>({});
   const [notificationItems, setNotificationItems] = useState<NotificationItem[]>([]);
   const [notificationPanelOpen, setNotificationPanelOpen] = useState(false);
   const [toastItems, setToastItems] = useState<NotificationItem[]>([]);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     if (typeof window === "undefined") return "dark";
     const stored = window.localStorage.getItem("maxc-theme");
     return stored === "light" ? "light" : "dark";
   });
   const [appVersion, setAppVersion] = useState("");
-  const [updateChannel, setUpdateChannel] = useState<"stable" | "beta">(() => {
-    if (typeof window === "undefined") return "stable";
-    const stored = window.localStorage.getItem("maxc-update-channel");
-    return stored === "beta" ? "beta" : "stable";
-  });
-  const [updateStatus, setUpdateStatus] = useState<
-    "idle" | "checking" | "available" | "uptodate" | "downloading" | "ready" | "error"
-  >("idle");
-  const [updateError, setUpdateError] = useState("");
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
-  const [updateProgress, setUpdateProgress] = useState<{ downloaded: number; total?: number }>({
-    downloaded: 0,
-    total: undefined,
-  });
-  const [envCopied, setEnvCopied] = useState(false);
 
   // -- shortcut help --
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [renamingWorkspaceId, setRenamingWorkspaceId] = useState("");
   const [renameValue, setRenameValue] = useState("");
+  const [shortcutMap, setShortcutMap] = useState<Record<string, string>>(() =>
+    buildShortcutMap(shortcutsFromStorage()),
+  );
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [rpcLogs, setRpcLogs] = useState<BackendLogEntry[]>([]);
+  const [rpcLogsLoading, setRpcLogsLoading] = useState(false);
+  const [rpcLogsError, setRpcLogsError] = useState("");
+  const [diagnosticsToken, setDiagnosticsToken] = useState<string | null>(null);
+  const [logFilter, setLogFilter] = useState("all");
+  const [logLevelFilter, setLogLevelFilter] = useState("all");
+  const [logSearch, setLogSearch] = useState("");
+
+  // -- create workspace drawer state --
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [wsName, setWsName] = useState("");
+  const [wsFolder, setWsFolder] = useState("");
+  const [wsEnvVars, setWsEnvVars] = useState<EnvEntry[]>([]);
+  const [wsCreating, setWsCreating] = useState(false);
+  const [wsError, setWsError] = useState("");
+  const [rpcRateLimit, setRpcRateLimit] = useState<number | "unlimited">(() => {
+    if (typeof window === "undefined") return 30;
+    const stored = window.localStorage.getItem("maxc-rpc-rate-limit");
+    if (!stored) return 30;
+    if (stored === "unlimited") return "unlimited";
+    const parsed = Number(stored);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+  });
 
   // -- refs --
   const surfacesRef = useRef<SurfaceState[]>([]);
@@ -229,6 +352,15 @@ function App() {
   const inputBufferRef = useRef<Map<string, string>>(new Map());
   const inputTimerRef = useRef<Map<string, number>>(new Map());
   const inputInFlightRef = useRef<Set<string>>(new Set());
+  const rateLimiterRef = useRef<{
+    limit: number | null;
+    timestamps: number[];
+    queue: Promise<void>;
+  }>({
+    limit: rpcRateLimit === "unlimited" ? null : rpcRateLimit,
+    timestamps: [],
+    queue: Promise.resolve(),
+  });
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((w) => w.workspace_id === selectedWorkspaceId) ?? workspaces[0] ?? null,
@@ -253,10 +385,69 @@ function App() {
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem("maxc-update-channel", updateChannel);
-  }, [updateChannel]);
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      "maxc-rpc-rate-limit",
+      rpcRateLimit === "unlimited" ? "unlimited" : String(rpcRateLimit),
+    );
+    rateLimiterRef.current.limit = rpcRateLimit === "unlimited" ? null : rpcRateLimit;
+  }, [rpcRateLimit]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("maxc-shortcuts", JSON.stringify(shortcutMap));
+  }, [shortcutMap]);
 
   const readyForActions = Boolean(token) && (readiness?.ready ?? false) && selectedWorkspace !== null;
+  const shortcutList = useMemo<ShortcutBinding[]>(
+    () =>
+      DEFAULT_SHORTCUTS.map((def) => ({
+        ...def,
+        keys: shortcutMap[def.id] ?? def.defaultKeys,
+      })),
+    [shortcutMap],
+  );
+  const parsedShortcuts = useMemo<ParsedShortcut[]>(
+    () =>
+      shortcutList.map((entry) => ({
+        ...entry,
+        binding: parseShortcutKeys(entry.keys),
+      })),
+    [shortcutList],
+  );
+  const filteredRpcLogs = useMemo(() => {
+    let next = rpcLogs;
+    if (logFilter !== "all") {
+      if (logFilter === "other") {
+        next = next.filter((entry) => {
+          const family = getMethodFamily(extractLogMethod(entry));
+          return !LOG_FILTERS.some((filter) => filter.id === family && filter.id !== "other");
+        });
+      } else {
+        next = next.filter((entry) => {
+          const family = getMethodFamily(extractLogMethod(entry));
+          return family === logFilter;
+        });
+      }
+    }
+    if (logLevelFilter !== "all") {
+      next = next.filter((entry) => entry.level === logLevelFilter);
+    }
+    const query = logSearch.trim().toLowerCase();
+    if (query) {
+      next = next.filter((entry) => {
+        const method = extractLogMethod(entry) ?? "";
+        const event = entry.event ?? "";
+        const component = entry.component ?? "";
+        return (
+          method.toLowerCase().includes(query)
+          || event.toLowerCase().includes(query)
+          || component.toLowerCase().includes(query)
+        );
+      });
+    }
+    return next;
+  }, [logFilter, logLevelFilter, logSearch, rpcLogs]);
 
   const unreadNotifications = useMemo(
     () => notificationItems.filter((n) => !n.read),
@@ -291,6 +482,50 @@ function App() {
     if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) return trimmed;
     return `https://${trimmed}`;
   }
+
+  const acquireRateLimitSlot = useCallback(async () => {
+    const state = rateLimiterRef.current;
+    const limit = state.limit;
+    if (!limit || limit <= 0) return;
+    const windowMs = 1000;
+    const now = Date.now();
+    state.timestamps = state.timestamps.filter((ts) => now - ts < windowMs);
+    if (state.timestamps.length < limit) {
+      state.timestamps.push(now);
+      return;
+    }
+    const waitMs = Math.max(0, windowMs - (now - state.timestamps[0]));
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    return acquireRateLimitSlot();
+  }, []);
+
+  const scheduleRpcSlot = useCallback(() => {
+    const state = rateLimiterRef.current;
+    if (!state.limit || state.limit <= 0) return Promise.resolve();
+    const next = state.queue.then(() => acquireRateLimitSlot());
+    state.queue = next.catch(() => {});
+    return next;
+  }, [acquireRateLimitSlot]);
+
+  const rpc = useCallback(
+    async <T,>(method: string, params: Record<string, unknown>): Promise<T> => {
+      await scheduleRpcSlot();
+      const request = {
+        id: crypto.randomUUID(),
+        method,
+        params,
+      };
+      const raw = await invoke<string>("rpc_call", { request: JSON.stringify(request) });
+      const parsed = JSON.parse(raw);
+      if (parsed.error) {
+        const code = parsed.error.code || "ERROR";
+        const message = parsed.error.message || "Unknown error";
+        throw new Error(code + ": " + message);
+      }
+      return parsed.result as T;
+    },
+    [scheduleRpcSlot],
+  );
 
   // -- workspace metadata enrichment --
   const workspaceMetas: WorkspaceMeta[] = useMemo(() => {
@@ -552,13 +787,6 @@ function App() {
       const ctrl = e.ctrlKey || e.metaKey;
       const targetSurface = focusedSurface?.surfaceId;
 
-      // Ctrl+Shift+N -> new window
-      if (ctrl && e.shiftKey && e.key.toLowerCase() === "n") {
-        e.preventDefault();
-        invoke("create_window").catch(console.error);
-        return;
-      }
-
       // Ctrl + / Ctrl = -> increase font size
       if (ctrl && (e.key === "+" || e.key === "=")) {
         e.preventDefault();
@@ -573,23 +801,38 @@ function App() {
         return;
       }
 
-      // Ctrl+N -> new workspace drawer
-      if (ctrl && e.key === "n") { e.preventDefault(); openDrawer(); return; }
-
-      // Ctrl+T -> new terminal surface in focused pane
-      if (ctrl && e.key === "t") { e.preventDefault(); handleCreateSurface(focusedPaneId, "terminal"); return; }
-
-      // Ctrl+B -> new browser surface in focused pane
-      if (ctrl && e.key === "b") { e.preventDefault(); handleCreateSurface(focusedPaneId, "browser"); return; }
-
-      // Ctrl+D -> split pane right
-      if (ctrl && !e.shiftKey && e.key === "d") { e.preventDefault(); handleSplitPane(focusedPaneId, "vertical"); return; }
-
-      // Ctrl+Shift+D -> split pane down
-      if (ctrl && e.shiftKey && e.key === "D") { e.preventDefault(); handleSplitPane(focusedPaneId, "horizontal"); return; }
-
-      // Ctrl+? -> toggle shortcuts panel
-      if (ctrl && e.key === "/") { e.preventDefault(); setShowShortcuts((v) => !v); return; }
+      const matchedShortcut = parsedShortcuts.find(
+        (shortcut) => shortcut.binding && matchesShortcutEvent(e, shortcut.binding),
+      );
+      if (matchedShortcut) {
+        e.preventDefault();
+        switch (matchedShortcut.id) {
+          case "new-window":
+            invoke("create_window").catch(console.error);
+            break;
+          case "new-workspace":
+            openDrawer();
+            break;
+          case "new-terminal":
+            handleCreateSurface(focusedPaneId, "terminal");
+            break;
+          case "new-browser":
+            handleCreateSurface(focusedPaneId, "browser");
+            break;
+          case "split-right":
+            handleSplitPane(focusedPaneId, "vertical");
+            break;
+          case "split-down":
+            handleSplitPane(focusedPaneId, "horizontal");
+            break;
+          case "toggle-shortcuts":
+            setShowShortcuts((v) => !v);
+            break;
+          default:
+            break;
+        }
+        return;
+      }
 
       // Alt+1-9 -> switch workspace
       if (e.altKey && e.key >= "1" && e.key <= "9") {
@@ -601,130 +844,202 @@ function App() {
         return;
       }
 
-      // Escape -> close drawer/shortcuts
+      // Escape -> close panels
       if (e.key === "Escape") {
-        if (drawerOpen) closeDrawer();
-        if (editDrawerOpen) closeEditDrawer();
         if (showShortcuts) setShowShortcuts(false);
         if (notificationPanelOpen) setNotificationPanelOpen(false);
+        if (logsOpen) setLogsOpen(false);
+        if (drawerOpen) setDrawerOpen(false);
         if (settingsOpen) setSettingsOpen(false);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [focusedSurface?.surfaceId, focusedPaneId, workspaces, selectedWorkspaceId, drawerOpen, editDrawerOpen, showShortcuts, notificationPanelOpen, settingsOpen]);
+  }, [
+    focusedSurface?.surfaceId,
+    focusedPaneId,
+    workspaces,
+    selectedWorkspaceId,
+    showShortcuts,
+    notificationPanelOpen,
+    logsOpen,
+    drawerOpen,
+    settingsOpen,
+    parsedShortcuts,
+  ]);
 
   // ---------------------------------------------------------------------------
-  // Drawer actions
+  // Settings dialog helpers
   // ---------------------------------------------------------------------------
   function openDrawer() {
-    setWsName(""); setWsFolder(""); setWsEnvVars([]); setWsError("");
+    setSettingsEditWorkspace(null);
+    setSettingsDefaultTab("workspace");
+    setSettingsOpen(false);
     setDrawerOpen(true);
+    setWsName("");
+    setWsFolder("");
+    setWsEnvVars([]);
+    setWsError("");
   }
+  function openEditDrawer(ws: Workspace) {
+    setSettingsEditWorkspace(ws);
+    setSettingsDefaultTab("workspace");
+    setDrawerOpen(false);
+    setSettingsOpen(true);
+  }
+  function openSettings(tab = "updates") {
+    setSettingsEditWorkspace(null);
+    setSettingsDefaultTab(tab);
+    setDrawerOpen(false);
+    setSettingsOpen(true);
+  }
+
   function closeDrawer() {
-    setDrawerOpen(false); setWsCreating(false); setWsError("");
+    setDrawerOpen(false);
   }
+
   async function pickFolder() {
     try {
       const selected = await open({ directory: true, multiple: false, title: "Select workspace folder" });
       if (selected && typeof selected === "string") setWsFolder(selected);
-    } catch { /* cancelled */ }
+    } catch {
+      // cancelled
+    }
   }
-  function addEnvEntry() { setWsEnvVars((p) => [...p, { key: "", value: "" }]); }
-  function updateEnvEntry(i: number, field: "key" | "value", val: string) {
-    setWsEnvVars((p) => p.map((e, idx) => (idx === i ? { ...e, [field]: val } : e)));
-  }
-  function removeEnvEntry(i: number) { setWsEnvVars((p) => p.filter((_, idx) => idx !== i)); }
 
-  function addEditEnvEntry() { setEditEnvVars((p) => [...p, { key: "", value: "" }]); }
-  function updateEditEnvEntry(i: number, field: "key" | "value", val: string) {
-    setEditEnvVars((p) => p.map((e, idx) => (idx === i ? { ...e, [field]: val } : e)));
+  function addEnvEntry() {
+    setWsEnvVars((prev) => [...prev, { key: "", value: "" }]);
   }
-  function removeEditEnvEntry(i: number) {
-    setEditEnvVars((p) => p.filter((_, idx) => idx !== i));
+
+  function updateEnvEntry(i: number, field: "key" | "value", value: string) {
+    setWsEnvVars((prev) =>
+      prev.map((entry, idx) => (idx === i ? { ...entry, [field]: value } : entry)),
+    );
+  }
+
+  function removeEnvEntry(i: number) {
+    setWsEnvVars((prev) => prev.filter((_, idx) => idx !== i));
   }
 
   async function createWorkspace() {
-    if (!token) { setWsError("No session token"); return; }
     const name = wsName.trim();
-    if (!name) { setWsError("Workspace name is required"); return; }
-
-    const envObj: Record<string, string> = {};
-    for (const e of wsEnvVars) { const k = e.key.trim(); if (k) envObj[k] = e.value; }
-
-    setWsCreating(true); setWsError("");
-    try {
-      const result = await rpc<Workspace>("workspace.create", {
-        command_id: "ui-ws-create-" + crypto.randomUUID(),
-        name, folder: wsFolder, env_vars: envObj,
-        auth: { token },
-      });
-      const newWs: Workspace = {
-        workspace_id: result.workspace_id, name: result.name,
-        folder: result.folder, env_vars: result.env_vars, created_at_ms: result.created_at_ms,
-      };
-      setWorkspaces((w) => [...w, newWs]);
-      setSelectedWorkspaceId(newWs.workspace_id);
-      setBackendStatus("Workspace created");
-      closeDrawer();
-    } catch (error) {
-      setWsError((error as Error).message);
-    } finally { setWsCreating(false); }
-  }
-
-  function openEditDrawer(ws: Workspace) {
-    setEditWorkspaceId(ws.workspace_id);
-    const editable = Object.entries(ws.env_vars || {})
-      .filter(([key]) => !key.startsWith("MAXC_"))
-      .map(([key, value]) => ({ key, value }));
-    setEditEnvVars(editable);
-    setEditError("");
-    setEditDrawerOpen(true);
-  }
-
-  function closeEditDrawer() {
-    setEditDrawerOpen(false);
-    setEditSaving(false);
-    setEditError("");
-  }
-
-  async function saveWorkspaceEnv() {
-    if (!token || !editWorkspaceId) return;
-    const ws = workspaces.find((w) => w.workspace_id === editWorkspaceId);
-    if (!ws) return;
-
-    const envObj: Record<string, string> = {};
-    for (const e of editEnvVars) {
-      const k = e.key.trim();
-      if (k) envObj[k] = e.value;
+    if (!name) {
+      setWsError("Workspace name is required");
+      return;
     }
-    // Preserve MAXC_* and other system-provided values
-    for (const [key, value] of Object.entries(ws.env_vars || {})) {
-      if (key.startsWith("MAXC_") && !(key in envObj)) {
-        envObj[key] = value;
-      }
+    const envObj: Record<string, string> = {};
+    for (const entry of wsEnvVars) {
+      const key = entry.key.trim();
+      if (key) envObj[key] = entry.value;
     }
-
-    setEditSaving(true);
-    setEditError("");
+    setWsCreating(true);
+    setWsError("");
     try {
-      await rpc("workspace.update", {
-        command_id: "ui-ws-env-update-" + crypto.randomUUID(),
-        workspace_id: ws.workspace_id,
-        env_vars: envObj,
-        auth: { token },
-      });
-      setWorkspaces((prev) =>
-        prev.map((w) =>
-          w.workspace_id === ws.workspace_id ? { ...w, env_vars: envObj } : w,
-        ),
-      );
-      closeEditDrawer();
+      await handleDialogCreateWorkspace(name, wsFolder, envObj);
+      setWsName("");
+      setWsFolder("");
+      setWsEnvVars([]);
+      setDrawerOpen(false);
     } catch (err) {
-      setEditError((err as Error).message);
+      setWsError((err as Error).message || "Failed to create workspace");
     } finally {
-      setEditSaving(false);
+      setWsCreating(false);
     }
+  }
+
+  function handleShortcutChange(id: string, keys: string) {
+    setShortcutMap((prev) => ({
+      ...prev,
+      [id]: keys,
+    }));
+  }
+
+  function resetShortcuts() {
+    setShortcutMap(buildShortcutMap());
+  }
+
+  function handleRpcRateLimitChange(value: string) {
+    if (value === "unlimited") {
+      setRpcRateLimit("unlimited");
+      return;
+    }
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      setRpcRateLimit(parsed);
+    }
+  }
+
+  const loadRpcLogs = useCallback(async () => {
+    if (!token && !diagnosticsToken) return;
+    setRpcLogsLoading(true);
+    setRpcLogsError("");
+    try {
+      const authToken = diagnosticsToken ?? token;
+      const result = await rpc<{ logs: BackendLogEntry[] }>("system.logs", {
+        auth: { token: authToken },
+      });
+      const logs = Array.isArray(result.logs) ? result.logs : [];
+      const sorted = logs.slice().sort((a, b) => b.timestamp_ms - a.timestamp_ms);
+      setRpcLogs(sorted);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!diagnosticsToken && /unauthorized/i.test(message)) {
+        try {
+          const diagSession = await rpc<{ token: string }>("session.create", {
+            command_id: "ui-session-diagnostics-" + crypto.randomUUID(),
+            scopes: ["diagnostics"],
+          });
+          setDiagnosticsToken(diagSession.token);
+          const retry = await rpc<{ logs: BackendLogEntry[] }>("system.logs", {
+            auth: { token: diagSession.token },
+          });
+          const logs = Array.isArray(retry.logs) ? retry.logs : [];
+          const sorted = logs.slice().sort((a, b) => b.timestamp_ms - a.timestamp_ms);
+          setRpcLogs(sorted);
+          setRpcLogsError("");
+        } catch (diagErr) {
+          setRpcLogsError(diagErr instanceof Error ? diagErr.message : String(diagErr));
+        }
+      } else {
+        setRpcLogsError(message);
+      }
+    } finally {
+      setRpcLogsLoading(false);
+    }
+  }, [rpc, token, diagnosticsToken]);
+
+  useEffect(() => {
+    if (!logsOpen) return;
+    loadRpcLogs();
+  }, [logsOpen, loadRpcLogs]);
+
+  async function handleDialogCreateWorkspace(name: string, folder: string, envVars: Record<string, string>) {
+    if (!token) throw new Error("No session token");
+    const result = await rpc<Workspace>("workspace.create", {
+      command_id: "ui-ws-create-" + crypto.randomUUID(),
+      name, folder, env_vars: envVars,
+      auth: { token },
+    });
+    const newWs: Workspace = {
+      workspace_id: result.workspace_id, name: result.name,
+      folder: result.folder, env_vars: result.env_vars, created_at_ms: result.created_at_ms,
+    };
+    setWorkspaces((w) => [...w, newWs]);
+    setSelectedWorkspaceId(newWs.workspace_id);
+    setBackendStatus("Workspace created");
+  }
+
+  async function handleDialogSaveWorkspaceEnv(workspaceId: string, envVars: Record<string, string>) {
+    if (!token) throw new Error("No session token");
+    await rpc("workspace.update", {
+      command_id: "ui-ws-env-update-" + crypto.randomUUID(),
+      workspace_id: workspaceId,
+      env_vars: envVars,
+      auth: { token },
+    });
+    setWorkspaces((prev) =>
+      prev.map((w) => w.workspace_id === workspaceId ? { ...w, env_vars: envVars } : w),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1734,7 +2049,15 @@ function App() {
             <Button
               size="icon-xs"
               variant="ghost"
-              onClick={() => setSettingsOpen(true)}
+              onClick={() => setLogsOpen(true)}
+              title="RPC Logs"
+            >
+              <ScrollText className="size-3" />
+            </Button>
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              onClick={() => openSettings("updates")}
               title="Settings"
             >
               <Settings className="size-3" />
@@ -1780,6 +2103,7 @@ function App() {
         focusedPaneId={focusedPaneId}
         token={token}
         paneCount={paneCount}
+        canCreateSurface={readyForActions}
         onFocusPane={setFocusedPaneId}
         onSplitPane={handleSplitPane}
         onClosePane={handleClosePane}
@@ -1827,250 +2151,41 @@ function App() {
   }
 
   // ---------------------------------------------------------------------------
-  // New Workspace Drawer
-  // ---------------------------------------------------------------------------
-  function renderDrawer() {
-    return (
-      <>
-        <div
-          className={cn(
-            "fixed inset-0 z-40 bg-black/40 transition-opacity duration-200",
-            drawerOpen ? "opacity-100" : "pointer-events-none opacity-0",
-          )}
-          onClick={closeDrawer}
-        />
-        <div
-          className={cn(
-            "fixed right-0 top-0 z-50 flex h-full w-[380px] flex-col border-l bg-card shadow-xl transition-transform duration-200 ease-out",
-            drawerOpen ? "translate-x-0" : "translate-x-full",
-          )}
-        >
-          <div className="flex items-center justify-between border-b px-5 py-4">
-            <h2 className="text-sm font-semibold">New Workspace</h2>
-            <Button variant="ghost" size="icon-sm" onClick={closeDrawer}><X className="size-4" /></Button>
-          </div>
-          <div className="flex-1 overflow-auto px-5 py-4 space-y-5">
-            {/* workspace id */}
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Workspace ID</label>
-              <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">Auto-generated on creation</div>
-            </div>
-            {/* name */}
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Name <span className="text-destructive">*</span></label>
-              <input type="text" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="e.g. my-project"
-                className="w-full rounded-md border bg-background px-3 py-2 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
-                autoFocus
-              />
-            </div>
-            {/* folder */}
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Working Directory</label>
-              <div className="flex gap-2">
-                <div className="flex-1 truncate rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground">
-                  {wsFolder || "No folder selected"}
-                </div>
-                <Button variant="outline" size="sm" onClick={pickFolder} className="h-[34px] px-2.5 shrink-0">
-                  <FolderOpen className="size-3.5" /><span>Browse</span>
-                </Button>
-              </div>
-            </div>
-            {/* env vars */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Environment Variables</label>
-                <Button variant="ghost" size="icon-xs" onClick={addEnvEntry}><Plus className="size-3.5" /></Button>
-              </div>
-              <p className="text-[11px] text-muted-foreground">Variables available to agent workers in this workspace.</p>
-              {wsEnvVars.length === 0 && (
-                <div className="rounded-md border border-dashed px-3 py-3 text-center text-[11px] text-muted-foreground">
-                  No environment variables. Click + to add.
-                </div>
-              )}
-              <div className="space-y-2">
-                {wsEnvVars.map((entry, i) => (
-                  <div key={i} className="flex items-center gap-1.5">
-                    <input type="text" value={entry.key} onChange={(e) => updateEnvEntry(i, "key", e.target.value)} placeholder="KEY"
-                      className="w-[120px] shrink-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30" />
-                    <span className="text-[11px] text-muted-foreground">=</span>
-                    <input type="text" value={entry.value} onChange={(e) => updateEnvEntry(i, "value", e.target.value)} placeholder="value"
-                      className="flex-1 rounded-md border bg-background px-2 py-1.5 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30" />
-                    <Button variant="ghost" size="icon-xs" onClick={() => removeEnvEntry(i)}>
-                      <Trash2 className="size-3 text-muted-foreground hover:text-destructive" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-          <div className="border-t px-5 py-4 space-y-2">
-            {wsError && <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{wsError}</div>}
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={closeDrawer} className="flex-1 h-9" disabled={wsCreating}>Cancel</Button>
-              <Button variant="default" size="sm" onClick={createWorkspace} className="flex-1 h-9" disabled={wsCreating || !wsName.trim()}>
-                {wsCreating ? "Creating..." : "Create Workspace"}
-              </Button>
-            </div>
-          </div>
-        </div>
-      </>
-    );
-  }
-
-  function renderEditDrawer() {
-    const ws = workspaces.find((w) => w.workspace_id === editWorkspaceId);
-    return (
-      <>
-        <div
-          className={cn(
-            "fixed inset-0 z-40 bg-black/40 transition-opacity duration-200",
-            editDrawerOpen ? "opacity-100" : "pointer-events-none opacity-0",
-          )}
-          onClick={closeEditDrawer}
-        />
-        <div
-          className={cn(
-            "fixed right-0 top-0 z-50 flex h-full w-[380px] flex-col border-l bg-card shadow-xl transition-transform duration-200 ease-out",
-            editDrawerOpen ? "translate-x-0" : "translate-x-full",
-          )}
-        >
-          <div className="flex items-center justify-between border-b px-5 py-4">
-            <div className="space-y-0.5">
-              <h2 className="text-sm font-semibold">Workspace Settings</h2>
-              <div className="text-[11px] text-muted-foreground truncate">
-                {ws?.name || "Workspace"}
-              </div>
-            </div>
-            <Button variant="ghost" size="icon-sm" onClick={closeEditDrawer}>
-              <X className="size-4" />
-            </Button>
-          </div>
-          <div className="flex-1 overflow-auto px-5 py-4 space-y-5 text-xs">
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Working Directory
-              </label>
-              <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">
-                {ws?.folder || "No folder set"}
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  Environment Variables
-                </label>
-                <Button variant="ghost" size="icon-xs" onClick={addEditEnvEntry}>
-                  <Plus className="size-3.5" />
-                </Button>
-              </div>
-              {editEnvVars.length === 0 && (
-                <div className="rounded-md border border-dashed px-3 py-3 text-center text-[11px] text-muted-foreground">
-                  No environment variables. Click + to add.
-                </div>
-              )}
-              <div className="space-y-2">
-                {editEnvVars.map((entry, i) => (
-                  <div key={i} className="flex items-center gap-1.5">
-                    <input
-                      type="text"
-                      value={entry.key}
-                      onChange={(e) => updateEditEnvEntry(i, "key", e.target.value)}
-                      placeholder="KEY"
-                      className="w-[120px] shrink-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
-                    />
-                    <span className="text-[11px] text-muted-foreground">=</span>
-                    <input
-                      type="text"
-                      value={entry.value}
-                      onChange={(e) => updateEditEnvEntry(i, "value", e.target.value)}
-                      placeholder="value"
-                      className="flex-1 rounded-md border bg-background px-2 py-1.5 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
-                    />
-                    <Button variant="ghost" size="icon-xs" onClick={() => removeEditEnvEntry(i)}>
-                      <Trash2 className="size-3 text-muted-foreground hover:text-destructive" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                MAXC Environment (read-only)
-              </div>
-              <div className="rounded-md border bg-muted px-3 py-2 text-[11px] text-muted-foreground whitespace-pre-wrap break-words">
-                {Object.entries(ws?.env_vars ?? {})
-                  .filter(([key]) => key.startsWith("MAXC_"))
-                  .map(([key, value]) => `${key}=${value}`)
-                  .join("\n") || "Not available yet."}
-              </div>
-            </div>
-          </div>
-          <div className="border-t px-5 py-4 space-y-2">
-            {editError && (
-              <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                {editError}
-              </div>
-            )}
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={closeEditDrawer}
-                className="flex-1 h-9"
-                disabled={editSaving}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="default"
-                size="sm"
-                onClick={saveWorkspaceEnv}
-                className="flex-1 h-9"
-                disabled={editSaving}
-              >
-                {editSaving ? "Saving..." : "Save"}
-              </Button>
-            </div>
-          </div>
-        </div>
-      </>
-    );
-  }
-
-  // ---------------------------------------------------------------------------
   // Keyboard shortcuts overlay
   // ---------------------------------------------------------------------------
   function renderShortcutsPanel() {
-    if (!showShortcuts) return null;
-    const shortcuts = [
-      { keys: "Ctrl+Shift+N", desc: "New window" },
-      { keys: "Ctrl+N", desc: "New workspace" },
-      { keys: "Ctrl+T", desc: "New terminal" },
-      { keys: "Ctrl+B", desc: "New browser" },
-      { keys: "Ctrl+D", desc: "Split pane right" },
-      { keys: "Ctrl+Shift+D", desc: "Split pane down" },
-      { keys: "Alt+1-9", desc: "Switch workspace" },
-      { keys: "Ctrl+/", desc: "Toggle shortcuts" },
-      { keys: "Escape", desc: "Close panel / drawer" },
-    ];
     return (
-      <>
-        <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setShowShortcuts(false)} />
-        <div className="fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2 w-[320px] rounded-xl border bg-card p-5 shadow-2xl">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-sm font-semibold flex items-center gap-2"><Keyboard className="size-4" /> Keyboard Shortcuts</h3>
-            <Button variant="ghost" size="icon-xs" onClick={() => setShowShortcuts(false)}><X className="size-3.5" /></Button>
-          </div>
+      <Dialog open={showShortcuts} onOpenChange={setShowShortcuts}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Keyboard className="size-4" />
+              Keyboard Shortcuts
+            </DialogTitle>
+            <DialogDescription>
+              Customize shortcuts in Settings → Shortcuts.
+            </DialogDescription>
+          </DialogHeader>
           <div className="space-y-2">
-            {shortcuts.map((s) => (
-              <div key={s.keys} className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">{s.desc}</span>
-                <kbd className="rounded bg-muted px-2 py-0.5 text-[11px] font-mono">{s.keys}</kbd>
+            {shortcutList.map((s) => (
+              <div key={s.id} className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">{s.label}</span>
+                <kbd className="rounded bg-muted px-2 py-0.5 text-[11px] font-mono">
+                  {s.keys}
+                </kbd>
               </div>
             ))}
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">Switch workspace</span>
+              <kbd className="rounded bg-muted px-2 py-0.5 text-[11px] font-mono">Alt+1-9</kbd>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">Close panel / drawer</span>
+              <kbd className="rounded bg-muted px-2 py-0.5 text-[11px] font-mono">Escape</kbd>
+            </div>
           </div>
-        </div>
-      </>
+        </DialogContent>
+      </Dialog>
     );
   }
 
@@ -2100,218 +2215,264 @@ function App() {
     );
   }
 
-  function renderSettingsPanel() {
-    const envLines = [
-      `MAXC_SOCKET_PATH=${socketPath}`,
-      token ? `MAXC_TOKEN=${token}` : "MAXC_TOKEN=",
-      selectedWorkspaceId ? `MAXC_WORKSPACE_ID=${selectedWorkspaceId}` : "MAXC_WORKSPACE_ID=",
-      focusedPaneId ? `MAXC_PANE_ID=${focusedPaneId}` : "MAXC_PANE_ID=",
-      focusedSurface?.surfaceId
-        ? `MAXC_SURFACE_ID=${focusedSurface.surfaceId}`
-        : "MAXC_SURFACE_ID=",
-    ];
-    const envBlock = envLines.join("\n");
-    const isUpdateDownloading = updateStatus === "downloading";
-
-    async function copyEnvBlock() {
-      try {
-        await navigator.clipboard.writeText(envBlock);
-        setEnvCopied(true);
-        window.setTimeout(() => setEnvCopied(false), 2000);
-      } catch {
-        setBackendStatus("Failed to copy env");
-      }
-    }
-
-    async function checkForUpdates() {
-      setUpdateStatus("checking");
-      setUpdateError("");
-      setUpdateInfo(null);
-      try {
-        const result = await invoke<UpdateInfo>("update_check", { channel: updateChannel });
-        if (!result.available) {
-          setUpdateStatus("uptodate");
-          return;
-        }
-        setUpdateInfo(result);
-        setUpdateStatus("available");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (/404|not found|no release/i.test(message)) {
-          setUpdateStatus("uptodate");
-          setUpdateError("");
-          return;
-        }
-        setUpdateStatus("error");
-        setUpdateError(message || "Update check failed");
-      }
-    }
-
-    async function downloadAndInstallUpdate() {
-      setUpdateStatus("downloading");
-      setUpdateError("");
-      setUpdateProgress({ downloaded: 0, total: undefined });
-      try {
-        await invoke("update_download_and_install", { channel: updateChannel });
-        setUpdateStatus("ready");
-      } catch (err) {
-        setUpdateStatus("error");
-        setUpdateError((err as Error).message || "Update download failed");
-      }
-    }
-
+  function renderRpcLogsDrawer() {
     return (
       <>
         <div
           className={cn(
             "fixed inset-0 z-40 bg-black/40 transition-opacity duration-200",
-            settingsOpen ? "opacity-100" : "pointer-events-none opacity-0",
+            logsOpen ? "opacity-100" : "pointer-events-none opacity-0",
           )}
-          onClick={() => setSettingsOpen(false)}
+          onClick={() => setLogsOpen(false)}
+        />
+        <div
+          className={cn(
+            "fixed right-0 top-0 z-50 flex h-full w-[420px] flex-col border-l bg-card shadow-xl transition-transform duration-200 ease-out",
+            logsOpen ? "translate-x-0" : "translate-x-full",
+          )}
+        >
+          <div className="flex items-center justify-between border-b px-5 py-4">
+            <div className="space-y-0.5">
+              <h2 className="text-sm font-semibold">RPC Logs</h2>
+              <div className="text-[11px] text-muted-foreground">
+                {filteredRpcLogs.length} of {rpcLogs.length} entries
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-[11px]"
+                onClick={loadRpcLogs}
+                disabled={rpcLogsLoading}
+              >
+                {rpcLogsLoading ? (
+                  <span className="inline-flex items-center gap-1.5">
+                    <Loader2 className="size-3 animate-spin" />
+                    Refreshing
+                  </span>
+                ) : (
+                  "Refresh"
+                )}
+              </Button>
+              <Button variant="ghost" size="icon-sm" onClick={() => setLogsOpen(false)}>
+                <X className="size-4" />
+              </Button>
+            </div>
+          </div>
+          <div className="settings-scroll flex-1 overflow-auto px-5 py-4 space-y-3 text-xs">
+            {rpcLogsError && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-200">
+                {rpcLogsError}
+              </div>
+            )}
+            <input
+              type="text"
+              value={logSearch}
+              onChange={(e) => setLogSearch(e.target.value)}
+              placeholder="Search by method, event, or component"
+              className="h-7 w-full rounded-md border bg-muted px-2 text-[10px] outline-none focus:ring-1 focus:ring-ring"
+            />
+            <div className="flex flex-wrap gap-2">
+              {LOG_FILTERS.map((filter) => (
+                <Button
+                  key={filter.id}
+                  variant={logFilter === filter.id ? "default" : "outline"}
+                  size="sm"
+                  className="h-7 px-2 text-[10px]"
+                  onClick={() => setLogFilter(filter.id)}
+                >
+                  {filter.label}
+                </Button>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {["all", "error", "warn", "info", "debug", "trace"].map((level) => (
+                <Button
+                  key={level}
+                  variant={logLevelFilter === level ? "default" : "outline"}
+                  size="sm"
+                  className="h-7 px-2 text-[10px] uppercase"
+                  onClick={() => setLogLevelFilter(level)}
+                >
+                  {level}
+                </Button>
+              ))}
+            </div>
+            {filteredRpcLogs.length === 0 && !rpcLogsLoading ? (
+              <div className="rounded-md border border-dashed px-3 py-4 text-center text-[11px] text-muted-foreground">
+                No results for {LOG_FILTERS.find((filter) => filter.id === logFilter)?.label ?? "selected"}.
+              </div>
+            ) : (
+              filteredRpcLogs.map((entry) => (
+                <div
+                  key={`${entry.timestamp_ms}-${entry.correlation_id}-${entry.method ?? entry.event}`}
+                  className="rounded-md border bg-muted/30 px-3 py-2 space-y-1"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-[11px] text-foreground">
+                      {extractLogMethod(entry) ?? entry.event}
+                    </span>
+                    <span
+                      className={cn(
+                        "text-[10px] font-medium",
+                        entry.status && entry.status.toLowerCase() === "ok"
+                          ? "text-emerald-500"
+                          : entry.level === "error"
+                            ? "text-rose-500"
+                            : "text-muted-foreground",
+                      )}
+                    >
+                      {(entry.status ?? entry.level ?? "info").toString().toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                    <span>{new Date(entry.timestamp_ms).toLocaleTimeString()}</span>
+                    <span>{entry.duration_ms ?? "—"} ms</span>
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    {entry.component} · {entry.event}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  function renderDrawer() {
+    return (
+      <>
+        <div
+          className={cn(
+            "fixed inset-0 z-40 bg-black/40 transition-opacity duration-200",
+            drawerOpen ? "opacity-100" : "pointer-events-none opacity-0",
+          )}
+          onClick={closeDrawer}
         />
         <div
           className={cn(
             "fixed right-0 top-0 z-50 flex h-full w-[380px] flex-col border-l bg-card shadow-xl transition-transform duration-200 ease-out",
-            settingsOpen ? "translate-x-0" : "translate-x-full",
+            drawerOpen ? "translate-x-0" : "translate-x-full",
           )}
         >
           <div className="flex items-center justify-between border-b px-5 py-4">
-            <h2 className="text-sm font-semibold">Settings</h2>
-            <Button variant="ghost" size="icon-sm" onClick={() => setSettingsOpen(false)}>
+            <h2 className="text-sm font-semibold">New Workspace</h2>
+            <Button variant="ghost" size="icon-sm" onClick={closeDrawer}>
               <X className="size-4" />
             </Button>
           </div>
-          <div className="flex-1 overflow-auto overflow-x-hidden px-5 py-4 space-y-5 text-xs">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  Updates
-                </span>
-                <div className="text-[10px] text-muted-foreground">
-                  {appVersion ? `v${appVersion}` : "v—"}
-                </div>
+          <div className="flex-1 overflow-auto px-5 py-4 space-y-5">
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Workspace ID
+              </label>
+              <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">
+                Auto-generated on creation
               </div>
-              <div className="flex items-center gap-2">
-                <label className="text-[10px] text-muted-foreground">Channel</label>
-                <div className="relative">
-                  <select
-                    className="h-7 appearance-none rounded-md border border-border/70 bg-background px-2 pr-6 text-[11px] text-foreground shadow-sm outline-none transition focus:border-primary/60 focus:ring-1 focus:ring-primary/30"
-                    value={updateChannel}
-                    onChange={(e) => setUpdateChannel(e.target.value as "stable" | "beta")}
-                  >
-                    <option value="stable">Stable</option>
-                    <option value="beta">Beta</option>
-                  </select>
-                  <ChevronDown className="pointer-events-none absolute right-1.5 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Name <span className="text-destructive">*</span>
+              </label>
+              <input
+                type="text"
+                value={wsName}
+                onChange={(e) => setWsName(e.target.value)}
+                placeholder="e.g. my-project"
+                className="w-full rounded-md border bg-background px-3 py-2 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Working Directory
+              </label>
+              <div className="flex gap-2">
+                <div className="flex-1 truncate rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground">
+                  {wsFolder || "No folder selected"}
                 </div>
                 <Button
                   variant="outline"
                   size="sm"
-                  className="h-7 px-2"
-                  onClick={checkForUpdates}
-                  disabled={updateStatus === "checking" || isUpdateDownloading}
+                  onClick={pickFolder}
+                  className="h-[34px] px-2.5 shrink-0"
                 >
-                  {updateStatus === "checking" ? "Checking..." : "Check"}
+                  <FolderOpen className="size-3.5" />
+                  <span>Browse</span>
                 </Button>
               </div>
-              {updateStatus === "available" && updateInfo && (
-                <div className="rounded-md border bg-muted px-3 py-2">
-                  <div className="text-[11px] text-foreground">
-                    Update available: v{updateInfo.version ?? "new"}
-                  </div>
-                  {updateInfo.date_ms ? (
-                    <div className="text-[10px] text-muted-foreground">
-                      {new Date(updateInfo.date_ms).toLocaleString()}
-                    </div>
-                  ) : null}
-                  {updateInfo.body && (
-                    <div className="mt-2 text-[10px] text-muted-foreground whitespace-pre-wrap">
-                      {updateInfo.body}
-                    </div>
-                  )}
-                  <div className="mt-2">
-                    <Button
-                      variant="default"
-                      size="sm"
-                      className="h-7 px-2"
-                      onClick={downloadAndInstallUpdate}
-                      disabled={isUpdateDownloading}
-                    >
-                      {isUpdateDownloading ? "Downloading..." : "Download & Install"}
-                    </Button>
-                  </div>
-                </div>
-              )}
-              {updateStatus === "downloading" && (
-                <div className="text-[10px] text-muted-foreground">
-                  Downloading update…{" "}
-                  {updateProgress.total
-                    ? `${Math.round((updateProgress.downloaded / updateProgress.total) * 100)}%`
-                    : ""}
-                </div>
-              )}
-              {updateStatus === "ready" && (
-                <div className="text-[10px] text-muted-foreground">
-                  Update installed. Restarting…
-                </div>
-              )}
-              {updateStatus === "uptodate" && (
-                <div className="text-[10px] text-muted-foreground">You are up to date.</div>
-              )}
-              {updateStatus === "error" && (
-                <div className="text-[10px] text-destructive">
-                  {updateError || "Updater not configured."}
-                </div>
-              )}
             </div>
-
-            <div className="flex items-center gap-3 text-[10px] text-muted-foreground/80">
-              <div className="h-px flex-1 bg-border/70" />
-              <span className="uppercase tracking-[0.2em]">Agent</span>
-              <div className="h-px flex-1 bg-border/70" />
-            </div>
-
-            <div className="space-y-2">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Agent Connection
-              </div>
-              <p className="text-muted-foreground">
-                Use these environment variables to let an external agent access all maxc
-                commands. Agents launched inside a maxc terminal inherit these values
-                automatically.
-              </p>
-            </div>
-
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  MAXC Environment
-                </span>
-                <Button variant="outline" size="sm" className="h-7 px-2" onClick={copyEnvBlock}>
-                  {envCopied ? (
-                    <span className="inline-flex items-center gap-1">
-                      <Check className="size-3.5" />
-                      Copied
-                    </span>
-                  ) : (
-                    "Copy"
-                  )}
+                <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Environment Variables
+                </label>
+                <Button variant="ghost" size="icon-xs" onClick={addEnvEntry}>
+                  <Plus className="size-3.5" />
                 </Button>
               </div>
-              <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted px-3 py-2 text-[11px] text-muted-foreground">
-                {envBlock}
-              </pre>
-            </div>
-
-            <div className="space-y-2">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Example CLI Usage
+              <p className="text-[11px] text-muted-foreground">
+                Variables available to agent workers in this workspace.
+              </p>
+              {wsEnvVars.length === 0 && (
+                <div className="rounded-md border border-dashed px-3 py-3 text-center text-[11px] text-muted-foreground">
+                  No environment variables. Click + to add.
+                </div>
+              )}
+              <div className="space-y-2">
+                {wsEnvVars.map((entry, i) => (
+                  <div key={i} className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={entry.key}
+                      onChange={(e) => updateEnvEntry(i, "key", e.target.value)}
+                      placeholder="KEY"
+                      className="w-[120px] shrink-0 rounded-md border bg-background px-2 py-1.5 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
+                    />
+                    <span className="text-[11px] text-muted-foreground">=</span>
+                    <input
+                      type="text"
+                      value={entry.value}
+                      onChange={(e) => updateEnvEntry(i, "value", e.target.value)}
+                      placeholder="value"
+                      className="flex-1 rounded-md border bg-background px-2 py-1.5 text-xs outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
+                    />
+                    <Button variant="ghost" size="icon-xs" onClick={() => removeEnvEntry(i)}>
+                      <Trash2 className="size-3 text-muted-foreground hover:text-destructive" />
+                    </Button>
+                  </div>
+                ))}
               </div>
-              <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted px-3 py-2 text-[11px] text-muted-foreground">
-{`maxc terminal spawn --workspace-id ${selectedWorkspaceId || "ws-1"} --surface-id ${focusedSurface?.surfaceId || "sf-1"}
-maxc terminal input --workspace-id ${selectedWorkspaceId || "ws-1"} --surface-id ${focusedSurface?.surfaceId || "sf-1"} --terminal-session-id ts-1 --input "npm test\\n"
-maxc notify --title "Task complete" --body "All tests passed" --level success`}
-              </pre>
+            </div>
+          </div>
+          <div className="border-t px-5 py-4 space-y-2">
+            {wsError && (
+              <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {wsError}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={closeDrawer}
+                className="flex-1 h-9"
+                disabled={wsCreating}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="default"
+                size="sm"
+                onClick={createWorkspace}
+                className="flex-1 h-9"
+                disabled={wsCreating || !wsName.trim()}
+              >
+                {wsCreating ? "Creating..." : "Create Workspace"}
+              </Button>
             </div>
           </div>
         </div>
@@ -2331,11 +2492,33 @@ maxc notify --title "Task complete" --body "All tests passed" --level success`}
           <div className="flex-1 min-h-0">{renderContent()}</div>
         </main>
       </div>
+      <SettingsDialog
+        open={settingsOpen && !drawerOpen}
+        onOpenChange={(open) => {
+          if (drawerOpen) return;
+          setSettingsOpen(open);
+          if (!open) setSettingsEditWorkspace(null);
+        }}
+        defaultTab={settingsDefaultTab}
+        token={token}
+        editWorkspace={settingsEditWorkspace}
+        appVersion={appVersion}
+        socketPath={socketPath}
+        selectedWorkspaceId={selectedWorkspaceId}
+        focusedPaneId={focusedPaneId}
+        focusedSurfaceId={focusedSurface?.surfaceId ?? ""}
+        shortcuts={shortcutList}
+        onShortcutChange={handleShortcutChange}
+        onResetShortcuts={resetShortcuts}
+        rpcRateLimit={rpcRateLimit}
+        onRpcRateLimitChange={handleRpcRateLimitChange}
+        onSaveWorkspaceEnv={handleDialogSaveWorkspaceEnv}
+        onStatusMessage={setBackendStatus}
+      />
+      {renderRpcLogsDrawer()}
       {renderDrawer()}
-      {renderEditDrawer()}
       {renderShortcutsPanel()}
       {renderNotificationToasts()}
-      {renderSettingsPanel()}
       <NotificationPanel
         open={notificationPanelOpen}
         notifications={notificationItems}

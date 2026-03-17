@@ -10,6 +10,12 @@ Build faster. Control everything. Work from one environment.
 
 ---
 
+## ⬇️ Download
+
+Download **maxc_v0.1.1**:
+
+[![Windows](https://img.shields.io/badge/Windows-MSI-0078D6?logo=windows&logoColor=white)](https://github.com/Pollux-Studio/maxc/releases/tag/v0.1.1)
+
 ## ✨ Overview
 
 **maxc** is an open source developer workspace that brings **terminals, browser automation, logs, and task orchestration into one unified environment**.
@@ -203,40 +209,40 @@ maxc uses a modular architecture designed for performance and extensibility.
 maxc/
 
 core/
-  workspace_manager
-  pane_manager
-  surface_manager
+  workspace_manager     # workspace lifecycle + state
+  pane_manager          # split panes + layout state
+  surface_manager       # tabs/surfaces + routing
 
 terminal/
-  conpty_engine
-  terminal_parser
-  terminal_renderer
+  conpty_engine         # Windows PTY integration
+  terminal_parser       # VT parsing + buffer model
+  terminal_renderer     # terminal render pipeline
 
 browser/
-  chromium_runtime
-  playwright_driver
-  dom_controller
-  automation_api
+  chromium_runtime      # embedded Chromium runtime
+  playwright_driver     # browser automation driver
+  dom_controller        # DOM interaction layer
+  automation_api        # browser RPC/commands
 
 automation/
-  rpc_server
-  command_dispatcher
-  socket_protocol
+  rpc_server            # JSON-RPC server
+  command_dispatcher    # RPC method routing
+  socket_protocol       # transport + protocol
 
 ui/
-  window_manager
-  layout_engine
-  sidebar
-  surface_tabs
+  window_manager        # top-level window system
+  layout_engine         # pane/surface layout
+  sidebar               # workspace + metadata sidebar
+  surface_tabs          # tab strip + surface switching
 
 notifications/
-  desktop_notifications
+  desktop_notifications # native notifications
 
 cli/
-  command_parser
+  command_parser        # CLI parsing + commands
 
 config/
-  configuration_loader
+  configuration_loader  # config files + defaults
 ```
 
 ## 🖥 Terminal Engine
@@ -402,45 +408,22 @@ maxc is built with modern systems technologies.
 * Clap CLI framework
 * Serde JSON RPC
 
-## 🗺 Development Roadmap
+## 📦 v0.1.2 Roadmap
 
-### Phase 1
+Roadmap:
 
-Core workspace foundations
+* Update installer fix
+* Initial install backend not started fix
 
-* terminal + browser surface models
-* pane splitting
-* surface tabs
+Improvements:
 
-### Phase 2
+* Settings UI improved
+* App icon improved
 
-Workspace manager
+Added:
 
-* sidebar
-* workspace switching
-* CLI control
-
-### Phase 3
-
-Browser surfaces
-
-* embedded browser
-* DOM automation
-
-### Phase 4
-
-Automation API
-
-* socket RPC server
-* command dispatcher
-
-### Phase 5
-
-Notifications and metadata
-
-* status indicators
-* progress tracking
-* sidebar logs
+* Logs page added
+* Shortcut customization added
 
 ## 📚 Documentation
 
@@ -461,7 +444,7 @@ Ways to contribute:
 
 maxc is released as **Free and Open Source Software (FOSS)**.
 
-License details will be added in the LICENSE file.
+License: [Apache-2.0](LICENSE).
 
 ## ❤️ Final Words
 

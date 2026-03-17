@@ -4,3 +4,6 @@ package-lock.json
 pnpm-lock.yaml
 yarn.lock
 bun.lockb
+backend-plan.md
+frontend-plan.md
+PLAN.md
