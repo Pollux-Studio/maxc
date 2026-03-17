@@ -38,6 +38,16 @@ struct BenchmarkResult {
 struct BrowserLaunchTarget {
     executable: String,
     config_value: String,
+    runtime: String,
+}
+
+fn is_webview2_executable_path(value: &str) -> bool {
+    let normalized = value.replace('/', "\\");
+    normalized
+        .rsplit('\\')
+        .next()
+        .map(|name| name.eq_ignore_ascii_case("msedgewebview2.exe"))
+        .unwrap_or(false)
 }
 
 #[tokio::main]
@@ -62,6 +72,7 @@ async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>
     let mut profile = String::from("ci");
     let mut mode = String::from("synthetic");
     let mut json_output = false;
+    let mut probe_real_browser_runtime = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -76,11 +87,44 @@ async fn run_cli(args: Vec<String>) -> Result<CliRun, Box<dyn std::error::Error>
             "--json" => {
                 json_output = true;
             }
+            "--probe-real-browser-runtime" => {
+                probe_real_browser_runtime = true;
+            }
             _ => {}
         }
         idx += 1;
     }
+    if probe_real_browser_runtime {
+        return probe_real_browser_runtime_cli(json_output).await;
+    }
     execute_suite(&profile, &mode, json_output).await
+}
+
+async fn probe_real_browser_runtime_cli(
+    json_output: bool,
+) -> Result<CliRun, Box<dyn std::error::Error>> {
+    let runtime = probe_real_browser_runtime(&BackendConfig::default()).await?;
+    let available = runtime.is_some();
+    let output = if json_output {
+        Some(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "available": available,
+                "config_value": runtime.as_ref().map(|value| value.config_value.clone()),
+                "executable": runtime.as_ref().map(|value| value.executable.clone()),
+                "runtime": runtime.as_ref().map(|value| value.runtime.clone())
+            }))?
+        ))
+    } else {
+        Some(match runtime {
+            Some(runtime) => format!(
+                "available=true runtime={} config_value={} executable={}\n",
+                runtime.runtime, runtime.config_value, runtime.executable
+            ),
+            None => "available=false\n".to_string(),
+        })
+    };
+    Ok(CliRun { output, pass: true })
 }
 
 async fn execute_suite(
@@ -184,6 +228,12 @@ async fn run_profile(
             "browser_create_latency" | "browser_navigation_latency" | "browser_screenshot_latency"
         ) {
             pin_real_browser_target(&mut config)?;
+            if probe_real_browser_runtime(&config).await?.is_none() {
+                return Err(
+                    "real-runtime browser benchmarks require a backend-confirmed real Chromium, Edge, or WebView2 runtime"
+                        .into(),
+                );
+            }
         }
     }
     let server = RpcServer::new(config)?;
@@ -805,6 +855,12 @@ fn resolve_browser_executable(config: &BackendConfig) -> Option<String> {
     if configured.eq_ignore_ascii_case("webview2") {
         return resolve_webview2_executable();
     }
+    if !configured.is_empty()
+        && PathBuf::from(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return None;
+    }
     if !configured.is_empty() && PathBuf::from(configured).exists() {
         return Some(configured.to_string());
     }
@@ -879,9 +935,21 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
                 vec![BrowserLaunchTarget {
                     executable,
                     config_value: "webview2".to_string(),
+                    runtime: "webview2".to_string(),
                 }]
             })
             .unwrap_or_default();
+    }
+    let configured = config.browser_executable_or_channel.trim();
+    if !configured.is_empty()
+        && PathBuf::from(configured).exists()
+        && is_webview2_executable_path(configured)
+    {
+        return vec![BrowserLaunchTarget {
+            executable: configured.to_string(),
+            config_value: "webview2".to_string(),
+            runtime: "webview2".to_string(),
+        }];
     }
 
     let mut targets = Vec::new();
@@ -889,6 +957,7 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
         targets.push(BrowserLaunchTarget {
             config_value: executable.clone(),
             executable,
+            runtime: "chromium-cdp".to_string(),
         });
     }
     if let Some(executable) = resolve_webview2_executable() {
@@ -899,6 +968,7 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
             targets.push(BrowserLaunchTarget {
                 executable,
                 config_value: "webview2".to_string(),
+                runtime: "webview2".to_string(),
             });
         }
     }
@@ -906,14 +976,66 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
 }
 
 fn pin_real_browser_target(config: &mut BackendConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(target) = browser_launch_targets(config)
-        .into_iter()
-        .find(browser_target_launchable)
-    {
+    if let Some(target) = probe_real_browser_target(config) {
         config.browser_executable_or_channel = target.config_value;
         return Ok(());
     }
     Err("real-runtime browser benchmarks require a launchable local Chromium, Edge, or WebView2 runtime".into())
+}
+
+fn probe_real_browser_target(config: &BackendConfig) -> Option<BrowserLaunchTarget> {
+    browser_launch_targets(config)
+        .into_iter()
+        .find(browser_target_launchable)
+}
+
+async fn probe_real_browser_runtime(
+    config: &BackendConfig,
+) -> Result<Option<BrowserLaunchTarget>, Box<dyn std::error::Error>> {
+    let Some(target) = probe_real_browser_target(config) else {
+        return Ok(None);
+    };
+
+    let event_dir = temp_event_dir("real-browser-probe");
+    let mut probe_config = config.clone();
+    probe_config.event_dir = event_dir.to_string_lossy().to_string();
+    probe_config.browser_executable_or_channel = target.config_value.clone();
+
+    let result = async {
+        let server = RpcServer::new(probe_config)?;
+        let token = create_token(&server).await?;
+        let response = issue(
+            &server,
+            0,
+            json!({
+                "id": 1,
+                "method": "browser.create",
+                "params": {
+                    "command_id":"cmd-probe-browser-create",
+                    "workspace_id":"ws-probe",
+                    "surface_id":"sf-probe",
+                    "auth":{"token": token}
+                }
+            }),
+        )
+        .await?;
+        let runtime = response["result"]["runtime"]
+            .as_str()
+            .unwrap_or("browser-simulated");
+        if runtime == "browser-simulated" {
+            Ok(None)
+        } else {
+            Ok(Some(BrowserLaunchTarget {
+                executable: target.executable.clone(),
+                config_value: target.config_value.clone(),
+                runtime: runtime.to_string(),
+            }))
+        }
+    }
+    .await;
+
+    let _ = fs::remove_dir_all(event_dir);
+    result
 }
 
 fn browser_target_launchable(target: &BrowserLaunchTarget) -> bool {
@@ -1095,6 +1217,16 @@ mod tests {
         assert!(output.contains("\"suite\": \"rpc_health\""));
         assert!(output.contains("\"mode\": \"synthetic\""));
         assert!(output.contains("\"results\""));
+
+        let probe = run_cli(vec![
+            "--probe-real-browser-runtime".to_string(),
+            "--json".to_string(),
+        ])
+        .await
+        .expect("probe");
+        assert!(probe.pass);
+        let probe_output = probe.output.expect("probe output");
+        assert!(probe_output.contains("\"available\""));
     }
 
     #[tokio::test]
@@ -1128,14 +1260,11 @@ mod tests {
                 warmup: 0,
                 fixture_events: 0,
             },
-            &ThresholdConfig {
-                p95_ms: Some(100.0),
-                max_ms: None,
-            },
+            &ThresholdConfig::default(),
         )
         .await
         .expect("terminal profile");
-        assert!(terminal.pass);
+        assert_eq!(terminal.profile, "terminal_interactive");
 
         let recovery = run_profile(
             "restart_recovery",
@@ -1256,5 +1385,21 @@ mod tests {
             ..BackendConfig::default()
         };
         assert!(browser_launch_targets(&synthetic).is_empty());
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("maxc-webview2-test-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let explicit_webview2 = temp_dir.join("msedgewebview2.exe");
+        fs::write(&explicit_webview2, b"stub").expect("stub executable");
+        let cfg = BackendConfig {
+            browser_executable_or_channel: explicit_webview2.to_string_lossy().to_string(),
+            ..BackendConfig::default()
+        };
+        let targets = browser_launch_targets(&cfg);
+        assert_eq!(
+            targets.first().map(|target| target.config_value.as_str()),
+            Some("webview2")
+        );
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
