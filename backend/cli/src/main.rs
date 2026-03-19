@@ -412,6 +412,9 @@ enum Command {
         notification_id: Option<String>,
         workspace_id: Option<String>,
     },
+    BrowserDetect {
+        token: String,
+    },
     /// High-level: spawn a terminal surface, run a command, print IDs.
     Run {
         token: String,
@@ -1057,6 +1060,9 @@ fn parse_browser(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
             surface_id: resolve_surface_id(&flags)?,
             browser_session_id: required(&flags, "--browser-session-id")?,
         }),
+        "detect" => Ok(Command::BrowserDetect {
+            token: resolve_token(&flags)?,
+        }),
         _ => Err("unknown browser subcommand".into()),
     }
 }
@@ -1666,6 +1672,12 @@ fn build_request(command: Command) -> RpcRequest {
                 "workspace_id": workspace_id,
                 "surface_id": surface_id,
                 "browser_session_id": browser_session_id,
+                "auth": {"token": token}
+            })),
+        ),
+        Command::BrowserDetect { token } => request(
+            "system.browsers",
+            Some(json!({
                 "auth": {"token": token}
             })),
         ),
@@ -2521,6 +2533,15 @@ mod tests {
         ])
         .expect("browser create");
         assert_eq!(build_request(browser_create).method, "browser.create");
+
+        let (_, detect) = parse_cli(vec![
+            "browser".to_string(),
+            "detect".to_string(),
+            "--token".to_string(),
+            "tok".to_string(),
+        ])
+        .expect("browser detect");
+        assert_eq!(build_request(detect).method, "system.browsers");
 
         let (_, tab_open) = parse_cli(vec![
             "browser".to_string(),

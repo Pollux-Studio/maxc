@@ -166,9 +166,7 @@ pub fn run() {
         .setup(|app| {
             // Resolve the app data directory for reliable event store path.
             let data_dir = app.path().app_data_dir().ok();
-            let state = RPC_STATE
-                .get_or_init(|| init_server(data_dir))
-                .clone();
+            let state = RPC_STATE.get_or_init(|| init_server(data_dir)).clone();
             app.manage(state);
             Ok(())
         })

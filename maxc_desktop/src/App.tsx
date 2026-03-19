@@ -16,12 +16,10 @@ import {
   Keyboard,
   Loader2,
   Minus,
-  Moon,
   Plus,
   ScrollText,
   Settings,
   Square,
-  Sun,
   Terminal as TerminalIcon,
   Trash2,
   X,
@@ -290,6 +288,12 @@ function App() {
   const [surfaces, setSurfaces] = useState<SurfaceState[]>([]);
   const [browserStates, setBrowserStates] = useState<Map<string, BrowserState>>(new Map());
 
+  // -- browser integration state --
+  const [detectedBrowsers, setDetectedBrowsers] = useState<Array<{ name: string; runtime: string; path: string }>>([]);
+  const [selectedBrowserRuntime, setSelectedBrowserRuntime] = useState<string>(() => {
+    try { return localStorage.getItem("maxc-browser-runtime") || ""; } catch { return ""; }
+  });
+
   // -- settings dialog state --
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("workspace");
@@ -300,7 +304,8 @@ function App() {
   const [notificationItems, setNotificationItems] = useState<NotificationItem[]>([]);
   const [notificationPanelOpen, setNotificationPanelOpen] = useState(false);
   const [toastItems, setToastItems] = useState<NotificationItem[]>([]);
-  const [theme, setTheme] = useState<"dark" | "light">(() => {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [theme, _setTheme] = useState<"dark" | "light">(() => {
     if (typeof window === "undefined") return "dark";
     const stored = window.localStorage.getItem("maxc-theme");
     return stored === "light" ? "light" : "dark";
@@ -330,6 +335,7 @@ function App() {
   const [wsEnvVars, setWsEnvVars] = useState<EnvEntry[]>([]);
   const [wsCreating, setWsCreating] = useState(false);
   const [wsError, setWsError] = useState("");
+  const [editingWorkspace, setEditingWorkspace] = useState<Workspace | null>(null);
   const [rpcRateLimit, setRpcRateLimit] = useState<number | "unlimited">(() => {
     if (typeof window === "undefined") return 30;
     const stored = window.localStorage.getItem("maxc-rpc-rate-limit");
@@ -351,7 +357,7 @@ function App() {
   const notificationSeen = useRef<Set<string>>(new Set());
   const inputBufferRef = useRef<Map<string, string>>(new Map());
   const inputTimerRef = useRef<Map<string, number>>(new Map());
-  const inputInFlightRef = useRef<Set<string>>(new Set());
+  // inputInFlightRef removed — terminal input is now fire-and-forget
   const rateLimiterRef = useRef<{
     limit: number | null;
     timestamps: number[];
@@ -525,6 +531,26 @@ function App() {
       return parsed.result as T;
     },
     [scheduleRpcSlot],
+  );
+
+  /** RPC call that bypasses the global rate limiter. Use for latency-sensitive terminal I/O. */
+  const rpcDirect = useCallback(
+    async <T,>(method: string, params: Record<string, unknown>): Promise<T> => {
+      const request = {
+        id: crypto.randomUUID(),
+        method,
+        params,
+      };
+      const raw = await invoke<string>("rpc_call", { request: JSON.stringify(request) });
+      const parsed = JSON.parse(raw);
+      if (parsed.error) {
+        const code = parsed.error.code || "ERROR";
+        const message = parsed.error.message || "Unknown error";
+        throw new Error(code + ": " + message);
+      }
+      return parsed.result as T;
+    },
+    [],
   );
 
   // -- workspace metadata enrichment --
@@ -743,6 +769,42 @@ function App() {
         setReadiness(ready);
         setBackendStatus(ready.ready ? "Backend ready" : "Backend not ready yet");
 
+        // Load manually added browsers from localStorage
+        let manualBrowsers: Array<{ name: string; runtime: string; path: string }> = [];
+        try {
+          const raw = localStorage.getItem("maxc-manual-browsers");
+          if (raw) {
+            const parsed = JSON.parse(raw) as Array<{ name: string; path: string }>;
+            manualBrowsers = parsed.map((b) => ({ name: b.name, runtime: "manual", path: b.path }));
+          }
+        } catch { /* ignore */ }
+
+        // Auto-detect browsers from backend + merge with manual
+        try {
+          const browserResult = await rpc<{ browsers: Array<{ name: string; runtime: string; path: string }> }>(
+            "system.browsers",
+            { auth: { token: session.token } },
+          );
+          const all = [...(browserResult.browsers || []), ...manualBrowsers];
+          setDetectedBrowsers(all);
+          if (!selectedBrowserRuntime && all.length > 0) {
+            setSelectedBrowserRuntime(all[0].runtime);
+          }
+        } catch {
+          // Even if auto-detect fails, load manual browsers
+          if (manualBrowsers.length > 0) setDetectedBrowsers(manualBrowsers);
+        }
+
+        // Sync backend rate limit with saved preference
+        try {
+          const savedRate = rpcRateLimit === "unlimited" ? 10000 : (typeof rpcRateLimit === "number" ? rpcRateLimit : 30);
+          await rpcDirect("system.config.rate_limit", {
+            rate_per_sec: savedRate,
+            burst: savedRate * 2,
+            auth: { token: session.token },
+          });
+        } catch { /* non-fatal */ }
+
         const wsList = await rpc<{ workspaces: Workspace[] }>("workspace.list", {
           auth: { token: session.token },
         });
@@ -872,6 +934,7 @@ function App() {
   // Settings dialog helpers
   // ---------------------------------------------------------------------------
   function openDrawer() {
+    setEditingWorkspace(null);
     setSettingsEditWorkspace(null);
     setSettingsDefaultTab("workspace");
     setSettingsOpen(false);
@@ -882,10 +945,18 @@ function App() {
     setWsError("");
   }
   function openEditDrawer(ws: Workspace) {
-    setSettingsEditWorkspace(ws);
-    setSettingsDefaultTab("workspace");
-    setDrawerOpen(false);
-    setSettingsOpen(true);
+    setEditingWorkspace(ws);
+    setWsName(ws.name);
+    setWsFolder(ws.folder || "");
+    setWsEnvVars(
+      Object.entries(ws.env_vars || {})
+        .filter(([key]) => !key.startsWith("MAXC_"))
+        .map(([key, value]) => ({ key, value })),
+    );
+    setWsError("");
+    setWsCreating(false);
+    setSettingsOpen(false);
+    setDrawerOpen(true);
   }
   function openSettings(tab = "updates") {
     setSettingsEditWorkspace(null);
@@ -896,6 +967,49 @@ function App() {
 
   function closeDrawer() {
     setDrawerOpen(false);
+    setEditingWorkspace(null);
+  }
+
+  async function saveWorkspaceEdits() {
+    if (!editingWorkspace || !token) return;
+    const name = wsName.trim();
+    if (!name) { setWsError("Workspace name is required"); return; }
+
+    const envObj: Record<string, string> = {};
+    for (const entry of wsEnvVars) {
+      const k = entry.key.trim();
+      if (k) envObj[k] = entry.value;
+    }
+    // Preserve MAXC_* system env vars
+    for (const [key, value] of Object.entries(editingWorkspace.env_vars || {})) {
+      if (key.startsWith("MAXC_") && !(key in envObj)) envObj[key] = value;
+    }
+
+    setWsCreating(true);
+    setWsError("");
+    try {
+      await rpc("workspace.update", {
+        command_id: "ui-ws-update-" + crypto.randomUUID(),
+        workspace_id: editingWorkspace.workspace_id,
+        name,
+        folder: wsFolder,
+        env_vars: envObj,
+        auth: { token },
+      });
+      setWorkspaces((prev) =>
+        prev.map((w) =>
+          w.workspace_id === editingWorkspace.workspace_id
+            ? { ...w, name, folder: wsFolder, env_vars: envObj }
+            : w,
+        ),
+      );
+      setBackendStatus("Workspace updated");
+      closeDrawer();
+    } catch (err) {
+      setWsError((err as Error).message);
+    } finally {
+      setWsCreating(false);
+    }
   }
 
   async function pickFolder() {
@@ -958,15 +1072,80 @@ function App() {
     setShortcutMap(buildShortcutMap());
   }
 
+  function handleBrowserRuntimeChange(runtime: string) {
+    setSelectedBrowserRuntime(runtime);
+    try { localStorage.setItem("maxc-browser-runtime", runtime); } catch {}
+  }
+
+  const [browserDetecting, setBrowserDetecting] = useState(false);
+
+  async function handleDetectBrowsers() {
+    if (!token) return;
+    setBrowserDetecting(true);
+    try {
+      const result = await rpc<{ browsers: Array<{ name: string; runtime: string; path: string }> }>(
+        "system.browsers",
+        { auth: { token } },
+      );
+      const detected = result.browsers || [];
+      // Merge with any manually added browsers (keep manuals that aren't auto-detected)
+      const manualBrowsers = detectedBrowsers.filter((b) => b.runtime === "manual");
+      const merged = [...detected, ...manualBrowsers];
+      setDetectedBrowsers(merged);
+      if (!selectedBrowserRuntime && merged.length > 0) {
+        handleBrowserRuntimeChange(merged[0].runtime);
+      }
+      setBackendStatus(`Detected ${detected.length} browser(s)`);
+    } catch (err) {
+      setBackendStatus("Browser detection failed: " + (err as Error).message);
+    } finally {
+      setBrowserDetecting(false);
+    }
+  }
+
+  function handleAddManualBrowser(name: string, path: string) {
+    const manual = {
+      name,
+      runtime: "manual",
+      path,
+    };
+    setDetectedBrowsers((prev) => [...prev, manual]);
+    // Auto-select if nothing is selected
+    if (!selectedBrowserRuntime) {
+      handleBrowserRuntimeChange("manual");
+    }
+    // Save manual browsers to localStorage
+    try {
+      const existingRaw = localStorage.getItem("maxc-manual-browsers");
+      const existing: Array<{ name: string; path: string }> = existingRaw ? JSON.parse(existingRaw) : [];
+      existing.push({ name, path });
+      localStorage.setItem("maxc-manual-browsers", JSON.stringify(existing));
+    } catch {}
+  }
+
   function handleRpcRateLimitChange(value: string) {
     if (value === "unlimited") {
       setRpcRateLimit("unlimited");
+      // Sync with backend: set a very high rate to effectively disable limiting
+      syncBackendRateLimit(10000);
       return;
     }
     const parsed = Number(value);
     if (Number.isFinite(parsed) && parsed > 0) {
       setRpcRateLimit(parsed);
+      syncBackendRateLimit(parsed);
     }
+  }
+
+  function syncBackendRateLimit(ratePerSec: number) {
+    if (!token) return;
+    rpcDirect("system.config.rate_limit", {
+      rate_per_sec: ratePerSec,
+      burst: ratePerSec * 2,
+      auth: { token },
+    }).catch((err) => {
+      console.error("Failed to sync backend rate limit:", err);
+    });
   }
 
   const loadRpcLogs = useCallback(async () => {
@@ -1299,6 +1478,7 @@ function App() {
         command_id: "ui-browser-attach-" + crypto.randomUUID(),
         workspace_id: surface.workspaceId,
         surface_id: surfaceId,
+        browser_runtime: selectedBrowserRuntime || undefined,
         auth: { token },
       });
       const browserSessionId = browserResult.browser_session_id as string;
@@ -1459,15 +1639,10 @@ function App() {
 
   // -- terminal input / resize handlers (keyed by surfaceId) --
   const flushTerminalInput = useCallback(
-    async (surfaceId: string) => {
+    (surfaceId: string) => {
       const buffer = inputBufferRef.current.get(surfaceId);
       if (!buffer) {
         inputBufferRef.current.delete(surfaceId);
-        return;
-      }
-      if (inputInFlightRef.current.has(surfaceId)) {
-        const retry = window.setTimeout(() => flushTerminalInput(surfaceId), 12);
-        inputTimerRef.current.set(surfaceId, retry);
         return;
       }
       const surface = surfacesRef.current.find((s) => s.surfaceId === surfaceId);
@@ -1475,29 +1650,22 @@ function App() {
         inputBufferRef.current.delete(surfaceId);
         return;
       }
-      inputInFlightRef.current.add(surfaceId);
+      // Grab the buffer and clear it immediately — don't wait for RPC response.
+      const data = buffer;
       inputBufferRef.current.set(surfaceId, "");
-      try {
-        await rpc("terminal.input", {
-          command_id: "ui-term-input-" + crypto.randomUUID(),
-          workspace_id: surface.workspaceId,
-          surface_id: surfaceId,
-          terminal_session_id: surface.terminalSessionId,
-          input: buffer,
-          auth: { token },
-        });
-      } catch (err) {
+      // Fire-and-forget: send to backend without blocking the next batch.
+      rpcDirect("terminal.input", {
+        command_id: "ui-term-input-" + crypto.randomUUID(),
+        workspace_id: surface.workspaceId,
+        surface_id: surfaceId,
+        terminal_session_id: surface.terminalSessionId,
+        input: data,
+        auth: { token },
+      }).catch((err) => {
         console.error("terminal.input error:", err);
-      } finally {
-        inputInFlightRef.current.delete(surfaceId);
-        const remaining = inputBufferRef.current.get(surfaceId);
-        if (remaining) {
-          const retry = window.setTimeout(() => flushTerminalInput(surfaceId), 0);
-          inputTimerRef.current.set(surfaceId, retry);
-        }
-      }
+      });
     },
-    [token],
+    [token, rpcDirect],
   );
 
   const sendTerminalInput = useCallback(
@@ -1509,7 +1677,7 @@ function App() {
         const timer = window.setTimeout(() => {
           inputTimerRef.current.delete(surfaceId);
           void flushTerminalInput(surfaceId);
-        }, 12);
+        }, 4);
         inputTimerRef.current.set(surfaceId, timer);
       }
     },
@@ -1730,7 +1898,7 @@ function App() {
         let didChange = false;
         const updated = await Promise.all(
           list.map(async (s) => {
-            const result = await rpc<any>("terminal.history", {
+            const result = await rpcDirect<any>("terminal.history", {
               workspace_id: s.workspaceId,
               surface_id: s.surfaceId,
               terminal_session_id: s.terminalSessionId,
@@ -1771,7 +1939,7 @@ function App() {
         pollInFlightRef.current = false;
       }
     };
-    const id = setInterval(poll, 500);
+    const id = setInterval(poll, 100);
     return () => clearInterval(id);
   }, [token]);
 
@@ -1887,15 +2055,7 @@ function App() {
         {/* header */}
         <div className="flex items-center justify-between px-3 pt-3 pb-2">
           <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">Workspaces</div>
-          <div className="flex items-center gap-1">
-            <Button
-              size="icon-xs"
-              variant="ghost"
-              onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
-              title={theme === "dark" ? "Switch to light" : "Switch to dark"}
-            >
-              {theme === "dark" ? <Sun className="size-3.5" /> : <Moon className="size-3.5" />}
-            </Button>
+          <div className="flex items-center gap-1"> 
             <Button size="icon-xs" variant="ghost" onClick={openDrawer} title="New Workspace (Ctrl+N)">
               <Plus className="size-3.5" />
             </Button>
@@ -2122,6 +2282,7 @@ function App() {
         onBrowserScreenshot={handleBrowserScreenshot}
         browserStates={browserStates}
         workspaceFolder={selectedWorkspace?.folder}
+        browserWebviewsVisible={!settingsOpen && !drawerOpen && !notificationPanelOpen && !logsOpen}
       />
     );
   }
@@ -2359,20 +2520,33 @@ function App() {
           )}
         >
           <div className="flex items-center justify-between border-b px-5 py-4">
-            <h2 className="text-sm font-semibold">New Workspace</h2>
+            <h2 className="text-sm font-semibold">
+              {editingWorkspace ? "Edit Workspace" : "New Workspace"}
+            </h2>
             <Button variant="ghost" size="icon-sm" onClick={closeDrawer}>
               <X className="size-4" />
             </Button>
           </div>
           <div className="flex-1 overflow-auto px-5 py-4 space-y-5">
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Workspace ID
-              </label>
-              <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">
-                Auto-generated on creation
+            {editingWorkspace ? (
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Workspace ID
+                </label>
+                <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground font-mono">
+                  {editingWorkspace.workspace_id}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Workspace ID
+                </label>
+                <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">
+                  Auto-generated on creation
+                </div>
+              </div>
+            )}
             <div className="space-y-1.5">
               <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 Name <span className="text-destructive">*</span>
@@ -2467,11 +2641,13 @@ function App() {
               <Button
                 variant="default"
                 size="sm"
-                onClick={createWorkspace}
+                onClick={editingWorkspace ? saveWorkspaceEdits : createWorkspace}
                 className="flex-1 h-9"
                 disabled={wsCreating || !wsName.trim()}
               >
-                {wsCreating ? "Creating..." : "Create Workspace"}
+                {wsCreating
+                  ? (editingWorkspace ? "Saving..." : "Creating...")
+                  : (editingWorkspace ? "Save Changes" : "Create Workspace")}
               </Button>
             </div>
           </div>
@@ -2512,6 +2688,12 @@ function App() {
         onResetShortcuts={resetShortcuts}
         rpcRateLimit={rpcRateLimit}
         onRpcRateLimitChange={handleRpcRateLimitChange}
+        detectedBrowsers={detectedBrowsers}
+        selectedBrowserRuntime={selectedBrowserRuntime}
+        onBrowserRuntimeChange={handleBrowserRuntimeChange}
+        onDetectBrowsers={handleDetectBrowsers}
+        browserDetecting={browserDetecting}
+        onAddManualBrowser={handleAddManualBrowser}
         onSaveWorkspaceEnv={handleDialogSaveWorkspaceEnv}
         onStatusMessage={setBackendStatus}
       />

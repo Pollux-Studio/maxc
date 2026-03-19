@@ -643,3 +643,75 @@ Track C (integration): Phase 5 (notifications) + Phase 8 (ergonomics)
 | 7     | 0               | 0                | 0              | 0             |
 | 8     | 0               | 2                | 0              | ~4            |
 | **Total** | **15**      | **40**           | **5**          | **~30**       |
+
+---
+
+## Feature: Native Browser Integration (v0.2.0)
+
+### Problem
+
+The current BrowserView uses an `<iframe>` that loads URLs in the Tauri webview sandbox. The backend launches a separate headless Chrome/Edge via CDP. These are completely disconnected.
+
+### Solution
+
+Replace the iframe with a **native embedded Tauri Webview** (`@tauri-apps/api/webview`) rendered directly inside the browser pane. Uses the system's native browser engine (WebView2 on Windows, WebKit on macOS/Linux). Everything stays in one maxc window.
+
+### Architecture
+
+```
+maxc window (single native window)
+  ├── React UI (main webview)
+  │   ├── Sidebar
+  │   ├── Terminal panes (xterm.js)
+  │   ├── Agent panels
+  │   └── Browser pane: URL bar (React) + container div
+  │
+  └── Native Webview (positioned over browser container div)
+      └── Real WebView2/WebKit rendering the web page
+```
+
+The React `BrowserView` component measures its container div position/size and creates a native `Webview` at those coordinates. A `ResizeObserver` keeps the webview synced on pane resize.
+
+### Phase NB-1: Backend — Browser Detection + Config (DONE)
+
+- Added `browser_headless: bool` config field + `MAXC_BROWSER_HEADLESS` env var
+- Added `system.browsers` RPC method returning detected browsers with names, paths, runtimes
+- Files: `backend/core/src/lib.rs`, `backend/automation/src/server.rs`
+
+### Phase NB-2: Tauri — Webview Permissions (DONE)
+
+- Enabled `unstable` feature on `tauri` crate for multiwebview support
+- Added 7 webview permissions: `allow-create-webview`, `allow-set-webview-position`, `allow-set-webview-size`, `allow-set-webview-focus`, `allow-webview-close`, `allow-webview-show`, `allow-webview-hide`
+- Files: `src-tauri/Cargo.toml`, `src-tauri/capabilities/default.json`
+
+### Phase NB-3: BrowserView — Native Webview Embedding (DONE)
+
+- Replaced `<iframe>` with `new Webview(getCurrentWindow(), label, { url, x, y, width, height })`
+- `ResizeObserver` + window resize listener syncs webview position/size with container
+- Webview created on URL navigate, closed on unmount
+- URL bar + nav buttons remain as React elements
+- Error handling with retry button
+- Files: `src/components/BrowserView.tsx` (full rewrite)
+
+### Phase NB-4: SettingsDialog — Integrations Tab (DONE)
+
+- Added "Integrations" tab with Puzzle icon between Agent and Shortcuts
+- Auto-detects browsers via props from App.tsx
+- Selectable browser cards showing name, path, runtime type with check indicator
+- Empty state when no browsers detected
+- "How it works" explanation section
+- Files: `src/components/SettingsDialog.tsx` (+3 props, +1 tab trigger, +1 tab content ~65 lines)
+
+### Phase NB-5: App.tsx — Browser Config Wiring (DONE)
+
+- Added `detectedBrowsers` and `selectedBrowserRuntime` state with localStorage persistence
+- Browser detection on startup via `rpc("system.browsers")` (non-fatal)
+- `handleBrowserRuntimeChange` persists to localStorage
+- All 3 new props passed to SettingsDialog
+- Files: `src/App.tsx`
+
+### Phase NB-6: CLI — Browser Detection Commands (DONE)
+
+- Added `maxc browser detect` — calls `system.browsers` RPC, lists available browsers
+- CLI test added and passing
+- Files: `backend/cli/src/main.rs`

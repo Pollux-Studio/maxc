@@ -75,6 +75,8 @@ export type PaneContainerProps = {
   browserStates: Map<string, BrowserState>;
   workspaceFolder?: string;
   canCreateSurface?: boolean;
+  /** Whether browser webviews should be visible (false when dialogs cover them) */
+  browserWebviewsVisible: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -161,7 +163,47 @@ export function PaneContainer(props: PaneContainerProps) {
             onClosePane={props.onClosePane}
             canClosePane={props.paneCount > 1}
           />
-          <div className="flex-1 min-h-0 bg-background">
+          <div className="flex-1 min-h-0 bg-background relative">
+            {/*
+              Render ALL browser surfaces in this pane persistently.
+              Native webviews are OS-level windows — they must be hidden/shown
+              via Tauri API, not mounted/unmounted via React.
+              Only the active browser surface with no dialogs open is visible.
+            */}
+            {node.surfaces
+              .filter((s) => s.panelType === "browser" && s.browserSessionId)
+              .map((s) => {
+                const bs = props.browserStates.get(s.surfaceId);
+                const isActiveBrowser =
+                  node.activeSurfaceId === s.surfaceId;
+                return (
+                  <div
+                    key={`browser-${s.surfaceId}`}
+                    className={cn("absolute inset-0", !isActiveBrowser && "pointer-events-none")}
+                    style={{ zIndex: isActiveBrowser ? 1 : -1 }}
+                  >
+                    <BrowserView
+                      surfaceId={s.surfaceId}
+                      browserSessionId={s.browserSessionId!}
+                      workspaceId={s.workspaceId}
+                      tabId={bs?.tabId ?? null}
+                      focused={isFocused && isActiveBrowser}
+                      visible={isActiveBrowser && props.browserWebviewsVisible}
+                      onNavigate={props.onBrowserNavigate}
+                      onReload={props.onBrowserReload}
+                      onBack={props.onBrowserBack}
+                      onForward={props.onBrowserForward}
+                      onScreenshot={props.onBrowserScreenshot}
+                      currentUrl={bs?.currentUrl ?? ""}
+                      screenshotData={bs?.screenshotData ?? null}
+                      screenshotLoading={bs?.screenshotLoading ?? false}
+                      sessionLoading={bs?.sessionLoading ?? false}
+                    />
+                  </div>
+                );
+              })}
+
+            {/* Active non-browser panel content */}
             {activeSurface?.panelType === "terminal" &&
             activeSurface.terminalSessionId ? (
               <XtermTerminal
@@ -179,27 +221,8 @@ export function PaneContainer(props: PaneContainerProps) {
               />
             ) : activeSurface?.panelType === "browser" &&
               activeSurface.browserSessionId ? (
-              (() => {
-                const bs = props.browserStates.get(activeSurface.surfaceId);
-                return (
-                  <BrowserView
-                    surfaceId={activeSurface.surfaceId}
-                    browserSessionId={activeSurface.browserSessionId}
-                    workspaceId={activeSurface.workspaceId}
-                    tabId={bs?.tabId ?? null}
-                    focused={isFocused}
-                    onNavigate={props.onBrowserNavigate}
-                    onReload={props.onBrowserReload}
-                    onBack={props.onBrowserBack}
-                    onForward={props.onBrowserForward}
-                    onScreenshot={props.onBrowserScreenshot}
-                    currentUrl={bs?.currentUrl ?? ""}
-                    screenshotData={bs?.screenshotData ?? null}
-                    screenshotLoading={bs?.screenshotLoading ?? false}
-                    sessionLoading={bs?.sessionLoading ?? false}
-                  />
-                );
-              })()
+              // Active browser — already rendered above persistently, nothing to render here
+              null
             ) : activeSurface?.panelType === "browser" ? (
               (() => {
                 const bs = props.browserStates.get(activeSurface.surfaceId);
