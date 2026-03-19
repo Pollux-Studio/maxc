@@ -18,7 +18,10 @@ const jetbrainsMono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://maxc.polluxstudio.in"),
-  title: "maxc - Workspace for AI Coding Agents",
+  title: {
+    default: "maxc - Workspace for AI Coding Agents",
+    template: "%s - maxc",
+  },
   description:
     "maxc is a programmable workspace for AI coding agents. Run terminals, automate browsers, and orchestrate AI agents from one developer environment.",
   keywords: [
@@ -30,15 +33,23 @@ export const metadata: Metadata = {
     "agent orchestration",
     "developer productivity tools",
   ],
+  applicationName: "maxc",
+  alternates: {
+    canonical: "/",
+  },
+  robots: {
+    index: true,
+    follow: true,
+  },
   openGraph: {
     title: "maxc - Control Center for AI Coding Agents",
     description:
       "Run terminals, control browsers, and orchestrate AI agents from one programmable workspace.",
-    url: "https://maxc.polluxstudio.in",
+    url: "/",
     siteName: "maxc",
     images: [
       {
-        url: "https://maxc.polluxstudio.in/og-image.png",
+        url: "/og.png",
         width: 1200,
         height: 630,
         alt: "maxc - Control Center for AI Coding Agents",
@@ -50,10 +61,10 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "maxc - AI Coding Agent Workspace",
     description: "Run terminals, browsers, and AI agents in one programmable workspace.",
-    images: ["https://maxc.polluxstudio.in/og-image.png"],
+    images: ["/og.png"],
   },
   icons: {
-    icon: "/maxc_logo_full_white_single.svg",
+    icon: [{ url: "/maxc_logo_full_white_single.svg" }],
   },
 };
 

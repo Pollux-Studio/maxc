@@ -1,4 +1,3 @@
-import Image from "next/image";
 import { Navbar } from "@/components/landing/navbar";
 import { Footer } from "@/components/landing/footer";
 
@@ -98,9 +97,10 @@ export default async function DownloadsPage() {
     }))
   );
 
-  const windowsAssets = assets.filter((asset) => asset.platformKey.startsWith("windows"));
-  const macAssets = assets.filter((asset) => asset.platformKey.startsWith("darwin"));
-  const linuxAssets = assets.filter((asset) => asset.platformKey.startsWith("linux"));
+  const versionToken = latest.version.replace(/^v/, "");
+  const windowsAssets = assets.filter(
+    (asset) => asset.platformKey.startsWith("windows") && asset.name.includes(versionToken)
+  );
 
   return (
     <main className="min-h-screen bg-[var(--background)] text-foreground">
@@ -122,7 +122,7 @@ export default async function DownloadsPage() {
       </section>
 
       <section className="wrapper wrapper--ticks border-t border-nickel px-6 sm:px-10 py-10">
-        <div className="grid gap-6 lg:grid-cols-3">
+        <div className="grid gap-6 lg:grid-cols-1">
           <div className="rounded-xl border border-[rgba(255,255,255,0.08)] bg-white/[0.02] p-5">
             <div className="flex items-center gap-2">
               <WindowsLogo className="h-5 w-5 text-white/70" />
@@ -131,44 +131,6 @@ export default async function DownloadsPage() {
             <div className="text-white/40 text-xs mt-1">x64</div>
             <div className="mt-5 space-y-3">
               {windowsAssets.map((asset) => (
-                <AssetRow key={asset.url} asset={asset} />
-              ))}
-            </div>
-          </div>
-
-          <div className="rounded-xl border border-[rgba(255,255,255,0.08)] bg-white/[0.02] p-5">
-            <div className="flex items-center gap-2">
-              <Image
-                src="/apple-logo-svgrepo-com.svg"
-                alt="Apple"
-                width={20}
-                height={20}
-                className="h-5 w-5 object-contain invert opacity-70"
-              />
-              <div className="text-white font-semibold text-lg">macOS</div>
-            </div>
-            <div className="text-white/40 text-xs mt-1">Apple Silicon</div>
-            <div className="mt-5 space-y-3">
-              {macAssets.map((asset) => (
-                <AssetRow key={asset.url} asset={asset} />
-              ))}
-            </div>
-          </div>
-
-          <div className="rounded-xl border border-[rgba(255,255,255,0.08)] bg-white/[0.02] p-5">
-            <div className="flex items-center gap-2">
-              <Image
-                src="/linux-svgrepo-com.svg"
-                alt="Linux"
-                width={20}
-                height={20}
-                className="h-5 w-5 object-contain grayscale invert opacity-70"
-              />
-              <div className="text-white font-semibold text-lg">Linux</div>
-            </div>
-            <div className="text-white/40 text-xs mt-1">AppImage, DEB, RPM</div>
-            <div className="mt-5 space-y-3">
-              {linuxAssets.map((asset) => (
                 <AssetRow key={asset.url} asset={asset} />
               ))}
             </div>
