@@ -32,7 +32,7 @@ export function Navbar() {
             <div className="relative z-10 w-full h-10 flex px-4">
               <div className="flex items-center gap-2 w-full max-w-360 mx-auto px-4">
                 <Image
-                  src="/@maxc_logo@.svg"
+                  src="/maxc_logo@.svg"
                   alt="maxc logo"
                   width={12}
                   height={12}
