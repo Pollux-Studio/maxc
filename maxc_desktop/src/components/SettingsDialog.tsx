@@ -6,9 +6,13 @@ import {
   Bot,
   ChevronDown,
   Download,
+  FolderOpen,
+  Globe2,
   Info,
   Keyboard,
+  Puzzle,
   Plus,
+  Search,
   Trash2,
 } from "lucide-react";
 import logoWhite from "@/assets/maxc_logo_white.svg";
@@ -21,6 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -173,10 +178,111 @@ export type SettingsDialogProps = {
   /** Rate limit */
   rpcRateLimit: RpcRateLimitValue;
   onRpcRateLimitChange: (value: string) => void;
+  /** Browser integrations */
+  detectedBrowsers: Array<{ name: string; runtime: string; path: string }>;
+  selectedBrowserRuntime: string;
+  onBrowserRuntimeChange: (runtime: string) => void;
+  onDetectBrowsers: () => Promise<void>;
+  browserDetecting: boolean;
+  onAddManualBrowser: (name: string, path: string) => void;
   /** Callbacks */
   onSaveWorkspaceEnv: (workspaceId: string, envVars: Record<string, string>) => Promise<void>;
   onStatusMessage: (msg: string) => void;
 };
+
+// ---------------------------------------------------------------------------
+// Manual Browser Entry sub-component
+// ---------------------------------------------------------------------------
+
+function ManualBrowserEntry({ onAdd }: { onAdd: (name: string, path: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const [manualName, setManualName] = useState("");
+  const [manualPath, setManualPath] = useState("");
+
+  async function browseForBrowser() {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        title: "Select browser executable",
+        filters: [
+          { name: "Executables", extensions: ["exe", "app", ""] },
+        ],
+      });
+      if (selected && typeof selected === "string") {
+        setManualPath(selected);
+        if (!manualName) {
+          const fileName = selected.split(/[/\\]/).pop()?.replace(/\.\w+$/, "") ?? "";
+          setManualName(fileName.charAt(0).toUpperCase() + fileName.slice(1));
+        }
+      }
+    } catch { /* cancelled */ }
+  }
+
+  function handleAdd() {
+    const name = manualName.trim();
+    const path = manualPath.trim();
+    if (!path) return;
+    onAdd(name || "Custom Browser", path);
+    setManualName("");
+    setManualPath("");
+    setExpanded(false);
+  }
+
+  if (!expanded) {
+    return (
+      <button
+        onClick={() => setExpanded(true)}
+        className="w-full rounded-md border border-dashed border-border/60 px-4 py-3 text-left text-[11px] text-muted-foreground hover:border-muted-foreground/40 hover:bg-muted/30 transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <Plus className="size-3.5" />
+          <span>Add browser manually</span>
+        </div>
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-md border px-4 py-3 space-y-3">
+      <div className="flex items-center justify-between">
+        <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          Add Browser Manually
+        </label>
+        <Button variant="ghost" size="icon-xs" onClick={() => setExpanded(false)}>
+          <Trash2 className="size-3" />
+        </Button>
+      </div>
+      <div className="space-y-2">
+        <input
+          type="text"
+          value={manualName}
+          onChange={(e) => setManualName(e.target.value)}
+          placeholder="Browser name (e.g. Chrome Beta)"
+          className="w-full rounded-md border bg-muted px-2.5 py-1.5 text-[11px] outline-none focus:ring-1 focus:ring-ring"
+        />
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={manualPath}
+            onChange={(e) => setManualPath(e.target.value)}
+            placeholder="Path to executable..."
+            className="flex-1 rounded-md border bg-muted px-2.5 py-1.5 text-[11px] font-mono outline-none focus:ring-1 focus:ring-ring"
+          />
+          <Button variant="outline" size="sm" onClick={browseForBrowser} className="h-7 shrink-0 gap-1 text-[10px]">
+            <FolderOpen className="size-3" />
+            Browse
+          </Button>
+        </div>
+      </div>
+      <div className="flex justify-end">
+        <Button size="sm" onClick={handleAdd} disabled={!manualPath.trim()} className="h-7 text-[10px]">
+          Add Browser
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -198,6 +304,12 @@ export function SettingsDialog({
   onResetShortcuts,
   rpcRateLimit,
   onRpcRateLimitChange,
+  detectedBrowsers,
+  selectedBrowserRuntime,
+  onBrowserRuntimeChange,
+  onDetectBrowsers,
+  browserDetecting,
+  onAddManualBrowser,
   onSaveWorkspaceEnv,
   onStatusMessage,
 }: SettingsDialogProps) {
@@ -431,7 +543,7 @@ export function SettingsDialog({
         </DialogHeader>
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 min-h-0">
-          <TabsList variant="line" className="w-full justify-start">
+          <TabsList variant="line" className="w-full justify-start overflow-x-auto flex-nowrap scrollbar-none">
             {isEditing && (
               <TabsTrigger value="workspace">
                 Workspace
@@ -440,6 +552,10 @@ export function SettingsDialog({
             <TabsTrigger value="agent" className="gap-1.5">
               <Bot className="size-3.5" />
               Agent
+            </TabsTrigger>
+            <TabsTrigger value="integrations" className="gap-1.5">
+              <Puzzle className="size-3.5" />
+              Integrations
             </TabsTrigger>
             <TabsTrigger value="shortcuts" className="gap-1.5">
               <Keyboard className="size-3.5" />
@@ -718,7 +834,7 @@ export function SettingsDialog({
                   <option value="unlimited">Unlimited</option>
                 </select>
                 <span className="text-[10px] text-muted-foreground">
-                  Applies to frontend JSON-RPC requests.
+                  Applies to both frontend and backend rate limits.
                 </span>
               </div>
               {showUnlimitedWarning && (
@@ -749,6 +865,108 @@ export function SettingsDialog({
                   </div>
                 ))}
               </div>
+            </div>
+          </TabsContent>
+
+          {/* ============ INTEGRATIONS TAB ============ */}
+          <TabsContent value="integrations" className="settings-scroll overflow-auto h-[55vh] pr-1 space-y-4 mt-3">
+            {/* Header + Detect button */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Browser Runtime
+                </label>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-[10px] gap-1.5"
+                  onClick={onDetectBrowsers}
+                  disabled={browserDetecting}
+                >
+                  <Search className="size-3" />
+                  {browserDetecting ? "Detecting..." : "Detect Browsers"}
+                </Button>
+              </div>
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                Click "Detect Browsers" to scan for installed browsers, or add one manually below.
+              </p>
+            </div>
+
+            {/* Detected browsers list */}
+            {detectedBrowsers.length > 0 && (
+              <div className="space-y-2">
+                {detectedBrowsers.map((browser) => {
+                  const isSelected = selectedBrowserRuntime === browser.runtime ||
+                    selectedBrowserRuntime === browser.path;
+                  return (
+                    <button
+                      key={browser.runtime + browser.path}
+                      onClick={() => onBrowserRuntimeChange(browser.runtime)}
+                      className={cn(
+                        "w-full rounded-md border px-4 py-3 text-left transition-colors",
+                        isSelected
+                          ? "border-primary bg-primary/5"
+                          : "border-border hover:border-muted-foreground/30 hover:bg-muted/40",
+                      )}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className={cn(
+                            "flex size-8 items-center justify-center rounded-md",
+                            isSelected ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground",
+                          )}>
+                            <Globe2 className="size-4" />
+                          </div>
+                          <div>
+                            <div className="text-[12px] font-medium text-foreground">
+                              {browser.name}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground font-mono truncate max-w-[260px]">
+                              {browser.path}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] text-muted-foreground font-mono rounded bg-muted px-1.5 py-0.5">
+                            {browser.runtime}
+                          </span>
+                          {isSelected && (
+                            <div className="flex size-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+                              <Check className="size-3" />
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {detectedBrowsers.length === 0 && (
+              <div className="rounded-md border border-dashed px-4 py-5 text-center">
+                <Globe2 className="size-5 text-muted-foreground/40 mx-auto mb-2" />
+                <div className="text-[11px] text-muted-foreground">
+                  No browsers detected yet.
+                </div>
+                <div className="text-[10px] text-muted-foreground/60 mt-1">
+                  Click "Detect Browsers" above to scan your system.
+                </div>
+              </div>
+            )}
+
+            {/* Manual browser entry */}
+            <ManualBrowserEntry onAdd={onAddManualBrowser} />
+
+            {/* How it works */}
+            <div className="space-y-1.5 pt-2">
+              <label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                How it works
+              </label>
+              <p className="text-[10px] text-muted-foreground leading-relaxed">
+                The embedded webview in each browser pane uses the system's native engine (WebView2 / WebKit).
+                The selected browser runtime is used by AI agents for headless automation via CDP protocol.
+              </p>
             </div>
           </TabsContent>
         </Tabs>

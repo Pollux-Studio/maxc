@@ -133,6 +133,7 @@ pub struct BackendConfig {
     pub browser_allowed_upload_roots: Vec<String>,
     pub browser_allowed_trace_roots: Vec<String>,
     pub browser_max_tabs_per_session: usize,
+    pub browser_headless: bool,
     pub terminal_runtime: String,
     pub terminal_max_sessions: usize,
     pub terminal_max_sessions_per_workspace: usize,
@@ -199,6 +200,7 @@ impl Default for BackendConfig {
             browser_allowed_upload_roots: Vec::new(),
             browser_allowed_trace_roots: Vec::new(),
             browser_max_tabs_per_session: 16,
+            browser_headless: true,
             terminal_runtime: if cfg!(windows) {
                 "conpty".to_string()
             } else {
@@ -425,6 +427,9 @@ impl BackendConfig {
         }
         if let Some(value) = get("MAXC_BROWSER_ALLOW_RAW_COMMANDS") {
             cfg.browser_allow_raw_commands = matches!(value.as_str(), "1" | "true" | "TRUE");
+        }
+        if let Some(value) = get("MAXC_BROWSER_HEADLESS") {
+            cfg.browser_headless = matches!(value.as_str(), "1" | "true" | "TRUE");
         }
         if let Some(value) = get("MAXC_BROWSER_ALLOWED_DOWNLOAD_ROOTS") {
             cfg.browser_allowed_download_roots = value

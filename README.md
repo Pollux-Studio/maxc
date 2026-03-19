@@ -12,9 +12,9 @@ Build faster. Control everything. Work from one environment.
 
 ## ⬇️ Download
 
-Download **maxc_v0.1.1**:
+Download **maxc v0.2.0**:
 
-[![Windows](https://img.shields.io/badge/Windows-MSI-0078D6?logo=windows&logoColor=white)](https://github.com/Pollux-Studio/maxc/releases/tag/v0.1.1)
+[![Windows](https://img.shields.io/badge/Windows-MSI-0078D6?logo=windows&logoColor=white)](https://github.com/Pollux-Studio/maxc/releases/tag/v0.2.0)
 
 ## ✨ Overview
 
@@ -408,22 +408,9 @@ maxc is built with modern systems technologies.
 * Clap CLI framework
 * Serde JSON RPC
 
-## 📦 v0.1.2 Roadmap
+## 📋 Changelog
 
-Roadmap:
-
-* Update installer fix
-* Initial install backend not started fix
-
-Improvements:
-
-* Settings UI improved
-* App icon improved
-
-Added:
-
-* Logs page added
-* Shortcut customization added
+See [CHANGELOG.md](CHANGELOG.md) for a detailed history of all releases.
 
 ## 📚 Documentation
 

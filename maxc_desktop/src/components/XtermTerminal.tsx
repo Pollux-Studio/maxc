@@ -150,7 +150,7 @@ export const XtermTerminal = forwardRef<XtermHandle, XtermTerminalProps>(
       <div
         ref={containerRef}
         className="h-full w-full min-h-0"
-        style={{ minHeight: 0 }}
+        style={{ minHeight: 0, padding: "6px 8px" }}
       />
     );
   },

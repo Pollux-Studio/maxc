@@ -466,6 +466,13 @@ impl RateLimiter {
         }
     }
 
+    fn update_rate(&mut self, rate_per_sec: u32, burst: u32) {
+        self.rate_per_sec = f64::from(rate_per_sec);
+        self.burst = f64::from(burst);
+        // Don't reset tokens — let current capacity drain naturally
+        self.tokens = self.tokens.min(self.burst);
+    }
+
     fn allow(&mut self) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
@@ -770,6 +777,8 @@ impl RpcServer {
             "system.diagnostics" => self.system_diagnostics(request.params).await,
             "system.metrics" => self.system_metrics(request.params).await,
             "system.logs" => self.system_logs(request.params).await,
+            "system.browsers" => self.system_browsers(request.params).await,
+            "system.config.rate_limit" => self.system_config_rate_limit(request.params).await,
             method if method.starts_with("workspace.") => {
                 self.workspace_dispatch(method, request.params).await
             }
@@ -1017,6 +1026,78 @@ impl RpcServer {
         self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
             .await?;
         serde_json::to_value(self.telemetry_snapshot()).map_err(|_| ServerError::Internal)
+    }
+
+    async fn system_browsers(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
+            .await?;
+        let targets = browser_launch_targets(&self.config);
+        let browsers: Vec<Value> = targets
+            .iter()
+            .map(|t| {
+                let name = match t.runtime.as_str() {
+                    "chrome" => "Google Chrome",
+                    "chrome-beta" => "Google Chrome Beta",
+                    "chrome-dev" => "Google Chrome Dev",
+                    "chrome-canary" => "Google Chrome Canary",
+                    "brave" => "Brave",
+                    "vivaldi" => "Vivaldi",
+                    "edge" => "Microsoft Edge",
+                    "webview2" => "WebView2 (Edge)",
+                    "chromium-cdp" => "Chromium",
+                    _ => "Browser",
+                };
+                json!({
+                    "name": name,
+                    "runtime": t.runtime,
+                    "path": t.executable,
+                })
+            })
+            .collect();
+        Ok(json!({ "browsers": browsers }))
+    }
+
+    async fn system_config_rate_limit(&self, params: Option<Value>) -> Result<Value, ServerError> {
+        self.require_active_session_scope(params.as_ref(), SessionScope::Diagnostics)
+            .await?;
+        let params_ref = params.as_ref().ok_or(ServerError::InvalidRequest)?;
+
+        // If rate_per_sec is provided, update the rate limits.
+        if let Some(rate) = params_ref.get("rate_per_sec").and_then(Value::as_u64) {
+            let rate = rate as u32;
+            let burst = params_ref
+                .get("burst")
+                .and_then(Value::as_u64)
+                .map(|b| b as u32)
+                .unwrap_or(rate * 2); // Default burst = 2x rate
+
+            // Update global limiter
+            {
+                let mut limiter = self.state.global_limiter.lock().await;
+                limiter.update_rate(rate, burst);
+            }
+
+            // Update all existing per-connection limiters
+            {
+                let mut limiters = self.state.connection_limiters.lock().await;
+                for limiter in limiters.values_mut() {
+                    limiter.update_rate(rate, burst);
+                }
+            }
+
+            return Ok(json!({
+                "rate_per_sec": rate,
+                "burst": burst,
+                "applied": true
+            }));
+        }
+
+        // If no rate_per_sec, return current config values (read-only query).
+        Ok(json!({
+            "rate_per_sec": self.config.rate_limit_per_sec,
+            "burst": self.config.burst_limit,
+            "applied": false
+        }))
     }
 
     async fn session_create(&self, params: Option<Value>) -> Result<Value, ServerError> {
@@ -2279,7 +2360,7 @@ impl RpcServer {
         }
 
         match method {
-            "browser.create" => self.browser_create(command_id, audit).await,
+            "browser.create" => self.browser_create(command_id, audit, params_ref).await,
             "browser.attach" => self.browser_attach(command_id, audit).await,
             "browser.detach" => self.browser_detach(command_id, audit).await,
             "browser.close" => self.browser_close(command_id, audit).await,
@@ -3649,12 +3730,33 @@ impl RpcServer {
         &self,
         command_id: String,
         audit: BrowserAuditContext,
+        params: &Value,
     ) -> Result<Value, ServerError> {
         let browser_session_id = format!(
             "bs-{}",
             random_token()?.chars().take(12).collect::<String>()
         );
-        let launched = launch_browser_process(&self.config, &browser_session_id);
+
+        // Allow per-request browser runtime override from params.
+        let requested_runtime = params
+            .get("browser_runtime")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let launched = if !requested_runtime.is_empty() {
+            // Try to find a matching launch target for the requested runtime.
+            let targets = browser_launch_targets(&self.config);
+            let target = targets
+                .iter()
+                .find(|t| t.runtime == requested_runtime)
+                .or_else(|| targets.first());
+            match target {
+                Some(t) => launch_browser_process_for_target(&self.config, &browser_session_id, t),
+                None => launch_browser_process(&self.config, &browser_session_id),
+            }
+        } else {
+            launch_browser_process(&self.config, &browser_session_id)
+        };
         let (runtime_name, executable, port, process, last_error) = match launched {
             Ok(process) => (
                 process.runtime.clone(),
@@ -7045,23 +7147,31 @@ fn resolve_browser_executable(config: &BackendConfig) -> Result<String, ServerEr
     if !configured.is_empty() && Path::new(configured).exists() {
         return Ok(configured.to_string());
     }
-    let candidates: &[&str] = match configured {
-        "chrome" | "chromium" | "" => &[
-            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let pf86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+
+    let candidates: Vec<String> = match configured {
+        "chrome" | "chromium" | "" => vec![
+            format!("{local_app_data}\\Google\\Chrome\\Application\\chrome.exe"),
+            format!("{pf}\\Google\\Chrome\\Application\\chrome.exe"),
+            format!("{pf86}\\Google\\Chrome\\Application\\chrome.exe"),
         ],
-        "edge" | "msedge" => &[
-            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        "edge" | "msedge" => vec![
+            format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe"),
+            format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"),
         ],
-        other => &[other],
+        "brave" => vec![
+            format!("{local_app_data}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+            format!("{pf}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+        ],
+        other => vec![other.to_string()],
     };
     candidates
         .iter()
         .find(|candidate| Path::new(candidate).exists())
-        .map(|value| (*value).to_string())
+        .cloned()
         .ok_or(ServerError::Internal)
 }
 
@@ -7131,13 +7241,116 @@ fn browser_launch_targets(config: &BackendConfig) -> Vec<BrowserLaunchTarget> {
             executable: configured.to_string(),
         }];
     }
+
+    // Discover all available browsers independently (Chrome, Edge, WebView2).
     let mut targets = Vec::new();
-    if let Ok(executable) = resolve_browser_executable(config) {
+
+    // If an explicit non-standard executable path is configured, add it first.
+    if !configured.is_empty() && Path::new(configured).exists() {
         targets.push(BrowserLaunchTarget {
             runtime: "chromium-cdp".to_string(),
-            executable,
+            executable: configured.to_string(),
         });
     }
+
+    // Build candidate lists dynamically using environment variables.
+    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let program_files_x86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+
+    // Helper: try candidates, push first match with given runtime + name.
+    let mut try_candidates = |runtime: &str, name: &str, candidates: Vec<String>| {
+        for candidate in candidates {
+            if Path::new(&candidate).exists() {
+                // Avoid duplicates (same executable already added).
+                if !targets
+                    .iter()
+                    .any(|t| t.executable.eq_ignore_ascii_case(&candidate))
+                {
+                    targets.push(BrowserLaunchTarget {
+                        runtime: runtime.to_string(),
+                        executable: candidate,
+                    });
+                }
+                return;
+            }
+        }
+        let _ = name; // used by caller for logging if needed
+    };
+
+    // Google Chrome (stable)
+    try_candidates(
+        "chrome",
+        "Google Chrome",
+        vec![
+            format!("{local_app_data}\\Google\\Chrome\\Application\\chrome.exe"),
+            format!("{program_files}\\Google\\Chrome\\Application\\chrome.exe"),
+            format!("{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe"),
+        ],
+    );
+
+    // Google Chrome Beta
+    try_candidates(
+        "chrome-beta",
+        "Google Chrome Beta",
+        vec![
+            format!("{local_app_data}\\Google\\Chrome Beta\\Application\\chrome.exe"),
+            format!("{program_files}\\Google\\Chrome Beta\\Application\\chrome.exe"),
+        ],
+    );
+
+    // Google Chrome Dev
+    try_candidates(
+        "chrome-dev",
+        "Google Chrome Dev",
+        vec![format!(
+            "{local_app_data}\\Google\\Chrome Dev\\Application\\chrome.exe"
+        )],
+    );
+
+    // Google Chrome Canary
+    try_candidates(
+        "chrome-canary",
+        "Google Chrome Canary",
+        vec![format!(
+            "{local_app_data}\\Google\\Chrome SxS\\Application\\chrome.exe"
+        )],
+    );
+
+    // Brave Browser
+    try_candidates(
+        "brave",
+        "Brave",
+        vec![
+            format!("{local_app_data}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+            format!("{program_files}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+            format!("{program_files_x86}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+        ],
+    );
+
+    // Vivaldi
+    try_candidates(
+        "vivaldi",
+        "Vivaldi",
+        vec![
+            format!("{local_app_data}\\Vivaldi\\Application\\vivaldi.exe"),
+            format!("{program_files}\\Vivaldi\\Application\\vivaldi.exe"),
+        ],
+    );
+
+    // Microsoft Edge
+    try_candidates(
+        "edge",
+        "Microsoft Edge",
+        vec![
+            format!("{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe"),
+            format!("{program_files}\\Microsoft\\Edge\\Application\\msedge.exe"),
+        ],
+    );
+
+    // WebView2
     if let Ok(executable) = resolve_webview2_executable() {
         if !targets
             .iter()
