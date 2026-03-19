@@ -5,7 +5,7 @@ const columns = [
   {
     title: "Product",
     links: [
-      { label: "Documentation", href: "/docs" },
+      { label: "Changelogs", href: "/changelogs" },
     ],
   },
   // {
@@ -19,7 +19,7 @@ const columns = [
     title: "Social",
     links: [
       { label: "GitHub", href: "https://github.com/Pollux-Studio/maxc" },
-      { label: "LinkedIn", href: "https://www.linkedin.com" },
+      { label: "LinkedIn", href: "https://www.linkedin.com/in/rjprasanth/" },
     ],
   },
 ];
