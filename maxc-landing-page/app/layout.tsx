@@ -1,103 +1,131 @@
-import type { Metadata } from "next";
-import { JetBrains_Mono, Space_Grotesk, Geist } from "next/font/google";
-import { Analytics } from "@vercel/analytics/next";
-import "./globals.css";
-import { cn } from "@/lib/utils";
+import type { Metadata, Viewport } from "next"
+import { Geist_Mono, Silkscreen } from "next/font/google"
+import { GeistPixelLine } from "geist/font/pixel"
+import { Analytics } from "@vercel/analytics/next"
+import "./globals.css"
 
-const geist = Geist({subsets:['latin'],variable:'--font-sans'});
-
-const spaceGrotesk = Space_Grotesk({
-  variable: "--font-space",
+const geistMono = Geist_Mono({
   subsets: ["latin"],
-});
+  variable: "--font-mono",
+})
 
-const jetbrainsMono = JetBrains_Mono({
-  variable: "--font-jetbrains",
+const silkscreen = Silkscreen({
+  weight: ["400", "700"],
   subsets: ["latin"],
-});
+  variable: "--font-pixel",
+})
+
+const geistPixelLine = GeistPixelLine
+
+const siteUrl = "https://maxc.polluxstudio.in"
+const siteName = "maxc"
+const siteTitle = "maxc | Programmable Developer Workspace"
+const siteDescription =
+  "Open-source programmable developer workspace unifying terminals, browser automation, and task orchestration. Built with Rust + Tauri v2 + React. 52 RPC methods. 40+ CLI commands."
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://maxc.polluxstudio.in"),
+  metadataBase: new URL(siteUrl),
   title: {
-    default: "maxc - Workspace for AI Coding Agents",
-    template: "%s - maxc",
+    default: siteTitle,
+    template: "%s | maxc",
   },
-  description:
-    "maxc is a programmable workspace for AI coding agents. Run terminals, automate browsers, and orchestrate AI agents from one developer environment.",
+  description: siteDescription,
+  generator: "maxc",
+  applicationName: siteName,
+  authors: [{ name: "Pollux Studio", url: "https://github.com/Pollux-Studio" }],
+  creator: "Pollux Studio",
+  publisher: "Pollux Studio",
   keywords: [
-    "AI coding agents",
-    "developer automation tools",
-    "terminal workspace",
-    "browser automation tools",
-    "AI development environment",
-    "agent orchestration",
-    "developer productivity tools",
+    "developer workspace",
+    "terminal multiplexer",
+    "browser automation",
+    "task orchestration",
+    "Rust",
+    "Tauri",
+    "ConPTY",
+    "CDP",
+    "CLI",
+    "open-source",
+    "developer tools",
+    "workspace manager",
+    "xterm.js",
+    "JSON-RPC",
+    "agent system",
   ],
-  applicationName: "maxc",
-  alternates: {
-    canonical: "/",
+  icons: {
+    icon: [
+      {
+        url: "/maxc_logo_full_white_single.svg",
+        type: "image/svg+xml",
+      },
+    ],
+    apple: "/apple-icon.png",
+  },
+  openGraph: {
+    type: "website",
+    locale: "en_US",
+    url: siteUrl,
+    siteName,
+    title: siteTitle,
+    description: siteDescription,
+    images: [
+      {
+        url: `${siteUrl}/og.png`,
+        width: 1200,
+        height: 630,
+        alt: "maxc — Programmable Developer Workspace",
+        type: "image/png",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: siteTitle,
+    description: siteDescription,
+    images: [`${siteUrl}/og.png`],
   },
   robots: {
     index: true,
     follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-video-preview": -1,
+      "max-image-preview": "large",
+      "max-snippet": -1,
+    },
   },
-  openGraph: {
-    title: "maxc - Control Center for AI Coding Agents",
-    description:
-      "Run terminals, control browsers, and orchestrate AI agents from one programmable workspace.",
-    url: "/",
-    siteName: "maxc",
-    images: [
-      {
-        url: "/og.png",
-        width: 1200,
-        height: 630,
-        alt: "maxc - Control Center for AI Coding Agents",
-      },
-    ],
-    type: "website",
+  alternates: {
+    canonical: siteUrl,
   },
-  twitter: {
-    card: "summary_large_image",
-    title: "maxc - AI Coding Agent Workspace",
-    description: "Run terminals, browsers, and AI agents in one programmable workspace.",
-    images: ["/og.png"],
-  },
-  icons: {
-    icon: [{ url: "/maxc_logo_full_white_single.svg" }],
-  },
-};
+  category: "Developer Tools",
+}
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#000000" },
+  ],
+  width: "device-width",
+  initialScale: 1,
+}
 
 export default function RootLayout({
   children,
 }: Readonly<{
-  children: React.ReactNode;
+  children: React.ReactNode
 }>) {
-  const structuredData = {
-    "@context": "https://schema.org",
-    "@type": "SoftwareApplication",
-    name: "maxc",
-    applicationCategory: "DeveloperApplication",
-    description:
-      "maxc is a programmable workspace for AI coding agents that allows developers to run terminals, automate browsers, and orchestrate agent workflows.",
-    operatingSystem: ["Windows", "macOS", "Linux"],
-    url: "https://maxc.polluxstudio.in",
-  };
-
   return (
-    <html lang="en" className={cn("dark font-sans", geist.variable)}>
+    <html lang="en" className={`dark ${geistPixelLine.variable}`}>
       <head>
-        <script
-          type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData) }}
-        />
+        <link rel="icon" href="/maxc_logo_full_white_single.svg" type="image/svg+xml" />
       </head>
       <body
-        className={`${spaceGrotesk.variable} ${jetbrainsMono.variable} antialiased`}
+        className={`${geistMono.variable} ${silkscreen.variable} font-mono antialiased`}
       >
         {children}
         <Analytics />
       </body>
     </html>
-  );
+  )
 }

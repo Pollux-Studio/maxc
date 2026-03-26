@@ -1,0 +1,47 @@
+# maxc
+
+> Open-source programmable developer workspace unifying terminals, browser automation, and task orchestration.
+
+## About
+
+maxc is a desktop application built with Rust (backend) + Tauri v2 + React/TypeScript (frontend). It organizes terminals, browser sessions, and AI agent tasks into structured workspaces controlled via a JSON-RPC API and CLI.
+
+- Website: https://maxc.polluxstudio.in
+- GitHub: https://github.com/Pollux-Studio/maxc
+- License: Apache-2.0
+- Current version: 0.2.0
+- Platform: Windows (primary), macOS, Linux
+
+## Core Features
+
+- Terminal Engine: ConPTY on Windows with process-stdio fallback. Supports PowerShell, Bash, Node.js, Python. Up to 32 concurrent sessions with resize, history, and real-time subscriptions.
+- Browser Automation: Chromium CDP integration with WebView2 fallback. 27 browser methods for navigation, DOM manipulation, cookies, storage, screenshots, downloads, and raw CDP pass-through. Up to 8 concurrent sessions.
+- Agent System: Worker-based architecture for autonomous task execution. Create workers, assign prompt-based tasks, attach terminals and browsers. Up to 8 concurrent workers.
+- Workspace Architecture: Five-level hierarchy — Window, Workspace, Pane, Surface, Panel. Each Panel hosts a Terminal or Browser surface.
+- RPC API: 52 JSON-RPC methods across terminal, browser, agent, workspace, and system domains.
+- CLI: 40+ commands organized by domain, piped through the RPC layer.
+- Storage & Recovery: Append-only event store with snapshot-based recovery for full workspace replay.
+- Security: Token-based authentication, per-method rate limiting (100 req/s base, 200 burst), circuit breaker protection.
+
+## Tech Stack
+
+- Backend: Rust, Tokio async runtime
+- Desktop: Tauri v2
+- Frontend: React 19, TypeScript
+- Terminal: xterm.js, ConPTY
+- Browser: Chromium CDP, WebView2
+- CLI: Clap framework, Windows named pipes
+
+## Pages
+
+- Home: https://maxc.polluxstudio.in
+- Documentation: https://maxc.polluxstudio.in/docs
+- Downloads: https://maxc.polluxstudio.in/downloads
+- Changelogs: https://maxc.polluxstudio.in/changelogs
+- Examples: https://maxc.polluxstudio.in/examples
+- GitHub: https://maxc.polluxstudio.in/github
+
+## Download
+
+- Windows (NSIS installer, no admin): https://github.com/Pollux-Studio/maxc/releases/download/stable/maxc_0.2.0_x64-setup.exe
+- Windows (MSI): https://github.com/Pollux-Studio/maxc/releases/download/stable/maxc_0.2.0_x64_en-US.msi
